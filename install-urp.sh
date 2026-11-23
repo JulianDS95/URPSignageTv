@@ -65,11 +65,11 @@ fi
 sudo apt-get update --allow-releaseinfo-change -y || sudo apt-get update -y
 sudo apt-get install -y curl ffmpeg feh unclutter x11-xserver-utils
 
-# Instalar reproductor según generación de Raspberry Pi
-if echo "$PI_MODEL" | grep -qiE "Pi 4|Pi 5|Pi 400|Compute Module 4"; then
-    sudo apt-get install -y mpv
-else
+# Instalar reproductor según generación de Raspberry Pi y disponibilidad en repositorios (Trixie/Bookworm usan mpv)
+if apt-cache show omxplayer >/dev/null 2>&1 && ! echo "$PI_MODEL" | grep -qiE "Pi 4|Pi 5|Pi 400|Compute Module 4"; then
     sudo apt-get install -y omxplayer || sudo apt-get install -y mpv
+else
+    sudo apt-get install -y mpv
 fi
 
 # Instalar Node.js y npm si no están presentes
@@ -118,21 +118,24 @@ if [ -n "${GITHUB_TOKEN:-}" ]; then
     echo "  -> Token GitHub detectado: usando autenticación para repositorio privado."
 fi
 
-if ! curl -fsSL "${CURL_AUTH_ARGS[@]}" -H "Cache-Control: no-cache" "$URP_SOURCE_URL" -o /home/pi/URP/URPPI3.js.tmp; then
+TMP_URP_JS="/home/pi/URP/.URPPI3.tmp.js"
+rm -f "$TMP_URP_JS"
+if ! curl -fsSL "${CURL_AUTH_ARGS[@]}" -H "Cache-Control: no-cache" "$URP_SOURCE_URL" -o "$TMP_URP_JS"; then
     if [ -n "${GITHUB_REPO:-}" ] && [ "$GITHUB_BRANCH" = "main" ]; then
         URP_SOURCE_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/master/URPPI3.js"
         echo "  -> Probando rama master: $URP_SOURCE_URL"
-        curl -fsSL "${CURL_AUTH_ARGS[@]}" -H "Cache-Control: no-cache" "$URP_SOURCE_URL" -o /home/pi/URP/URPPI3.js.tmp
+        curl -fsSL "${CURL_AUTH_ARGS[@]}" -H "Cache-Control: no-cache" "$URP_SOURCE_URL" -o "$TMP_URP_JS"
     else
         echo "ERROR: No se pudo descargar URPPI3.js desde $URP_SOURCE_URL"
         if [ -z "${GITHUB_TOKEN:-}" ]; then
             echo "  Si el repositorio es privado, exporta primero: export GITHUB_TOKEN="tu_token""
         fi
+        rm -f "$TMP_URP_JS"
         exit 1
     fi
 fi
-node --check /home/pi/URP/URPPI3.js.tmp
-mv -f /home/pi/URP/URPPI3.js.tmp /home/pi/URP/URPPI3.js
+node --check "$TMP_URP_JS"
+mv -f "$TMP_URP_JS" /home/pi/URP/URPPI3.js
 chmod +x /home/pi/URP/URPPI3.js
 
 # 5. Configurar GPU, X11, Desktop Autologin y neutralizar fondo/salvapantallas
@@ -142,8 +145,8 @@ if command -v raspi-config >/dev/null 2>&1; then
     sudo raspi-config nonint do_boot_behaviour B4 2>/dev/null || true
     # Si es Bookworm/Wayland, cambiar a X11 (W1) para compatibilidad total con feh/DISPLAY=:0
     sudo raspi-config nonint do_wayland W1 2>/dev/null || true
-    # En Raspberry Pi 3B+ fijar 128MB de GPU para VideoCore IV
-    if ! echo "$PI_MODEL" | grep -qiE "Pi 4|Pi 5|Pi 400"; then
+    # Solo en sistemas legacy con omxplayer (Buster/Bullseye) fijar gpu_mem=128; en Trixie/Bookworm KMS usa CMA dinámico
+    if command -v omxplayer >/dev/null 2>&1 && ! echo "$PI_MODEL" | grep -qiE "Pi 4|Pi 5|Pi 400"; then
         sudo raspi-config nonint do_memory_split 128 2>/dev/null || true
     fi
 fi

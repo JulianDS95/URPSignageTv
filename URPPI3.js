@@ -1,6 +1,6 @@
 var URPActive = true;
 var URPType = 'URPPI3';
-var URPVersion = '2.2.0';
+var URPVersion = '2.2.1';
 var URPUpdated = false;
 var isArm = process.arch === 'arm' || process.arch === 'arm64';
 var isLinux = process.platform === 'linux';
@@ -315,7 +315,7 @@ function playCurrentIndex() {
     }
 
     // --------------------------------------------------------------------------
-    // CASO B: VIDEO (omxplayer en RPi 3B+ o mpv con HWDEC en RPi 4/5)
+    // CASO B: VIDEO (omxplayer en RPi 3B+ legacy o mpv en RPi 3B+/4/5 Bookworm/Trixie)
     // --------------------------------------------------------------------------
     console.log("[PLAYER:VIDEO] Reproduciendo: " + path.basename(fullPath));
 
@@ -329,11 +329,42 @@ function playCurrentIndex() {
         }
         playerArgs.push(fullPath);
     } else {
-        playerArgs = ['--fs', '--no-osc', '--no-osd-bar', '--really-quiet', '--hwdec=auto-safe', '--keep-open=no'];
-        if (currentPlaylist.length === 1) {
-            playerArgs.push('--loop-file=inf');
+        var mpvBaseArgs = [
+            '--fs', '--no-osc', '--no-osd-bar', '--really-quiet',
+            '--no-input-default-bindings', '--cursor-autohide=always', '--ontop',
+            '--hwdec=auto', '--keep-open=no'
+        ];
+        var usedMpvPlaylist = false;
+        if (currentPlaylist.length > 1 && currentMediaIndex === 0) {
+            var mpvPlaylistPaths = [];
+            var mpvTelemetryList = [];
+            for (var vpIdx = 0; vpIdx < currentPlaylist.length; vpIdx++) {
+                var vpItem = currentPlaylist[vpIdx];
+                var vpPath = path.isAbsolute(vpItem.file) ? vpItem.file : (contentBasePath + vpItem.file);
+                var vpExt = path.extname(vpPath).toLowerCase();
+                if (vpExt !== '.jpg' && vpExt !== '.jpeg' && vpExt !== '.png' && vpExt !== '.bmp' && fs.existsSync(vpPath)) {
+                    try {
+                        if (fs.statSync(vpPath).size > 1024) {
+                            mpvPlaylistPaths.push(vpPath);
+                            mpvTelemetryList.push({ idContent: vpItem.idContent || 0, duration: vpItem.duration || 10 });
+                        }
+                    } catch (se) {}
+                }
+            }
+            if (mpvPlaylistPaths.length > 1 && mpvPlaylistPaths.length === currentPlaylist.length) {
+                playerArgs = mpvBaseArgs.concat(['--prefetch-playlist=yes', '--loop-playlist=inf'], mpvPlaylistPaths);
+                startSeamlessTelemetry(mpvTelemetryList);
+                usedMpvPlaylist = true;
+                console.log("[PLAYER:MPV] Modo playlist continua en ventana única (" + mpvPlaylistPaths.length + " videos).");
+            }
         }
-        playerArgs.push(fullPath);
+        if (!usedMpvPlaylist) {
+            playerArgs = mpvBaseArgs.slice();
+            if (currentPlaylist.length === 1) {
+                playerArgs.push('--loop-file=inf');
+            }
+            playerArgs.push(fullPath);
+        }
     }
 
     var playStartTime = Date.now();
@@ -534,10 +565,101 @@ ensureDir(seamlessBasePath);
 emergencyDiskPlayback();
 
 // ==============================================================================
-// 4. BASE DE DATOS LEVELDB ROBUSTA
+// 4. BASE DE DATOS LEVELDB ROBUSTA (Compatible level v6/v7, v8/v9/v10 y fallback JSON)
 // ==============================================================================
 var level = null;
 var db = null;
+
+function createJsonDbAdapter(jsonPath) {
+    function readStore() {
+        try {
+            if (fs.existsSync(jsonPath)) {
+                return JSON.parse(fs.readFileSync(jsonPath, 'utf8') || '{}');
+            }
+        } catch (e) {}
+        return {};
+    }
+    function writeStore(obj) {
+        try {
+            var tmp = jsonPath + '.tmp';
+            fs.writeFileSync(tmp, JSON.stringify(obj));
+            fs.renameSync(tmp, jsonPath);
+        } catch (e) {}
+    }
+    return {
+        get: function (key, cb) {
+            var store = readStore();
+            if (Object.prototype.hasOwnProperty.call(store, key)) {
+                if (typeof cb === 'function') cb(null, store[key]);
+            } else {
+                if (typeof cb === 'function') cb(new Error('Key not found: ' + key));
+            }
+        },
+        put: function (key, val, cb) {
+            var store = readStore();
+            store[key] = val;
+            writeStore(store);
+            if (typeof cb === 'function') cb(null);
+        },
+        del: function (key, cb) {
+            var store = readStore();
+            delete store[key];
+            writeStore(store);
+            if (typeof cb === 'function') cb(null);
+        }
+    };
+}
+
+function wrapModernLevel(rawDb, jsonBackup) {
+    return {
+        get: function (key, cb) {
+            try {
+                var res = rawDb.get(key);
+                if (res && typeof res.then === 'function') {
+                    res.then(function (val) {
+                        if (typeof cb === 'function') cb(null, val);
+                    }, function (err) {
+                        jsonBackup.get(key, function (jErr, jVal) {
+                            if (!jErr && jVal !== undefined) {
+                                if (typeof cb === 'function') cb(null, jVal);
+                            } else {
+                                if (typeof cb === 'function') cb(err || jErr);
+                            }
+                        });
+                    });
+                } else {
+                    rawDb.get(key, cb);
+                }
+            } catch (e) {
+                jsonBackup.get(key, cb);
+            }
+        },
+        put: function (key, val, cb) {
+            jsonBackup.put(key, val);
+            try {
+                var res = rawDb.put(key, val);
+                if (res && typeof res.then === 'function') {
+                    res.then(function () { if (typeof cb === 'function') cb(null); }, function (e) { if (typeof cb === 'function') cb(e); });
+                }
+            } catch (e) {
+                if (typeof cb === 'function') cb(e);
+            }
+        },
+        del: function (key, cb) {
+            jsonBackup.del(key);
+            try {
+                var res = rawDb.del(key);
+                if (res && typeof res.then === 'function') {
+                    res.then(function () { if (typeof cb === 'function') cb(null); }, function (e) { if (typeof cb === 'function') cb(e); });
+                }
+            } catch (e) {
+                if (typeof cb === 'function') cb(e);
+            }
+        }
+    };
+}
+
+var jsonFallbackDb = createJsonDbAdapter(basePath + 'URPDB.json');
 try {
     // Si hubo un corte de luz o crash previo, limpiar lock huerfano para no congelar
     var lockFile = basePath + 'URPDB/LOCK';
@@ -545,9 +667,26 @@ try {
         try { fs.unlinkSync(lockFile); } catch (e) {}
     }
     level = require('level');
-    db = level(basePath + 'URPDB');
+    if (typeof level === 'function') {
+        var legacyDb = level(basePath + 'URPDB');
+        db = {
+            get: function (k, cb) {
+                legacyDb.get(k, function (err, val) {
+                    if (!err && val !== undefined) return cb && cb(null, val);
+                    jsonFallbackDb.get(k, cb);
+                });
+            },
+            put: function (k, v, cb) { jsonFallbackDb.put(k, v); legacyDb.put(k, v, cb); },
+            del: function (k, cb) { jsonFallbackDb.del(k); legacyDb.del(k, cb); }
+        };
+    } else if (level && typeof level.Level === 'function') {
+        db = wrapModernLevel(new level.Level(basePath + 'URPDB'), jsonFallbackDb);
+    } else {
+        db = jsonFallbackDb;
+    }
 } catch (e) {
-    console.warn('[DB] LevelDB no disponible o bloqueada:', e.message);
+    console.warn('[DB] LevelDB no disponible o bloqueada, usando almacenamiento JSON:', e.message);
+    db = jsonFallbackDb;
 }
 
 function initDB() {
@@ -607,10 +746,36 @@ var crypto = require('crypto');
 var algorithm = 'aes-256-ctr';
 var password = 'TBEE';
 
+function evpBytesToKey(passStr, keyLen, ivLen) {
+    var passBuf = Buffer.from(String(passStr), 'utf8');
+    var chunks = [];
+    var totalLen = 0;
+    var prev = Buffer.alloc(0);
+    while (totalLen < keyLen + ivLen) {
+        var md5 = crypto.createHash('md5');
+        md5.update(prev);
+        md5.update(passBuf);
+        prev = md5.digest();
+        chunks.push(prev);
+        totalLen += prev.length;
+    }
+    var derived = Buffer.concat(chunks);
+    return {
+        key: derived.slice(0, keyLen),
+        iv: derived.slice(keyLen, keyLen + ivLen)
+    };
+}
+
 function decrypt(text) {
     if (!text) return '';
     try {
-        var decipher = crypto.createDecipher(algorithm, password);
+        var decipher;
+        if (typeof crypto.createDecipher === 'function') {
+            decipher = crypto.createDecipher(algorithm, password);
+        } else {
+            var k = evpBytesToKey(password, 32, 16);
+            decipher = crypto.createDecipheriv(algorithm, k.key, k.iv);
+        }
         var dec = decipher.update(text, 'hex', 'utf8');
         dec += decipher.final('utf8');
         return dec;
@@ -1999,7 +2164,7 @@ function checkURPVersion(remoteVersion, remoteMD5) {
 
     isUpdatingCode = true;
     var updateUrl = 'http://' + baseUrl + '/URP/' + URPType + '.js';
-    var tempNewPath = tempFolderPath + URPType + '.js.new';
+    var tempNewPath = tempFolderPath + URPType + '.new.js';
     var targetPath = __filename || (basePath + URPType + '.js');
 
     console.log('[OTA] Nueva versión disponible en servidor: ' + remoteVersion + ' (actual: ' + URPVersion + '). Descargando desde ' + updateUrl);
