@@ -3,17 +3,15 @@
 # Instalador Automático Zero-Touch - URP Digital Signage v2.2.0
 # Compatible con Raspberry Pi 3B+ (Buster/Legacy) y Raspberry Pi 4 / 5 (Bullseye/Bookworm)
 # Uso desde GitHub público (sin tocar el servidor tbee.tv):
-#   curl -fsSL https://raw.githubusercontent.com/USUARIO/REPO/main/install-urp.sh | bash -s -- USUARIO/REPO
+#   curl -fsSL https://raw.githubusercontent.com/JulianDS95/URPSignageTv/main/install-urp.sh | bash
 # Uso desde GitHub PRIVADO (con Fine-Grained Token solo lectura "Contents: Read-only"):
 #   export GITHUB_TOKEN="github_pat_TU_TOKEN"
-#   curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" https://raw.githubusercontent.com/USUARIO/REPO/main/install-urp.sh | bash -s -- USUARIO/REPO
+#   curl -fsSL -H "Authorization: Bearer $GITHUB_TOKEN" https://raw.githubusercontent.com/JulianDS95/URPSignageTv/main/install-urp.sh | bash
 #   unset GITHUB_TOKEN
-# O si definis DEFAULT_GITHUB_REPO="USUARIO/REPO" abajo:
-#   curl -fsSL https://raw.githubusercontent.com/USUARIO/REPO/main/install-urp.sh | bash
 # ==============================================================================
 set -e
 
-DEFAULT_GITHUB_REPO=""
+DEFAULT_GITHUB_REPO="JulianDS95/URPSignageTv"
 GITHUB_BRANCH="${GITHUB_BRANCH:-main}"
 ARG_SOURCE="${1:-}"
 
