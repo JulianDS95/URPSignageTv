@@ -105,7 +105,7 @@ function attemptOtaRollback(reasonStr) {
         if (!fs.existsSync(otaPendingPath)) return false;
         var pending = JSON.parse(fs.readFileSync(otaPendingPath, 'utf8') || '{}');
         var backupPath = pending.backupPath;
-        var targetPath = pending.targetPath || __filename || (basePath + 'URPPI3.js');
+        var targetPath = pending.targetPath || __filename || (basePath + 'URPPI3-v2.5.js');
         if (backupPath && fs.existsSync(backupPath)) {
             otaRollbackHandled = true;
             console.error('[OTA:ROLLBACK] Fallo crítico durante arranque post-OTA (' + reasonStr + '). Restaurando respaldo...');
@@ -3485,27 +3485,115 @@ function cleanLogs() {
     execCleanLogs();
 }
 
+function captureMpvFrame(outPath, callback) {
+    if (!isPlaying || !activePlayerProcess || activePlayerBin !== 'mpv' || !fs.existsSync(mpvIpcSocketPath)) {
+        return callback(false);
+    }
+    var tmpOut = outPath + '.mpv.jpg';
+    try { if (fs.existsSync(tmpOut)) fs.unlinkSync(tmpOut); } catch (e) {}
+    mpvIpcRequest([['screenshot-to-file', tmpOut, 'video']], function (err, res) {
+        var r1 = res && res[1];
+        if (!err && r1 && r1.error === 'success' && fs.existsSync(tmpOut) && fs.statSync(tmpOut).size > 512) {
+            try {
+                fs.renameSync(tmpOut, outPath);
+                return callback(true);
+            } catch (re) {}
+        }
+        try { if (fs.existsSync(tmpOut)) fs.unlinkSync(tmpOut); } catch (ue) {}
+        callback(false);
+    });
+}
+
+function captureOsDisplayFrame(outPath, callback) {
+    var env = getGuiEnv();
+    var cmd = '';
+    if (hasWaylandDisplay && hasGrim) {
+        cmd = 'grim -t jpeg -q 80 "' + outPath + '"';
+    } else if (hasX11Display && hasScrot) {
+        cmd = 'scrot -q 80 -o "' + outPath + '"';
+    } else if (hasRaspi2png) {
+        cmd = 'raspi2png -p "' + outPath + '"';
+    } else if (hasX11Display) {
+        cmd = 'ffmpeg -nostdin -y -loglevel error -f x11grab -i :0.0 -frames:v 1 "' + outPath + '"';
+    } else {
+        cmd = 'ffmpeg -nostdin -y -loglevel error -f fbdev -i /dev/fb0 -frames:v 1 "' + outPath + '"';
+    }
+    exec(cmd, { env: env, timeout: 8000 }, function (err) {
+        var ok = !err && fs.existsSync(outPath) && fs.statSync(outPath).size > 512;
+        callback(ok);
+    });
+}
+
+var livePreviewBusy = false;
+var livePreviewWaiters = [];
+function captureLivePreview(callback) {
+    var outPreview = basePath + 'live_preview.jpg';
+    if (!isArm && !isLinux) {
+        if (typeof callback === 'function') callback(false, outPreview);
+        return;
+    }
+    if (typeof callback === 'function') livePreviewWaiters.push(callback);
+    if (livePreviewBusy) return;
+    livePreviewBusy = true;
+
+    var done = function (ok) {
+        livePreviewBusy = false;
+        var list = livePreviewWaiters.slice();
+        livePreviewWaiters = [];
+        for (var wi = 0; wi < list.length; wi++) {
+            try { list[wi](ok, outPreview); } catch (e) {}
+        }
+    };
+
+    var tmpPreview = basePath + 'live_preview.tmp.jpg';
+    try { if (fs.existsSync(tmpPreview)) fs.unlinkSync(tmpPreview); } catch (e) {}
+
+    captureMpvFrame(tmpPreview, function (mpvOk) {
+        if (mpvOk && fs.existsSync(tmpPreview)) {
+            try {
+                fs.renameSync(tmpPreview, outPreview);
+                return done(true);
+            } catch (re) {}
+        }
+        captureOsDisplayFrame(tmpPreview, function (osOk) {
+            if (osOk && fs.existsSync(tmpPreview)) {
+                try {
+                    fs.renameSync(tmpPreview, outPreview);
+                    return done(true);
+                } catch (re2) {}
+            }
+            try { if (fs.existsSync(tmpPreview)) fs.unlinkSync(tmpPreview); } catch (ue) {}
+            done(fs.existsSync(outPreview) && fs.statSync(outPreview).size > 512);
+        });
+    });
+}
+
+function getTailscaleIp() {
+    try {
+        var ifaces = osMod.networkInterfaces();
+        var keys = Object.keys(ifaces || {});
+        for (var i = 0; i < keys.length; i++) {
+            var name = keys[i];
+            var list = ifaces[name] || [];
+            for (var j = 0; j < list.length; j++) {
+                var item = list[j];
+                if (!item || item.internal || item.family !== 'IPv4') continue;
+                if (name.indexOf('tailscale') !== -1 || /^100.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])./.test(item.address)) {
+                    return item.address;
+                }
+            }
+        }
+    } catch (e) {}
+    return '';
+}
+
 function execScreenshot(callback) {
     var outShot = basePath + 'screenshot.jpg';
     if (!isArm && !isLinux) {
         if (typeof callback === 'function') callback(false, outShot);
         return;
     }
-    var env = getGuiEnv();
-    var cmd = '';
-    if (hasWaylandDisplay && hasGrim) {
-        cmd = 'grim -t jpeg -q 80 "' + outShot + '"';
-    } else if (hasX11Display && hasScrot) {
-        cmd = 'scrot -q 80 -o "' + outShot + '"';
-    } else if (hasRaspi2png) {
-        cmd = 'raspi2png -p "' + outShot + '"';
-    } else if (hasX11Display) {
-        cmd = 'ffmpeg -nostdin -y -loglevel error -f x11grab -i :0.0 -frames:v 1 "' + outShot + '"';
-    } else {
-        cmd = 'ffmpeg -nostdin -y -loglevel error -f fbdev -i /dev/fb0 -frames:v 1 "' + outShot + '"';
-    }
-    exec(cmd, { env: env, timeout: 10000 }, function (err) {
-        var ok = !err && fs.existsSync(outShot) && fs.statSync(outShot).size > 512;
+    var finishShot = function (ok) {
         if (ok && ftpHost && ftpUser) {
             var nowD = new Date();
             var timeTag = nowD.toTimeString().slice(0, 8).replace(/:/g, '-');
@@ -3518,6 +3606,13 @@ function execScreenshot(callback) {
             callUpdateWS('http://' + baseUrl + '/ws/updateScreenshotDisplay.php', 0);
             if (typeof callback === 'function') callback(ok, outShot);
         }
+    };
+
+    captureMpvFrame(outShot, function (mpvOk) {
+        if (mpvOk) return finishShot(true);
+        captureOsDisplayFrame(outShot, function (osOk) {
+            finishShot(osOk);
+        });
     });
 }
 
@@ -4141,7 +4236,12 @@ function buildLocalDashboardHtml() {
         'button{border:0;border-radius:8px;padding:9px 13px;font-size:12px;font-weight:600;cursor:pointer;color:#fff;background:#1e293b;transition:filter .15s}' +
         'button:hover{filter:brightness(1.15)} .b-blue{background:#2563eb}.b-indigo{background:#4f46e5}.b-amber{background:#d97706}.b-red{background:#dc2626}.b-green{background:#059669}.b-ghost{background:#0f172a;border:1px solid #334155}' +
         'pre{background:#030712;border:1px solid #1f2937;border-radius:10px;padding:12px;font-size:11px;line-height:1.45;max-height:290px;overflow:auto;color:#cbd5e1;margin:0}' +
-        '.shot{max-width:100%;border-radius:8px;border:1px solid #1f2937;margin-top:8px;display:none}' +
+        '.shot{max-width:100%;max-height:460px;object-fit:contain;border-radius:8px;border:1px solid #1f2937;background:#020617;display:block;margin:8px auto 0 auto}' +
+        '.pbarWrap{height:6px;background:#030712;border-radius:99px;overflow:hidden;margin-top:7px;border:1px solid #1f2937}' +
+        '.pbarFill{height:100%;width:0%;background:#3b82f6;transition:width .4s ease}' +
+        '.liveHead{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}' +
+        '.liveBadge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:10px;font-weight:700;letter-spacing:.05em;background:#1e293b;color:#94a3b8}' +
+        '.liveBadge.on{background:#065f46;color:#6ee7b7}' +
         '.hide{display:none!important}' +
         '.msg{padding:10px 12px;border-radius:9px;font-size:12px;margin-bottom:14px;border:1px solid #1e40af;background:#0f172a;color:#bfdbfe;display:none}' +
         '.msg.err{border-color:#991b1b;background:#1f1215;color:#fecaca} .msg.ok{border-color:#065f46;background:#091f18;color:#a7f3d0}' +
@@ -4164,22 +4264,32 @@ function buildLocalDashboardHtml() {
 
         '<div id="viewMonitor">' +
         '<div class="grid" style="margin-bottom:0">' +
-        '<div class="card"><div class="k">Reproduciendo</div><div class="v" id="now" style="font-size:13px;word-break:break-all">-</div></div>' +
+        '<div class="card"><div class="k">Reproduciendo</div><div class="v" id="now" style="font-size:13px;word-break:break-all">-</div><div class="pbarWrap"><div id="pbar" class="pbarFill"></div></div><div class="sub" id="ptime" style="margin-top:4px">-</div></div>' +
         '<div class="card"><div class="k">CPU / RAM / Temp</div><div class="v" id="hw">-</div></div>' +
         '<div class="card"><div class="k">Disco Libre</div><div class="v" id="disk">-</div></div>' +
         '<div class="card"><div class="k">Video Wall</div><div class="v" id="vw" style="font-size:13px">-</div></div>' +
         '</div>' +
         '<div class="btns">' +
         '<button id="btnOpenWall" class="b-indigo">Configurar Video Wall</button>' +
+        '<button id="btnRestartPlayer" class="b-amber">Reiniciar Reproductor</button>' +
         '<button id="btnUpdate" class="b-blue">Buscar OTA GitHub</button>' +
         '<button id="btnGc" class="b-green">Limpiar Huérfanos</button>' +
-        '<button id="btnShot">Captura de Pantalla</button>' +
         '<button id="btnCleanLogs">Limpiar Logs</button>' +
         '<button id="btnReboot" class="b-amber">Reiniciar Pi</button>' +
         '<button id="btnShutdown" class="b-red">Apagar Pi</button>' +
         '<button id="btnDelete" class="b-red">Borrar Contenidos</button>' +
         '</div>' +
-        '<div class="card"><div class="k">Colas y Agenda</div><div id="queues" class="sub" style="margin-top:4px">-</div><img id="shotImg" class="shot" alt="Screenshot"></div>' +
+        '<div class="card"><div class="liveHead">' +
+        '<div><span class="k" style="margin-right:8px">Monitor Visual en Vivo</span><span id="liveBadge" class="liveBadge">PAUSADO</span><div class="sub" id="liveMeta" style="margin-top:2px">Activá Vista en Vivo para supervisar la pantalla desde cualquier ubicación (sin subir al FTP)</div></div>' +
+        '<div class="btns" style="margin:0">' +
+        '<select id="liveInt" style="width:auto;padding:7px 9px;font-size:12px"><option value="2000">Cada 2s</option><option value="3000" selected>Cada 3s</option><option value="5000">Cada 5s</option></select>' +
+        '<button id="btnToggleLive" class="b-green">Activar Vista en Vivo</button>' +
+        '<button id="btnShot">Capturar Ahora</button>' +
+        '</div></div>' +
+        '<div id="liveEmpty" class="sub" style="padding:18px;text-align:center;border:1px dashed #334155;border-radius:8px;margin-top:6px">Sin captura cargada todavía. Pulsá &ldquo;Capturar Ahora&rdquo; o &ldquo;Activar Vista en Vivo&rdquo;.</div>' +
+        '<img id="shotImg" class="shot" style="display:none" alt="Vista previa pantalla">' +
+        '</div>' +
+        '<div class="card"><div class="k">Colas y Agenda</div><div id="queues" class="sub" style="margin-top:4px">-</div></div>' +
         '<div class="card"><div class="k">Logs en vivo</div><pre id="logs">Cargando...</pre></div>' +
         '</div>' +
 
@@ -4256,8 +4366,17 @@ function buildLocalDashboardHtml() {
         '</div><script>' +
         'var lastStatus = null;' +
         'var wallLoaded = false;' +
+        'var liveActive = false;' +
+        'var liveTimer = null;' +
+        'var liveInFlight = false;' +
         'var nl = String.fromCharCode(10);' +
         'function byId(id){ return document.getElementById(id); }' +
+        'function fmtSec(sec){' +
+        '  var s = Math.max(0, Math.floor(sec || 0));' +
+        '  var m = Math.floor(s / 60);' +
+        '  var r = s % 60;' +
+        '  return (m < 10 ? "0" : "") + m + ":" + (r < 10 ? "0" : "") + r;' +
+        '}' +
         'function showMsg(txt, kind){' +
         '  var m = byId("msgBox");' +
         '  if (!txt) { m.style.display = "none"; m.className = "msg"; return; }' +
@@ -4269,6 +4388,48 @@ function buildLocalDashboardHtml() {
         '  var n = parseInt(val, 10);' +
         '  if (isNaN(n)) return fallback;' +
         '  return Math.max(min, Math.min(max, n));' +
+        '}' +
+        'function scheduleLiveNext(){' +
+        '  if (!liveActive) return;' +
+        '  if (liveTimer) clearTimeout(liveTimer);' +
+        '  var ms = clampInt(byId("liveInt").value, 1000, 30000, 3000);' +
+        '  liveTimer = setTimeout(fetchLiveFrame, ms);' +
+        '}' +
+        'function fetchLiveFrame(){' +
+        '  if (liveInFlight) return;' +
+        '  liveInFlight = true;' +
+        '  var img = byId("shotImg");' +
+        '  img.onload = function(){' +
+        '    liveInFlight = false;' +
+        '    byId("liveEmpty").style.display = "none";' +
+        '    img.style.display = "block";' +
+        '    byId("liveMeta").textContent = "Último frame capturado: " + new Date().toLocaleTimeString();' +
+        '    scheduleLiveNext();' +
+        '  };' +
+        '  img.onerror = function(){' +
+        '    liveInFlight = false;' +
+        '    byId("liveMeta").textContent = "Sin frame disponible aún (esperando reproductor...)";' +
+        '    scheduleLiveNext();' +
+        '  };' +
+        '  img.src = "/api/preview.jpg?t=" + Date.now();' +
+        '}' +
+        'function setLiveMode(on){' +
+        '  liveActive = Boolean(on);' +
+        '  if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; }' +
+        '  var b = byId("liveBadge");' +
+        '  var btn = byId("btnToggleLive");' +
+        '  if (liveActive) {' +
+        '    b.textContent = "EN VIVO";' +
+        '    b.className = "liveBadge on";' +
+        '    btn.textContent = "Pausar Vista en Vivo";' +
+        '    btn.className = "b-amber";' +
+        '    fetchLiveFrame();' +
+        '  } else {' +
+        '    b.textContent = "PAUSADO";' +
+        '    b.className = "liveBadge";' +
+        '    btn.textContent = "Activar Vista en Vivo";' +
+        '    btn.className = "b-green";' +
+        '  }' +
         '}' +
         'function syncToForm(cfg, serverFlag){' +
         '  if (!cfg) return;' +
@@ -4339,6 +4500,7 @@ function buildLocalDashboardHtml() {
         '}' +
         'function openWallView(){' +
         '  showMsg("");' +
+        '  if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; }' +
         '  if (lastStatus && lastStatus.wallConfig) {' +
         '    syncToForm(lastStatus.wallConfig, lastStatus.serverVideoWallFlag);' +
         '    wallLoaded = true;' +
@@ -4350,14 +4512,25 @@ function buildLocalDashboardHtml() {
         '  showMsg("");' +
         '  byId("viewWall").className = "hide";' +
         '  byId("viewMonitor").className = "";' +
+        '  if (liveActive) scheduleLiveNext();' +
         '}' +
         'function refresh(){' +
         '  fetch("/api/status").then(function(r){ return r.json(); }).then(function(s){' +
         '    lastStatus = s;' +
         '    byId("ver").textContent = "v" + s.version;' +
-        '    byId("meta").textContent = (s.model || "Linux") + " • IP " + (s.ip || "-") + " • " + s.displayBackend;' +
+        '    byId("meta").textContent = (s.model || "Linux") + " • IP " + (s.ip || "-") + (s.tailscaleIp ? (" • Tailscale " + s.tailscaleIp) : "") + " • " + s.displayBackend;' +
         '    byId("conn").textContent = s.connection ? "tbee.tv ONLINE" : "MODO OFFLINE";' +
-        '    byId("now").textContent = s.filesPlaying.join(", ") || "En espera";' +
+        '    var pl = s.player || {};' +
+        '    var playingLabel = (pl.file || s.filesPlaying.join(", ") || "En espera");' +
+        '    byId("now").textContent = playingLabel;' +
+        '    if (pl.duration && pl.duration > 0) {' +
+        '      var pct = Math.max(0, Math.min(100, Math.round((pl.timePos / pl.duration) * 100)));' +
+        '      byId("pbar").style.width = pct + "%";' +
+        '      byId("ptime").textContent = fmtSec(pl.timePos) + " / " + fmtSec(pl.duration) + " (" + pct + "%) • " + (pl.bin || "mpv");' +
+        '    } else {' +
+        '      byId("pbar").style.width = "0%";' +
+        '      byId("ptime").textContent = pl.active ? ("Motor: " + (pl.bin || "-")) : "Sin reproducción activa";' +
+        '    }' +
         '    byId("hw").textContent = s.cpuUsage + "% / " + s.memPercentUsed + "% / " + s.temperature + "°C";' +
         '    byId("disk").textContent = s.freeSpace;' +
         '    byId("vw").textContent = s.wallActive ? (s.wallConfig.mode + " " + s.wallConfig.rows + "x" + s.wallConfig.cols + " #" + s.wallConfig.screenId + " (drift " + (s.wallSyncStatus.driftMs || 0) + "ms)") : ("Normal (" + (s.wallConfig.activationMode === "server" ? "remoto tbee.tv OFF" : "desactivado") + ")");' +
@@ -4433,15 +4606,18 @@ function buildLocalDashboardHtml() {
         '  byId(liveIds[li]).onchange = updateWallPreview;' +
         '  byId(liveIds[li]).oninput = updateWallPreview;' +
         '}' +
+        'byId("btnToggleLive").onclick = function(){ setLiveMode(!liveActive); };' +
+        'byId("liveInt").onchange = function(){ if (liveActive) scheduleLiveNext(); };' +
+        'byId("btnRestartPlayer").onclick = function(){ act("/restartPlayer"); };' +
         'byId("btnUpdate").onclick = function(){ act("/update"); };' +
         'byId("btnGc").onclick = function(){ act("/gc"); };' +
         'byId("btnCleanLogs").onclick = function(){ act("/cleanLogs"); };' +
-        'byId("btnShot").onclick = function(){ fetch("/screenshot").then(function(){ var img = byId("shotImg"); img.src = "/screenshot.jpg?t=" + Date.now(); img.style.display = "block"; showMsg("Captura actualizada.", "ok"); }); };' +
+        'byId("btnShot").onclick = function(){ fetchLiveFrame(); };' +
         'byId("btnReboot").onclick = function(){ if (confirm("¿Reiniciar Raspberry Pi?")) act("/reboot"); };' +
         'byId("btnShutdown").onclick = function(){ if (confirm("¿Apagar Raspberry Pi?")) act("/shutdown"); };' +
         'byId("btnDelete").onclick = function(){ if (confirm("¿Borrar todo el contenido local?")) act("/deleteContents"); };' +
         'refresh();' +
-        'setInterval(refresh, 4000);' +
+        'setInterval(refresh, 3000);' +
         '</script></body></html>';
 }
 
@@ -4463,36 +4639,89 @@ app.get('/', function (req, res) {
 
 app.get('/api/status', function (req, res) {
     loadWallConfig();
-    res.json({
-        version: URPVersion,
-        model: piModelStr,
-        totalRamMB: totalRamMB,
-        displayBackend: useDrmDirect ? 'DRM/KMS' : (hasWaylandDisplay ? 'Wayland' : 'X11'),
-        ip: URPdata.URPIpAddress || '',
-        mac: macAdd,
-        uptimeSec: Math.round(process.uptime()),
-        connection: iConn,
-        freeSpace: URPFreeSpace,
-        freeDiskMb: freeDiskMb,
-        temperature: temperature,
-        cpuUsage: cpuUsage,
-        memPercentUsed: memPercentUsed,
-        blockPlaying: blockPlaying,
-        nowPlayingId: URPNowPlaying,
-        filesPlaying: filesPlaying,
-        scheduleCount: Array.isArray(schedule) ? schedule.length : 0,
-        serverVideoWallFlag: Boolean(URPdata && URPdata.isVideoWall),
-        wallActive: isWallActive(),
-        wallConfig: wallConfig,
-        wallSyncStatus: wallSyncStatus,
-        queues: {
-            ftp: FTPcontents.length,
-            render: renderQueue.length + (isRendering ? 1 : 0),
-            videoOpt: videoOptQueue.length + (isOptimizingVideo ? 1 : 0),
-            concatenating: isConcatenating
-        },
-        logs: recentLogs
+    var buildPayload = function (pl) {
+        res.json({
+            version: URPVersion,
+            model: piModelStr,
+            totalRamMB: totalRamMB,
+            displayBackend: useDrmDirect ? 'DRM/KMS' : (hasWaylandDisplay ? 'Wayland' : 'X11'),
+            ip: URPdata.URPIpAddress || '',
+            tailscaleIp: getTailscaleIp(),
+            mac: macAdd,
+            uptimeSec: Math.round(process.uptime()),
+            connection: iConn,
+            freeSpace: URPFreeSpace,
+            freeDiskMb: freeDiskMb,
+            temperature: temperature,
+            cpuUsage: cpuUsage,
+            memPercentUsed: memPercentUsed,
+            blockPlaying: blockPlaying,
+            nowPlayingId: URPNowPlaying,
+            filesPlaying: filesPlaying,
+            player: pl,
+            scheduleCount: Array.isArray(schedule) ? schedule.length : 0,
+            serverVideoWallFlag: Boolean(URPdata && URPdata.isVideoWall),
+            wallActive: isWallActive(),
+            wallConfig: wallConfig,
+            wallSyncStatus: wallSyncStatus,
+            queues: {
+                ftp: FTPcontents.length,
+                render: renderQueue.length + (isRendering ? 1 : 0),
+                videoOpt: videoOptQueue.length + (isOptimizingVideo ? 1 : 0),
+                concatenating: isConcatenating
+            },
+            logs: recentLogs
+        });
+    };
+
+    if (isPlaying && activePlayerProcess && activePlayerBin === 'mpv' && fs.existsSync(mpvIpcSocketPath)) {
+        mpvIpcRequest([
+            ['get_property', 'time-pos'],
+            ['get_property', 'duration'],
+            ['get_property', 'filename'],
+            ['get_property', 'pause']
+        ], function (err, ipcRes) {
+            var pos = (!err && ipcRes && ipcRes[1] && ipcRes[1].error === 'success') ? (parseFloat(ipcRes[1].data) || 0) : 0;
+            var dur = (!err && ipcRes && ipcRes[2] && ipcRes[2].error === 'success') ? (parseFloat(ipcRes[2].data) || 0) : 0;
+            var fname = (!err && ipcRes && ipcRes[3] && ipcRes[3].error === 'success') ? String(ipcRes[3].data || '') : '';
+            var paused = (!err && ipcRes && ipcRes[4] && ipcRes[4].error === 'success') ? Boolean(ipcRes[4].data) : false;
+            buildPayload({
+                active: Boolean(isPlaying),
+                bin: activePlayerBin,
+                file: fname || (filesPlaying[0] || ''),
+                timePos: pos,
+                duration: dur,
+                paused: paused
+            });
+        });
+    } else {
+        buildPayload({
+            active: Boolean(isPlaying),
+            bin: activePlayerBin || (activeFehProcess ? 'imagen' : 'idle'),
+            file: filesPlaying[0] || '',
+            timePos: 0,
+            duration: 0,
+            paused: false
+        });
+    }
+});
+
+app.get('/api/preview.jpg', function (req, res) {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+    captureLivePreview(function (ok, previewPath) {
+        if (ok && fs.existsSync(previewPath)) {
+            return res.sendFile(previewPath);
+        }
+        res.status(404).send('Sin captura disponible');
     });
+});
+
+app.get('/restartPlayer', function (req, res) {
+    blockPlaying = 0;
+    stopOmx(function () {
+        setTimeout(function () { checkSchedule(); }, 250);
+    });
+    res.status(200).send('Reproductor reiniciado');
 });
 
 app.get('/resetContent', function (req, res) {

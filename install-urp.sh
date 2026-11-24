@@ -283,10 +283,19 @@ pm2 delete URP 2>/dev/null || true
 DISPLAY=:0 XAUTHORITY=/home/pi/.Xauthority pm2 start /home/pi/URP/URPPI3.js --name URP
 pm2 save
 
+# Opcional: instalar Tailscale para mantenimiento remoto desde otra provincia (si exportas URP_TAILSCALE=1)
+if [ "${URP_TAILSCALE:-0}" = "1" ] && ! command -v tailscale >/dev/null 2>&1; then
+    echo "[+] Instalando Tailscale para soporte y mantenimiento remoto (:8090)..."
+    curl -fsSL https://tailscale.com/install.sh | sh || true
+fi
+
 echo "=========================================================="
 echo "  ¡INSTALACIÓN COMPLETADA CON ÉXITO!"
 echo "  - Ver logs en vivo: pm2 logs URP"
 echo "  - Configurar Video Wall (opcional): urp-wall"
+echo "  - Panel web local / soporte en vivo: http://IP_DE_LA_PI:8090"
+echo "  - Para acceso remoto desde otra ciudad sin abrir puertos:"
+echo "      curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up"
 echo "  - Notificaciones y popups del sistema desactivados."
 echo "  - Para pantalla vertical: sudo nano $CFG_FILE"
 echo "    y quitá el '#' de #display_hdmi_rotate=1 (o 3 para 270°)"
