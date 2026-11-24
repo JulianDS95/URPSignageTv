@@ -4,9 +4,9 @@
 # Ejecutable independiente para activar y configurar Video Wall en Raspberry Pi.
 # - Modo Normal (wall.json inexistente o enabled=false): URPPI3 funciona normal.
 # - Modo Video Wall (enabled=true): recorte automático en mosaico (tile) o espejo
-#   (mirror), ID de pantalla (1..N), disposición (filas x cols), bisel, orientación
+#   (mirror), ID de pantalla (1..999), disposición (filas x cols), bisel, orientación
 #   y sincronización sin Master (NTP) o por IP de Master local.
-# Uso: urp-wall   (o bash /home/pi/URP/urp-wall.sh [--status | --off])
+# Uso: urp-wall   (o bash /home/pi/URP/urp-wall.sh [--status | --off | --remote])
 # ==============================================================================
 set -u
 
@@ -113,10 +113,11 @@ function loadConfig() {
     try {
         if (!fs.existsSync(WALL_JSON)) return def;
         var raw = JSON.parse(fs.readFileSync(WALL_JSON, 'utf8'));
-        var rows = Math.max(1, parseInt(raw.rows, 10) || 1);
-        var cols = Math.max(1, parseInt(raw.cols, 10) || 3);
+        var rows = Math.max(1, Math.min(32, parseInt(raw.rows, 10) || 1));
+        var cols = Math.max(1, Math.min(32, parseInt(raw.cols, 10) || 3));
         var total = rows * cols;
-        var screenId = Math.min(total, Math.max(1, parseInt(raw.screenId, 10) || 1));
+        var screenId = Math.min(999, Math.max(1, parseInt(raw.screenId, 10) || 1));
+        var effIdx = (screenId - 1) % total;
         var actMode = (raw.activationMode === 'server' || raw.activationMode === 'local') ? raw.activationMode : 'local';
         return {
             enabled: Boolean(raw.enabled),
@@ -125,8 +126,8 @@ function loadConfig() {
             screenId: screenId,
             rows: rows,
             cols: cols,
-            row: Math.floor((screenId - 1) / cols),
-            col: (screenId - 1) % cols,
+            row: Math.floor(effIdx / cols),
+            col: effIdx % cols,
             bezelPx: Math.max(0, Math.min(400, parseInt(raw.bezelPx, 10) || 0)),
             orientation: (typeof raw.orientation === 'number') ? raw.orientation : curRot,
             syncMode: (raw.syncMode === 'master') ? 'master' : 'ntp',
@@ -139,12 +140,13 @@ function loadConfig() {
 }
 
 function normalizeComputedFields(cfg) {
-    cfg.rows = Math.max(1, parseInt(cfg.rows, 10) || 1);
-    cfg.cols = Math.max(1, parseInt(cfg.cols, 10) || 1);
+    cfg.rows = Math.max(1, Math.min(32, parseInt(cfg.rows, 10) || 1));
+    cfg.cols = Math.max(1, Math.min(32, parseInt(cfg.cols, 10) || 1));
     var total = cfg.rows * cfg.cols;
-    cfg.screenId = Math.min(total, Math.max(1, parseInt(cfg.screenId, 10) || 1));
-    cfg.row = Math.floor((cfg.screenId - 1) / cfg.cols);
-    cfg.col = (cfg.screenId - 1) % cfg.cols;
+    cfg.screenId = Math.min(999, Math.max(1, parseInt(cfg.screenId, 10) || 1));
+    var effIdx = (cfg.screenId - 1) % total;
+    cfg.row = Math.floor(effIdx / cfg.cols);
+    cfg.col = effIdx % cfg.cols;
     cfg.bezelPx = Math.max(0, Math.min(400, parseInt(cfg.bezelPx, 10) || 0));
     cfg.orientation = [0, 1, 2, 3].indexOf(cfg.orientation) !== -1 ? cfg.orientation : 0;
     return cfg;
@@ -199,15 +201,18 @@ function restartUrpService() {
 
 function renderGridAscii(cfg) {
     var lines = [];
+    var maxColsShow = Math.min(cfg.cols, 8);
+    var maxRowsShow = Math.min(cfg.rows, 6);
     var id = 1;
-    for (var r = 0; r < cfg.rows; r++) {
+    for (var r = 0; r < maxRowsShow; r++) {
         var top = '  ';
         var mid = '  ';
         var sub = '  ';
         var bot = '  ';
-        for (var c = 0; c < cfg.cols; c++) {
-            var isMe = (id === cfg.screenId);
-            var tag = isMe ? ('[>' + id + '<]') : (' [' + id + '] ');
+        for (var c = 0; c < maxColsShow; c++) {
+            var cellId = (r * cfg.cols) + c + 1;
+            var isMe = (cellId === cfg.screenId);
+            var tag = isMe ? ('[>' + cellId + '<]') : (' [' + cellId + '] ');
             while (tag.length < 7) tag = ' ' + tag;
             if (tag.length > 7) tag = tag.slice(0, 7);
             var coord = ' f' + (r + 1) + ',c' + (c + 1) + ' ';
@@ -218,7 +223,16 @@ function renderGridAscii(cfg) {
             bot += '+-------+ ';
             id++;
         }
+        if (cfg.cols > maxColsShow) {
+            mid += ' ... (+' + (cfg.cols - maxColsShow) + ' cols)';
+        }
         lines.push(top, mid, sub, bot);
+    }
+    if (cfg.rows > maxRowsShow) {
+        lines.push('  ... (+' + (cfg.rows - maxRowsShow) + ' filas más)');
+    }
+    if (cfg.mode === 'tile' && cfg.screenId > (cfg.rows * cfg.cols)) {
+        lines.push('  [!] Aviso: ID #' + cfg.screenId + ' supera las ' + (cfg.rows * cfg.cols) + ' posiciones de ' + cfg.rows + 'x' + cfg.cols + '. Ampliá la disposición en opción 2.');
     }
     return lines.join('\n');
 }
@@ -294,11 +308,16 @@ function ask(q, cb) {
     });
 }
 
+function isBackCmd(ans) {
+    var s = String(ans || '').trim().toLowerCase();
+    return (s === 'v' || s === 'b' || s === 'volver' || s === 'back' || s === 'atras' || s === 'atrás');
+}
+
 function showMainMenu() {
     printSummary(cfg);
     console.log('  1) Modo de activación (Remoto desde tbee.tv / Local / Desactivado)');
-    console.log('  2) Disposición y Modo (1x2, 1x3, 2x2, etc. / Mosaico vs Espejo)');
-    console.log('  3) Elegir ID de esta Pantalla (1..' + (cfg.rows * cfg.cols) + ')');
+    console.log('  2) Disposición y Modo (1x2, 1x3, 1x4, 2x2, 3x3, etc. / Mosaico vs Espejo)');
+    console.log('  3) Elegir ID de esta Pantalla (actual: #' + cfg.screenId + ' | soporta 1..999)');
     console.log('  4) Orientación de Pantalla (Horizontal / Vertical 90° / 270°)');
     console.log('  5) Compensación de Bisel / Marco en px (actual: ' + cfg.bezelPx + ' px)');
     console.log('  6) Sincronización (NTP sin Master / Master-Slave LAN)');
@@ -314,6 +333,15 @@ function showMainMenu() {
         if (opt === '6') return menuSync();
         if (opt === '7') return saveAndExit();
         if (opt === '0') {
+            if (dirty) {
+                return ask('Tenés cambios sin guardar. ¿Salir igual y descartar? (s/N): ', function (conf) {
+                    if (conf.toLowerCase() === 's' || conf.toLowerCase() === 'y' || conf.toLowerCase() === 'si') {
+                        rl.close();
+                        process.exit(0);
+                    }
+                    showMainMenu();
+                });
+            }
             rl.close();
             process.exit(0);
         }
@@ -326,58 +354,100 @@ function menuActivation() {
     console.log('  1) Controlado por servidor tbee.tv (Remoto: respeta el check Video Wall de tbee.tv)');
     console.log('  2) Siempre ACTIVO en esta Pi (Local: ignora el check del servidor)');
     console.log('  3) DESACTIVADO (Modo Normal URPPI3)');
-    ask('Elegí activación [1-3]: ', function (ans) {
-        if (ans === '1') { cfg.activationMode = 'server'; cfg.enabled = true; dirty = true; }
-        if (ans === '2') { cfg.activationMode = 'local'; cfg.enabled = true; dirty = true; }
-        if (ans === '3') { cfg.activationMode = 'local'; cfg.enabled = false; dirty = true; }
-        showMainMenu();
+    console.log('  v) Volver al menú principal');
+    ask('Elegí activación [1-3 | v = volver]: ', function (ans) {
+        if (isBackCmd(ans) || ans === '') return showMainMenu();
+        if (ans === '1') { cfg.activationMode = 'server'; cfg.enabled = true; dirty = true; return showMainMenu(); }
+        if (ans === '2') { cfg.activationMode = 'local'; cfg.enabled = true; dirty = true; return showMainMenu(); }
+        if (ans === '3') { cfg.activationMode = 'local'; cfg.enabled = false; dirty = true; return showMainMenu(); }
+        console.log('Opción inválida.');
+        menuActivation();
     });
 }
 
 function menuLayout() {
     console.log('\n--- DISPOSICIÓN DE PANTALLAS ---');
-    console.log('  1) 1 x 2 Horizontal (2 pantallas lado a lado)');
-    console.log('  2) 1 x 3 Horizontal (3 pantallas lado a lado)');
-    console.log('  3) 1 x 4 Horizontal (4 pantallas en fila)');
-    console.log('  4) 2 x 1 Vertical apilado (2 pantallas)');
-    console.log('  5) 3 x 1 Vertical apilado (3 pantallas)');
-    console.log('  6) 2 x 2 Matriz (4 pantallas)');
-    console.log('  7) 3 x 3 Matriz (9 pantallas)');
-    console.log('  8) Personalizada (ingresar Filas x Columnas)');
-    ask('Elegí disposición [Enter = mantener ' + cfg.rows + 'x' + cfg.cols + ']: ', function (ans) {
+    console.log('  1) 1 x 2 Horizontal (2 pantallas)');
+    console.log('  2) 1 x 3 Horizontal (3 pantallas)');
+    console.log('  3) 1 x 4 Horizontal (4 pantallas)');
+    console.log('  4) 1 x 5 Horizontal (5 pantallas)');
+    console.log('  5) 1 x 6 Horizontal (6 pantallas)');
+    console.log('  6) 2 x 1 Vertical apilado (2 pantallas)');
+    console.log('  7) 2 x 2 Matriz (4 pantallas)');
+    console.log('  8) 2 x 3 Matriz (6 pantallas)');
+    console.log('  9) 3 x 3 Matriz (9 pantallas)');
+    console.log(' 10) Personalizada (ingresar Filas x Columnas, hasta 32x32)');
+    console.log('  v) Volver al menú principal');
+    ask('Elegí disposición [1-10 | Enter = cambiar solo Mosaico/Espejo | v = volver]: ', function (ans) {
+        if (isBackCmd(ans)) return showMainMenu();
+        var prevRows = cfg.rows;
+        var prevCols = cfg.cols;
         var presets = {
             '1': [1, 2], '2': [1, 3], '3': [1, 4],
-            '4': [2, 1], '5': [3, 1], '6': [2, 2], '7': [3, 3]
+            '4': [1, 5], '5': [1, 6], '6': [2, 1],
+            '7': [2, 2], '8': [2, 3], '9': [3, 3]
         };
         if (presets[ans]) {
             cfg.rows = presets[ans][0];
             cfg.cols = presets[ans][1];
             dirty = true;
-            return askWallMode();
+            return askWallMode(prevRows, prevCols);
         }
-        if (ans === '8') {
-            return ask('Cantidad de FILAS (ej. 1, 2, 3): ', function (rAns) {
-                var r = parseInt(rAns, 10);
-                if (!isNaN(r) && r >= 1 && r <= 8) cfg.rows = r;
-                ask('Cantidad de COLUMNAS (ej. 2, 3, 4): ', function (cAns) {
-                    var c = parseInt(cAns, 10);
-                    if (!isNaN(c) && c >= 1 && c <= 8) cfg.cols = c;
-                    dirty = true;
-                    askWallMode();
-                });
-            });
+        if (ans === '10') {
+            return askCustomRows(prevRows, prevCols);
         }
-        askWallMode();
+        if (ans === '') {
+            return askWallMode(prevRows, prevCols);
+        }
+        console.log('Opción inválida.');
+        menuLayout();
     });
 }
 
-function askWallMode() {
+function askCustomRows(prevRows, prevCols) {
+    ask('Cantidad de FILAS (1-32) [v = volver atrás]: ', function (rAns) {
+        if (isBackCmd(rAns)) return menuLayout();
+        var r = parseInt(rAns, 10);
+        if (isNaN(r) || r < 1 || r > 32) {
+            console.log('Ingresá un número entre 1 y 32.');
+            return askCustomRows(prevRows, prevCols);
+        }
+        askCustomCols(r, prevRows, prevCols);
+    });
+}
+
+function askCustomCols(newRows, prevRows, prevCols) {
+    ask('Cantidad de COLUMNAS (1-32) [v = volver a Filas]: ', function (cAns) {
+        if (isBackCmd(cAns)) return askCustomRows(prevRows, prevCols);
+        var c = parseInt(cAns, 10);
+        if (isNaN(c) || c < 1 || c > 32) {
+            console.log('Ingresá un número entre 1 y 32.');
+            return askCustomCols(newRows, prevRows, prevCols);
+        }
+        cfg.rows = newRows;
+        cfg.cols = c;
+        dirty = true;
+        askWallMode(prevRows, prevCols);
+    });
+}
+
+function askWallMode(prevRows, prevCols) {
     console.log('\n--- TIPO DE PROYECCIÓN ---');
     console.log('  1) Mosaico / Imagen partida (tile): cada pantalla muestra su parte del video');
     console.log('  2) Espejo sincronizado (mirror): todas muestran el video completo sincronizado');
-    ask('Elegí modo [1-2, Enter = mantener ' + cfg.mode + ']: ', function (ans) {
+    console.log('  v) Volver atrás (elegir disposición)');
+    ask('Elegí modo [1-2 | Enter = mantener ' + cfg.mode + ' | v = volver]: ', function (ans) {
+        if (isBackCmd(ans)) {
+            cfg.rows = prevRows;
+            cfg.cols = prevCols;
+            return menuLayout();
+        }
         if (ans === '1') { cfg.mode = 'tile'; cfg.enabled = true; dirty = true; }
-        if (ans === '2') { cfg.mode = 'mirror'; cfg.enabled = true; dirty = true; }
+        else if (ans === '2') { cfg.mode = 'mirror'; cfg.enabled = true; dirty = true; }
+        else if (ans !== '') {
+            console.log('Opción inválida.');
+            return askWallMode(prevRows, prevCols);
+        }
         normalizeComputedFields(cfg);
         showMainMenu();
     });
@@ -387,18 +457,61 @@ function menuScreenId() {
     normalizeComputedFields(cfg);
     var total = cfg.rows * cfg.cols;
     console.log('\n--- ID DE ESTA PANTALLA ---');
+    console.log('  Disposición actual: ' + cfg.rows + 'x' + cfg.cols + ' (' + total + ' espacios) | Modo: ' + cfg.mode);
+    console.log('  Podés ingresar cualquier número de ID (1 a 999), incluso mayor a ' + total + '.');
     console.log(renderGridAscii(cfg));
-    ask('Ingresá el ID de esta Raspberry Pi (1 a ' + total + '): ', function (ans) {
+    console.log('  v) Volver al menú principal');
+    ask('Ingresá el ID de esta Raspberry Pi (1..999) [actual #' + cfg.screenId + ' | v = volver]: ', function (ans) {
+        if (isBackCmd(ans) || ans === '') return showMainMenu();
         var id = parseInt(ans, 10);
-        if (!isNaN(id) && id >= 1 && id <= total) {
+        if (isNaN(id) || id < 1 || id > 999) {
+            console.log('Valor inválido. Ingresá un número entre 1 y 999.');
+            return menuScreenId();
+        }
+        if (cfg.mode === 'tile' && id > total) {
+            return handleScreenIdExceedsLayout(id, total);
+        }
+        cfg.screenId = id;
+        cfg.enabled = true;
+        dirty = true;
+        normalizeComputedFields(cfg);
+        showMainMenu();
+    });
+}
+
+function handleScreenIdExceedsLayout(id, total) {
+    console.log('\n[i] Elegiste ID #' + id + ', pero la matriz actual (' + cfg.rows + 'x' + cfg.cols + ') tiene ' + total + ' espacios:');
+    console.log('  1) Ampliar automáticamente a 1 x ' + id + ' (' + id + ' pantallas en fila) y usar ID #' + id);
+    console.log('  2) Guardar ID #' + id + ' e ir ahora a elegir otra matriz (ej. 2x2, 2x3, 3x3)');
+    console.log('  3) Guardar ID #' + id + ' sin cambiar la matriz ahora');
+    console.log('  v) Volver atrás y elegir otro ID');
+    ask('Elegí una opción [1-3 | v = volver]: ', function (ans) {
+        if (isBackCmd(ans)) return menuScreenId();
+        if (ans === '1') {
+            cfg.rows = 1;
+            cfg.cols = Math.min(32, id);
             cfg.screenId = id;
             cfg.enabled = true;
             dirty = true;
             normalizeComputedFields(cfg);
-        } else if (ans !== '') {
-            console.log('Valor inválido. Debe estar entre 1 y ' + total + '.');
+            return showMainMenu();
         }
-        showMainMenu();
+        if (ans === '2') {
+            cfg.screenId = id;
+            cfg.enabled = true;
+            dirty = true;
+            normalizeComputedFields(cfg);
+            return menuLayout();
+        }
+        if (ans === '3') {
+            cfg.screenId = id;
+            cfg.enabled = true;
+            dirty = true;
+            normalizeComputedFields(cfg);
+            return showMainMenu();
+        }
+        console.log('Opción inválida.');
+        handleScreenIdExceedsLayout(id, total);
     });
 }
 
@@ -406,14 +519,18 @@ function menuOrientation() {
     console.log('\n--- ORIENTACIÓN DE ESTA PANTALLA ---');
     console.log('  0) 0° Horizontal Normal');
     console.log('  1) 90° Vertical Derecha (display_hdmi_rotate=1)');
-    console.log('  3) 270° Vertical Izquierda (display_hdmi_rotate=3)');
     console.log('  2) 180° Invertido (display_hdmi_rotate=2)');
-    ask('Elegí orientación [0, 1, 2, 3]: ', function (ans) {
+    console.log('  3) 270° Vertical Izquierda (display_hdmi_rotate=3)');
+    console.log('  v) Volver al menú principal');
+    ask('Elegí orientación [0, 1, 2, 3 | v = volver]: ', function (ans) {
+        if (isBackCmd(ans) || ans === '') return showMainMenu();
         if (ans === '0' || ans === '1' || ans === '2' || ans === '3') {
             cfg.orientation = parseInt(ans, 10);
             dirty = true;
+            return showMainMenu();
         }
-        showMainMenu();
+        console.log('Opción inválida.');
+        menuOrientation();
     });
 }
 
@@ -421,13 +538,17 @@ function menuBezel() {
     console.log('\n--- COMPENSACIÓN DE BISEL / MARCO ---');
     console.log('  0 = Sin recorte entre pantallas (recomendado si no querés perder contenido)');
     console.log('  15 a 30 = Píxeles ocultos detrás del marco físico entre pantallas vecinas');
-    ask('Ingresá píxeles de bisel (0-400) [actual ' + cfg.bezelPx + ']: ', function (ans) {
+    console.log('  v) Volver al menú principal');
+    ask('Ingresá píxeles de bisel (0-400) [actual ' + cfg.bezelPx + ' | v = volver]: ', function (ans) {
+        if (isBackCmd(ans) || ans === '') return showMainMenu();
         var b = parseInt(ans, 10);
         if (!isNaN(b) && b >= 0 && b <= 400) {
             cfg.bezelPx = b;
             dirty = true;
+            return showMainMenu();
         }
-        showMainMenu();
+        console.log('Valor inválido. Debe estar entre 0 y 400.');
+        menuBezel();
     });
 }
 
@@ -436,7 +557,9 @@ function menuSync() {
     console.log('  1) NTP Automático (Sin equipo Master extra: todas usan reloj del sistema)');
     console.log('  2) Master LAN (Esta pantalla será el reloj maestro en la red local)');
     console.log('  3) Slave LAN (Esta pantalla seguirá la IP del Master en la red local)');
-    ask('Elegí sincronización [1-3]: ', function (ans) {
+    console.log('  v) Volver al menú principal');
+    ask('Elegí sincronización [1-3 | v = volver]: ', function (ans) {
+        if (isBackCmd(ans) || ans === '') return showMainMenu();
         if (ans === '1') {
             cfg.syncMode = 'ntp';
             cfg.masterIp = '';
@@ -450,15 +573,23 @@ function menuSync() {
             return showMainMenu();
         }
         if (ans === '3') {
-            return ask('Ingresá la IP local del Master (ej. 192.168.1.50): ', function (ip) {
-                if (ip) {
-                    cfg.syncMode = 'master';
-                    cfg.masterIp = ip;
-                    dirty = true;
-                }
-                showMainMenu();
-            });
+            return askMasterIp();
         }
+        console.log('Opción inválida.');
+        menuSync();
+    });
+}
+
+function askMasterIp() {
+    ask('Ingresá la IP local del Master (ej. 192.168.1.50) [v = volver atrás]: ', function (ip) {
+        if (isBackCmd(ip)) return menuSync();
+        if (!ip) {
+            console.log('La IP no puede estar vacía.');
+            return askMasterIp();
+        }
+        cfg.syncMode = 'master';
+        cfg.masterIp = ip;
+        dirty = true;
         showMainMenu();
     });
 }
@@ -483,7 +614,8 @@ function saveAndExit() {
     }
 
     if (rotChanged) {
-        ask('La orientación HDMI cambió. ¿Reiniciar la Raspberry Pi ahora? (s/N): ', function (ans) {
+        ask('La orientación HDMI cambió. ¿Reiniciar la Raspberry Pi ahora? (s/N | v = volver al menú): ', function (ans) {
+            if (isBackCmd(ans)) return showMainMenu();
             rl.close();
             if (ans.toLowerCase() === 's' || ans.toLowerCase() === 'y' || ans.toLowerCase() === 'si') {
                 console.log('Reiniciando...');

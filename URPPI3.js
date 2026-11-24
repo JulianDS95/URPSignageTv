@@ -1,13 +1,12 @@
 var URPActive = true;
 var URPType = 'URPPI3';
-var URPVersion = '2.4.1';
+var URPVersion = '2.5.0';
 var URPUpdated = false;
 var isArm = process.arch === 'arm' || process.arch === 'arm64';
 var isLinux = process.platform === 'linux';
 var baseUrl = 'tbee.tv';
 var offline = false;
 var procBackgroundImage = null;
-var procImage, pidImage, procVideo, pidVideo, procBrowser, pidBrowser;
 var isPlaying = false;
 var playing = null;
 var refreshIntervalId = null;
@@ -35,49 +34,175 @@ var URPPort = 8090;
 var URPSocketPort = 8092;
 var ftpHost, ftpPort, ftpUser, ftpPass, ftpBasePath;
 var URPFreeSpace = '-';
+var freeDiskMb = -1;
 var temperature = 0;
 var memPercentUsed = 0;
 var cpuUsage = 0;
 var blockPlaying = 0;
-var comandPlaying;
 var respuesta = false;
 var isRendering = false;
 var isConcatenating = false;
 var playContentRunning = false;
 var path = require('path');
 var macAdd = '';
-var lista = [];
 var URPNowPlaying = 0;
 var fs = require('fs');
 var exec = require('child_process').exec;
 var execSync = require('child_process').execSync;
 var spawn = require('child_process').spawn;
 var net = require('net');
+var http = require('http');
+var https = require('https');
+var urlMod = require('url');
+var crypto = require('crypto');
+var osMod = require('os');
 var _ = require('lodash');
 var async = require('async');
 
-var osMod = require('os');
+// ==============================================================================
+// 0. BUFFER DE LOGS EN MEMORIA (para Panel Web Local :8090) + ROLLBACK OTA
+// ==============================================================================
+var recentLogs = [];
+var MAX_RECENT_LOGS = 80;
+function pushLogLine(levelTag, argsArr) {
+    try {
+        var msg = Array.prototype.slice.call(argsArr).map(function (a) {
+            if (typeof a === 'string') return a;
+            try { return JSON.stringify(a); } catch (e) { return String(a); }
+        }).join(' ');
+        var nowStr = new Date().toISOString().slice(11, 19);
+        recentLogs.push('[' + nowStr + '][' + levelTag + '] ' + msg);
+        if (recentLogs.length > MAX_RECENT_LOGS) {
+            recentLogs.shift();
+        }
+    } catch (e) {}
+}
+(function hookConsoleLogs() {
+    var origLog = console.log;
+    var origWarn = console.warn;
+    var origErr = console.error;
+    console.log = function () {
+        pushLogLine('INFO', arguments);
+        origLog.apply(console, arguments);
+    };
+    console.warn = function () {
+        pushLogLine('WARN', arguments);
+        origWarn.apply(console, arguments);
+    };
+    console.error = function () {
+        pushLogLine('ERR', arguments);
+        origErr.apply(console, arguments);
+    };
+})();
+
+var otaPendingPath = basePath + '.ota_pending';
+var otaBootSafe = false;
+var otaRollbackHandled = false;
+
+function attemptOtaRollback(reasonStr) {
+    if (otaBootSafe || otaRollbackHandled) return false;
+    try {
+        if (!fs.existsSync(otaPendingPath)) return false;
+        var pending = JSON.parse(fs.readFileSync(otaPendingPath, 'utf8') || '{}');
+        var backupPath = pending.backupPath;
+        var targetPath = pending.targetPath || __filename || (basePath + 'URPPI3.js');
+        if (backupPath && fs.existsSync(backupPath)) {
+            otaRollbackHandled = true;
+            console.error('[OTA:ROLLBACK] Fallo crítico durante arranque post-OTA (' + reasonStr + '). Restaurando respaldo...');
+            try {
+                fs.writeFileSync(targetPath, fs.readFileSync(backupPath));
+            } catch (we) {}
+            try { fs.unlinkSync(otaPendingPath); } catch (ue) {}
+            return true;
+        }
+        try { fs.unlinkSync(otaPendingPath); } catch (ue2) {}
+    } catch (e) {}
+    return false;
+}
+
+if (fs.existsSync(otaPendingPath)) {
+    setTimeout(function () {
+        otaBootSafe = true;
+        try {
+            if (fs.existsSync(otaPendingPath)) {
+                fs.unlinkSync(otaPendingPath);
+                console.log('[OTA:ROLLBACK] Arranque estable confirmado (20s). Actualización v' + URPVersion + ' consolidada.');
+            }
+        } catch (e) {}
+    }, 20000);
+} else {
+    otaBootSafe = true;
+}
+
+process.on('uncaughtException', function (err) {
+    console.error('[FATAL] uncaughtException:', err && err.stack ? err.stack : err);
+    if (attemptOtaRollback(err ? err.message : 'uncaughtException')) {
+        setTimeout(function () { process.exit(1); }, 300);
+    }
+});
+
+// ==============================================================================
+// 0A. DETECCION DE HARDWARE Y SESION GRAFICA (X11 / WAYLAND / DRM DIRECTO)
+// ==============================================================================
 var hasOmxplayer = false;
 var hasMpv = false;
 var hasCurl = false;
 var hasNice = false;
+var hasGrim = false;
+var hasScrot = false;
+var hasRaspi2png = false;
 var piModelStr = '';
 var totalRamMB = Math.round(osMod.totalmem() / (1024 * 1024));
 var isPi4Or5 = false;
 var isLowPowerPi = false;
+var hasX11Display = false;
+var hasWaylandDisplay = false;
+var useDrmDirect = false;
 var bootGraceDone = false;
+
 setTimeout(function () {
     bootGraceDone = true;
     if (Array.isArray(schedule) && schedule.length > 0) {
         checkSchedule();
+        setTimeout(prebuildAllScheduleBlocks, 2500);
     }
 }, 5000);
+
+function detectDisplaySession() {
+    if (!isArm && !isLinux) return;
+    hasX11Display = false;
+    hasWaylandDisplay = false;
+    try {
+        if (fs.existsSync('/tmp/.X11-unix')) {
+            var xFiles = fs.readdirSync('/tmp/.X11-unix');
+            if (xFiles && xFiles.length > 0) hasX11Display = true;
+        }
+    } catch (e) {}
+    try {
+        var uid = (typeof process.getuid === 'function') ? process.getuid() : 1000;
+        var rtDir = process.env.XDG_RUNTIME_DIR || ('/run/user/' + uid);
+        if (fs.existsSync(rtDir)) {
+            var rtEntries = fs.readdirSync(rtDir);
+            for (var ri = 0; ri < rtEntries.length; ri++) {
+                if (/^wayland-[0-9]+$/.test(rtEntries[ri])) {
+                    hasWaylandDisplay = true;
+                    break;
+                }
+            }
+        }
+    } catch (e) {}
+    var forceDrm = (process.env.URP_DRM_MODE === '1') || Boolean(wallConfig && wallConfig.drmMode);
+    useDrmDirect = hasMpv && (forceDrm || (!hasX11Display && !hasWaylandDisplay));
+}
 
 if (isArm || isLinux) {
     try { execSync('command -v omxplayer', { stdio: 'ignore' }); hasOmxplayer = true; } catch (e) {}
     try { execSync('command -v mpv', { stdio: 'ignore' }); hasMpv = true; } catch (e) {}
     try { execSync('command -v curl', { stdio: 'ignore' }); hasCurl = true; } catch (e) {}
     try { execSync('command -v nice', { stdio: 'ignore' }); hasNice = true; } catch (e) {}
+    try { execSync('command -v grim', { stdio: 'ignore' }); hasGrim = true; } catch (e) {}
+    try { execSync('command -v scrot', { stdio: 'ignore' }); hasScrot = true; } catch (e) {}
+    try { execSync('command -v raspi2png', { stdio: 'ignore' }); hasRaspi2png = true; } catch (e) {}
     try {
         if (fs.existsSync('/proc/device-tree/model')) {
             piModelStr = fs.readFileSync('/proc/device-tree/model', 'utf8').replace(/\0/g, '').trim();
@@ -89,7 +214,6 @@ if (isArm || isLinux) {
 
 // ==============================================================================
 // 0B. MODO VIDEO WALL MODULAR (Leido desde /home/pi/URP/wall.json)
-//     Si wall.json no existe o enabled=false, URPPI3 opera 100% en modo normal.
 // ==============================================================================
 var wallConfigPath = basePath + 'wall.json';
 var wallConfig = {
@@ -104,7 +228,8 @@ var wallConfig = {
     bezelPx: 0,
     orientation: 0,
     syncMode: 'ntp',
-    masterIp: ''
+    masterIp: '',
+    drmMode: false
 };
 var wallConfigMtime = 0;
 var lastWallSignatureLogged = '';
@@ -115,9 +240,10 @@ function loadWallConfig() {
             wallConfig = {
                 enabled: false, activationMode: 'server', mode: 'mirror', screenId: 1,
                 rows: 1, cols: 1, row: 0, col: 0, bezelPx: 0,
-                orientation: 0, syncMode: 'ntp', masterIp: ''
+                orientation: 0, syncMode: 'ntp', masterIp: '', drmMode: false
             };
             wallConfigMtime = 0;
+            detectDisplaySession();
             return wallConfig;
         }
         var st = fs.statSync(wallConfigPath);
@@ -125,16 +251,17 @@ function loadWallConfig() {
             return wallConfig;
         }
         var parsed = JSON.parse(fs.readFileSync(wallConfigPath, 'utf8'));
-        var rows = Math.max(1, parseInt(parsed.rows, 10) || 1);
-        var cols = Math.max(1, parseInt(parsed.cols, 10) || 1);
+        var rows = Math.max(1, Math.min(32, parseInt(parsed.rows, 10) || 1));
+        var cols = Math.max(1, Math.min(32, parseInt(parsed.cols, 10) || 1));
         var total = rows * cols;
-        var screenId = Math.min(total, Math.max(1, parseInt(parsed.screenId, 10) || 1));
+        var screenId = Math.min(999, Math.max(1, parseInt(parsed.screenId, 10) || 1));
+        var effIdx = (screenId - 1) % total;
         var row = (typeof parsed.row === 'number' && parsed.row >= 0 && parsed.row < rows)
             ? parsed.row
-            : Math.floor((screenId - 1) / cols);
+            : Math.floor(effIdx / cols);
         var col = (typeof parsed.col === 'number' && parsed.col >= 0 && parsed.col < cols)
             ? parsed.col
-            : ((screenId - 1) % cols);
+            : (effIdx % cols);
         var actMode = (parsed.activationMode === 'server' || parsed.activationMode === 'local')
             ? parsed.activationMode
             : 'local';
@@ -151,13 +278,16 @@ function loadWallConfig() {
             bezelPx: Math.max(0, Math.min(400, parseInt(parsed.bezelPx, 10) || 0)),
             orientation: [0, 1, 2, 3].indexOf(parseInt(parsed.orientation, 10)) !== -1 ? parseInt(parsed.orientation, 10) : 0,
             syncMode: (parsed.syncMode === 'master') ? 'master' : 'ntp',
-            masterIp: String(parsed.masterIp || '').trim()
+            masterIp: String(parsed.masterIp || '').trim(),
+            drmMode: Boolean(parsed.drmMode)
         };
         wallConfigMtime = st.mtime.getTime();
+        detectDisplaySession();
 
-        var sig = wallConfig.activationMode + '_' + wallConfig.enabled + '_' + wallConfig.mode + '_' + wallConfig.rows + 'x' + wallConfig.cols + '_id' + wallConfig.screenId + '_' + wallConfig.syncMode;
+        var sig = wallConfig.activationMode + '_' + wallConfig.enabled + '_' + wallConfig.mode + '_' + wallConfig.rows + 'x' + wallConfig.cols + '_id' + wallConfig.screenId + '_' + wallConfig.syncMode + '_drm' + useDrmDirect;
         if (sig !== lastWallSignatureLogged) {
             lastWallSignatureLogged = sig;
+            console.log('[DISPLAY:SESION] Salida=' + (useDrmDirect ? 'DRM/KMS directo (sin X11)' : (hasWaylandDisplay ? 'Wayland' : 'X11')));
             if (wallConfig.activationMode === 'server' || wallConfig.enabled) {
                 console.log('[VIDEOWALL] Config -> control=' + wallConfig.activationMode + ', enabled=' + wallConfig.enabled + ', modo=' + wallConfig.mode + ', matriz=' + wallConfig.rows + 'x' + wallConfig.cols + ', pantalla #' + wallConfig.screenId + ' (f' + (wallConfig.row + 1) + ',c' + (wallConfig.col + 1) + '), bisel=' + wallConfig.bezelPx + 'px, sync=' + wallConfig.syncMode + (wallConfig.masterIp ? ('(' + wallConfig.masterIp + ')') : ''));
             }
@@ -197,10 +327,10 @@ function getWallCropFilter() {
 }
 
 loadWallConfig();
+detectDisplaySession();
 
 function getTargetVideoDims() {
     var isVert = isPortraitOrientation();
-    // En Pi 3B+/Zero 2W con mpv (Bookworm/Trixie sin omxplayer), 720p H.264 Baseline L3.1 garantiza decodificación fluida sin tirones
     var use720p = isLowPowerPi && !hasOmxplayer;
     var longEdge = use720p ? 1280 : 1920;
     var shortEdge = use720p ? 720 : 1080;
@@ -225,7 +355,93 @@ function spawnFfmpegLowPriority(ffArgs) {
 }
 
 // ==============================================================================
-// 1. NEUTRALIZACION DEL ESCRITORIO + CORTINA NEGRA PERMANENTE EN X11
+// 0C. CLIENTE HTTP/HTTPS NATIVO (REEMPLAZA A 'request' OBSOLETO)
+// ==============================================================================
+function httpRequest(opts, callback) {
+    if (typeof opts === 'string') opts = { url: opts };
+    var settled = false;
+    var done = function (err, res, body) {
+        if (settled) return;
+        settled = true;
+        if (typeof callback === 'function') callback(err, res, body);
+    };
+
+    var redirects = opts._redirects || 0;
+    var maxRedirects = (opts.followRedirect === false) ? 0 : 5;
+    var timeoutMs = opts.timeout || 15000;
+
+    try {
+        var parsed = urlMod.parse(opts.url);
+        var isHttps = parsed.protocol === 'https:';
+        var transport = isHttps ? https : http;
+        var reqHeaders = Object.assign({}, opts.headers || {});
+        var payload = null;
+
+        if (opts.body !== undefined && opts.body !== null) {
+            if (opts.json || typeof opts.body === 'object') {
+                payload = Buffer.from(JSON.stringify(opts.body), 'utf8');
+                if (!reqHeaders['Content-Type']) reqHeaders['Content-Type'] = 'application/json';
+            } else {
+                payload = Buffer.isBuffer(opts.body) ? opts.body : Buffer.from(String(opts.body), 'utf8');
+            }
+            reqHeaders['Content-Length'] = payload.length;
+        }
+
+        var reqOpts = {
+            protocol: parsed.protocol,
+            hostname: parsed.hostname,
+            port: parsed.port || (isHttps ? 443 : 80),
+            path: parsed.path || '/',
+            method: (opts.method || 'GET').toUpperCase(),
+            headers: reqHeaders,
+            timeout: timeoutMs
+        };
+
+        var req = transport.request(reqOpts, function (res) {
+            var code = res.statusCode || 0;
+            if ((code === 301 || code === 302 || code === 303 || code === 307 || code === 308) && res.headers.location && redirects < maxRedirects) {
+                res.resume();
+                var nextUrl = urlMod.resolve(opts.url, res.headers.location);
+                var nextMethod = (code === 303) ? 'GET' : reqOpts.method;
+                var nextOpts = Object.assign({}, opts, { url: nextUrl, method: nextMethod, _redirects: redirects + 1 });
+                return httpRequest(nextOpts, done);
+            }
+
+            var chunks = [];
+            res.on('data', function (chunk) { chunks.push(chunk); });
+            res.on('end', function () {
+                var buf = Buffer.concat(chunks);
+                if (opts.encoding === null) {
+                    return done(null, res, buf);
+                }
+                var txt = buf.toString(typeof opts.encoding === 'string' ? opts.encoding : 'utf8');
+                if (opts.json) {
+                    try {
+                        return done(null, res, JSON.parse(txt));
+                    } catch (je) {
+                        return done(null, res, txt);
+                    }
+                }
+                return done(null, res, txt);
+            });
+        });
+
+        req.on('timeout', function () {
+            req.destroy(new Error('HTTP timeout (' + timeoutMs + 'ms)'));
+        });
+        req.on('error', function (err) {
+            done(err, null, null);
+        });
+
+        if (payload) req.write(payload);
+        req.end();
+    } catch (e) {
+        done(e, null, null);
+    }
+}
+
+// ==============================================================================
+// 1. NEUTRALIZACION DEL ESCRITORIO + CORTINA NEGRA + ROTACION HDMI
 // ==============================================================================
 var curtainProc = null;
 var BLACK_CURTAIN_PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAADElEQVR4nGNgGB4AAADIAAGtQHYiAAAAAElFTkSuQmCC';
@@ -274,10 +490,7 @@ function getWaylandEnv() {
             }
         } catch (e) {}
     }
-    return {
-        runtimeDir: runtimeDir,
-        waylandDisplay: waylandDisp
-    };
+    return { runtimeDir: runtimeDir, waylandDisplay: waylandDisp };
 }
 
 function getGuiEnv() {
@@ -287,9 +500,7 @@ function getGuiEnv() {
         XAUTHORITY: getXauthPath(),
         XDG_RUNTIME_DIR: wl.runtimeDir
     };
-    if (wl.waylandDisplay) {
-        extra.WAYLAND_DISPLAY = wl.waylandDisplay;
-    }
+    if (wl.waylandDisplay) extra.WAYLAND_DISPLAY = wl.waylandDisplay;
     return Object.assign({}, process.env, extra);
 }
 
@@ -388,7 +599,7 @@ function handleDisplayRotationResult(cfgRot, stdout) {
         if (osScreenRotated) {
             console.log('[DISPLAY] Rotación de sistema activa (display_hdmi_rotate=' + cfgRot + ').');
         } else {
-            console.log('[DISPLAY] Sistema sin rotación HDMI nativa (display_hdmi_rotate=' + cfgRot + '). Usando rotación GPU por reproductor (--video-rotate=' + getMpvVideoRotateDeg() + ').');
+            console.log('[DISPLAY] Rotación GPU por reproductor (--video-rotate=' + getMpvVideoRotateDeg() + ').');
         }
     }
 
@@ -404,6 +615,10 @@ function handleDisplayRotationResult(cfgRot, stdout) {
 
 function refreshDisplayRotationSync() {
     if (!isArm && !isLinux) return;
+    if (useDrmDirect) {
+        osScreenRotated = false;
+        return;
+    }
     var cfgRot = readHdmiRotateFromConfig();
     if (cfgRot === null || cfgRot === 0) {
         osScreenRotated = false;
@@ -418,7 +633,8 @@ function refreshDisplayRotationSync() {
 }
 
 function applyDisplayRotationIfNeeded(callback) {
-    if (!isArm && !isLinux) {
+    if (!isArm && !isLinux || useDrmDirect) {
+        osScreenRotated = false;
         if (callback) callback(false);
         return;
     }
@@ -428,7 +644,6 @@ function applyDisplayRotationIfNeeded(callback) {
         if (callback) callback(false);
         return;
     }
-
     exec(buildDisplayRotationScript(cfgRot), function (err, stdout) {
         var didChange = handleDisplayRotationResult(cfgRot, stdout);
         if (callback) callback(didChange);
@@ -438,6 +653,7 @@ refreshDisplayRotationSync();
 
 function startBlackCurtain() {
     if (!isArm && !isLinux) return;
+    if (useDrmDirect || !hasX11Display) return;
     if (!URPActive || curtainProc != null) return;
     var curtainPath = ensureBlackCurtainAsset();
     if (!fs.existsSync(curtainPath)) return;
@@ -447,7 +663,7 @@ function startBlackCurtain() {
         curtainProc.on('error', function () { curtainProc = null; });
         curtainProc.on('exit', function () {
             curtainProc = null;
-            if (URPActive) {
+            if (URPActive && !useDrmDirect && hasX11Display) {
                 setTimeout(startBlackCurtain, 1000);
             }
         });
@@ -457,9 +673,8 @@ function startBlackCurtain() {
 }
 
 function suppressDesktopPopups() {
-    if (!isArm && !isLinux) return;
+    if (!isArm && !isLinux || useDrmDirect) return;
     var xEnv = "export DISPLAY=:0; export XAUTHORITY=\"" + getXauthPath() + "\"; ";
-    // No invocar pcmanfm --desktop-off en bucle cada 20s porque dispara 'Drawing desktop' y consume CPU si lxsession lo reinicia
     var cmd = xEnv + "pkill -9 -f 'lwrespawn.*(pcmanfm|wf-panel)' 2>/dev/null || true; " +
               "pkill -9 -x wf-panel-pi lxpanel xcompmgr picom compton mako dunst xfce4-notifyd notification-daemon lxqt-notificationd piwiz blueman-applet nm-applet zenity yad 2>/dev/null || true; " +
               xEnv + "xset s off -dpms s noblank 2>/dev/null || true";
@@ -492,6 +707,7 @@ function writeCleanAutostartDir(dirPath, cleanContent) {
 
 function neutralizeDesktop() {
     if (!isArm && !isLinux) return;
+    if (useDrmDirect) return;
     try {
         var homeBase = process.env.HOME || '/home/pi';
         var pcmanDirs = [
@@ -511,7 +727,6 @@ function neutralizeDesktop() {
             } catch (ce) {}
         }
 
-        // Anular pcmanfm --desktop y paneles en TODOS los perfiles de sesion (LXDE-pi, LXDE-pi-x, rpd-x, openbox, labwc)
         var cleanX11As = "#URP_CLEAN\n@xset s off\n@xset -dpms\n@xset s noblank\n@xhost +local:\n";
         var lxDirs = [
             homeBase + '/.config/lxsession/LXDE-pi',
@@ -523,7 +738,6 @@ function neutralizeDesktop() {
             writeCleanAutostartDir(lxDirs[ld], cleanX11As);
         }
 
-        // Neutralizar labwc autostart para que tampoco dispare lwrespawn pcmanfm --desktop
         try {
             var labwcDir = homeBase + '/.config/labwc';
             ensureDir(labwcDir);
@@ -533,7 +747,6 @@ function neutralizeDesktop() {
             }
         } catch (le) {}
 
-        // Ocultar autostart de pcmanfm/notificaciones en ~/.config/autostart
         try {
             var xdgAuto = homeBase + '/.config/autostart';
             ensureDir(xdgAuto);
@@ -549,7 +762,7 @@ function neutralizeDesktop() {
         var xEnv = "export DISPLAY=:0; export XAUTHORITY=\"" + getXauthPath() + "\"; ";
         var cmd = xEnv + "pkill -9 -f 'lwrespawn.*(pcmanfm|wf-panel)' 2>/dev/null || true; " +
                   "if pgrep -x pcmanfm >/dev/null 2>&1; then " + xEnv + "pcmanfm --desktop-off 2>/dev/null || true; fi; " +
-                  "pkill -9 -x wf-panel-pi lxpanel mako dunst xfce4-notifyd notification-daemon lxqt-notificationd piwiz blueman-applet nm-applet zenity yad 2>/dev/null || true; " +
+                  "pkill -9 -x wf-panel-pi lxpanel xcompmgr picom compton mako dunst xfce4-notifyd notification-daemon lxqt-notificationd piwiz blueman-applet nm-applet zenity yad 2>/dev/null || true; " +
                   xEnv + "xsetroot -solid black 2>/dev/null; " +
                   xEnv + "xset s off -dpms s noblank 2>/dev/null; " +
                   xEnv + "pkill -9 feh 2>/dev/null; " +
@@ -563,6 +776,7 @@ function neutralizeDesktop() {
 }
 neutralizeDesktop();
 setInterval(function () {
+    detectDisplaySession();
     suppressDesktopPopups();
     applyDisplayRotationIfNeeded();
 }, 20000);
@@ -575,12 +789,12 @@ function killBackground() {
 }
 
 var setBackground = function (callback) {
-    if ((isArm || isLinux) && !isPlaying) {
+    if ((isArm || isLinux) && !isPlaying && !useDrmDirect && hasX11Display) {
         var bgPath = basePath + 'background.png';
         if (procBackgroundImage == null && fs.existsSync(bgPath)) {
             try {
                 procBackgroundImage = spawn('feh', ['-x', '-q', '-F', bgPath], {
-                    env: Object.assign({}, process.env, { DISPLAY: ':0', XAUTHORITY: '/home/pi/.Xauthority' })
+                    env: Object.assign({}, process.env, { DISPLAY: ':0', XAUTHORITY: getXauthPath() })
                 });
                 procBackgroundImage.on('error', function () { procBackgroundImage = null; });
             } catch (e) {
@@ -596,16 +810,13 @@ var setBackground = function (callback) {
 };
 
 // ==============================================================================
-// 2. MOTOR DE REPRODUCCION NATIVO (RPI 3B+: OMXPLAYER | RPI 4/5: MPV) + FEH
-//   - Limpieza síncrona antes de lanzar cada reproductor (cero race conditions)
-//   - Detección automática de omxplayer (VideoCore IV) o mpv (KMS/DRM en RPi 4/5)
-//   - Capa negra fija (-b) y --layer 10000 para evitar destellos del escritorio
+// 2. MOTOR DE REPRODUCCION (OMXPLAYER / MPV X11-WAYLAND-DRM) + WATCHDOG IPC
 // ==============================================================================
 var currentPlaylist = [];
 var currentMediaIndex = 0;
 var activePlayerProcess = null;
+var activePlayerBin = '';
 var activeFehProcess = null;
-var fehCurrentFile = '';
 var imageTimer = null;
 var filesPlaying = [];
 var playbackToken = 0;
@@ -613,13 +824,12 @@ var playbackToken = 0;
 function killMediaPlayersSync() {
     if (!isArm && !isLinux) return;
     try {
-        // No usar killall feh aquí para preservar la cortina negra permanente (curtainProc)
         execSync("killall -9 omxplayer.bin omxplayer mpv 2>/dev/null || true", { stdio: 'ignore' });
     } catch (e) {}
 }
 
 // ==============================================================================
-// 2B. MOTOR DE SINCRONIZACION VIDEO WALL (MPV IPC: NTP SIN MASTER Y MASTER/SLAVE)
+// 2B. MOTOR DE SINCRONIZACION VIDEO WALL + WATCHDOG ANTI-CONGELAMIENTO (MPV IPC)
 // ==============================================================================
 var mpvIpcSocketPath = '/tmp/mpv-urp.sock';
 var wallSyncTimer = null;
@@ -627,6 +837,9 @@ var wallSyncBusy = false;
 var lastWallSeekAt = 0;
 var wallMasterState = { timePos: 0, duration: 0, ts: 0, file: '' };
 var wallSyncStatus = { active: false, mode: '', driftMs: 0, speed: 1, targetPos: 0, curPos: 0, lastSyncAt: 0, lastError: '' };
+var watchdogLastPos = -1;
+var watchdogStallCount = 0;
+var watchdogBusy = false;
 
 function stopWallSync() {
     if (wallSyncTimer) {
@@ -697,6 +910,38 @@ function mpvIpcRequest(commands, callback) {
     }
 }
 
+// Watchdog cada 15s: si mpv queda congelado en el mismo cuadro 45s seguidos, reinicia solo mpv
+setInterval(function () {
+    if (!isPlaying || !activePlayerProcess || activePlayerBin !== 'mpv' || watchdogBusy) return;
+    if (!fs.existsSync(mpvIpcSocketPath)) return;
+    watchdogBusy = true;
+    mpvIpcRequest([['get_property', 'time-pos'], ['get_property', 'pause'], ['get_property', 'duration']], function (err, res) {
+        watchdogBusy = false;
+        if (err || !res || !res[1] || res[1].error !== 'success') return;
+        var pos = parseFloat(res[1].data);
+        var paused = Boolean(res[2] && res[2].data === true);
+        var dur = (res[3] && res[3].error === 'success') ? parseFloat(res[3].data) : 0;
+        if (isNaN(pos) || paused || (dur > 0 && dur <= 3)) {
+            watchdogStallCount = 0;
+            return;
+        }
+        if (watchdogLastPos >= 0 && Math.abs(pos - watchdogLastPos) < 0.05) {
+            watchdogStallCount++;
+            if (watchdogStallCount >= 3) {
+                watchdogStallCount = 0;
+                watchdogLastPos = -1;
+                console.warn('[WATCHDOG] mpv congelado en pos=' + pos.toFixed(2) + 's durante 45s. Reiniciando reproductor...');
+                stopOmx(function () {
+                    setTimeout(function () { checkSchedule(); }, 300);
+                });
+            }
+        } else {
+            watchdogStallCount = 0;
+            watchdogLastPos = pos;
+        }
+    });
+}, 15000);
+
 function applyWallTargetDrift(curPos, duration, targetPos) {
     var diff = targetPos - curPos;
     if (diff > duration / 2) diff -= duration;
@@ -708,7 +953,6 @@ function applyWallTargetDrift(curPos, duration, targetPos) {
     wallSyncStatus.lastSyncAt = Date.now();
     wallSyncStatus.lastError = '';
 
-    // Evitar ajustes justo sobre el salto del bucle final -> inicio
     if (curPos < 0.8 || curPos > duration - 0.8 || targetPos < 0.8 || targetPos > duration - 0.8) {
         return;
     }
@@ -760,7 +1004,6 @@ function startWallSync(currentFile) {
                 return;
             }
 
-            // En modo Master LAN (sin masterIp), esta Raspberry sirve el reloj maestro y no se corrige
             if (wallConfig.syncMode === 'master' && !wallConfig.masterIp) {
                 wallMasterState = {
                     timePos: curPos,
@@ -781,10 +1024,9 @@ function startWallSync(currentFile) {
                 return;
             }
 
-            // Modo Slave LAN contra Master IP
             if (wallConfig.syncMode === 'master' && wallConfig.masterIp) {
                 var reqStart = Date.now();
-                request({
+                httpRequest({
                     url: 'http://' + wallConfig.masterIp + ':' + URPPort + '/wall/sync',
                     json: true,
                     timeout: 1200
@@ -805,7 +1047,6 @@ function startWallSync(currentFile) {
                 return;
             }
 
-            // Modo NTP automático (sin equipo Master extra)
             var targetPosNtp = ((Date.now() / 1000) % duration);
             applyWallTargetDrift(curPos, duration, targetPosNtp);
             wallSyncBusy = false;
@@ -813,10 +1054,11 @@ function startWallSync(currentFile) {
     }, 1500);
 }
 
-// Detención segura de procesos de medios anteriores
 function stopCurrentMedia(callback) {
-    playbackToken++; // Invalida cualquier callback pendiente de procesos o temporizadores anteriores
+    playbackToken++;
     stopWallSync();
+    watchdogStallCount = 0;
+    watchdogLastPos = -1;
     if (imageTimer) {
         clearTimeout(imageTimer);
         imageTimer = null;
@@ -828,6 +1070,7 @@ function stopCurrentMedia(callback) {
             activePlayerProcess.kill('SIGKILL');
         } catch (e) {}
         activePlayerProcess = null;
+        activePlayerBin = '';
     }
     if (activeFehProcess != null) {
         try {
@@ -836,18 +1079,16 @@ function stopCurrentMedia(callback) {
             activeFehProcess.kill('SIGKILL');
         } catch (e) {}
         activeFehProcess = null;
-        fehCurrentFile = '';
     }
     killMediaPlayersSync();
     if (typeof callback === 'function') setTimeout(callback, 50);
 }
 
-// Reproducción secuencial limpia de elementos (Video con OMX/MPV | Imagen con FEH)
 function playCurrentIndex() {
     if (!isPlaying || currentPlaylist.length === 0) return;
 
     if (currentMediaIndex >= currentPlaylist.length) {
-        currentMediaIndex = 0; // Reinicio cíclico
+        currentMediaIndex = 0;
     }
 
     var item = currentPlaylist[currentMediaIndex];
@@ -856,7 +1097,6 @@ function playCurrentIndex() {
     }
     var fullPath = path.isAbsolute(item.file) ? item.file : path.resolve(contentBasePath, item.file);
 
-    // Si el archivo no existe o es demasiado pequeño/corrupto, saltar de inmediato al siguiente
     if (!fs.existsSync(fullPath)) {
         console.warn("[PLAYER] Archivo no encontrado: " + fullPath + ". Saltando...");
         currentMediaIndex++;
@@ -880,10 +1120,8 @@ function playCurrentIndex() {
 
     var ext = path.extname(fullPath).toLowerCase();
     var isImage = (ext === '.jpg' || ext === '.jpeg' || ext === '.png' || ext === '.bmp');
-
     var env = getGuiEnv();
     var mpvRotateDeg = getMpvVideoRotateDeg();
-
     var token = ++playbackToken;
 
     if (imageTimer) {
@@ -891,7 +1129,6 @@ function playCurrentIndex() {
         imageTimer = null;
     }
 
-    // Cerrar cualquier proceso previo de video o imagen de forma SINCRONA antes de lanzar el nuevo
     var needsSyncKill = (activePlayerProcess != null);
     if (activePlayerProcess != null) {
         try {
@@ -900,6 +1137,7 @@ function playCurrentIndex() {
             activePlayerProcess.kill('SIGKILL');
         } catch (e) {}
         activePlayerProcess = null;
+        activePlayerBin = '';
     }
     if (activeFehProcess != null) {
         try {
@@ -913,21 +1151,25 @@ function playCurrentIndex() {
         killMediaPlayersSync();
     }
 
-    // --------------------------------------------------------------------------
-    // CASO A: IMAGEN (respaldo mpv/feh mientras se convierte a MP4)
-    // --------------------------------------------------------------------------
+    // CASO A: IMAGEN (respaldo mientras se convierte a MP4)
     if (isImage) {
         var duration = (item.duration && item.duration > 0) ? parseInt(item.duration, 10) : 10;
         if (isNaN(duration) || duration <= 0) duration = 10;
         console.log("[PLAYER:IMAGEN] Mostrando (" + duration + "s): " + path.basename(fullPath));
 
-        if (mpvRotateDeg > 0 && hasMpv) {
+        if ((useDrmDirect || mpvRotateDeg > 0 || !hasX11Display) && hasMpv) {
+            var imgMpvArgs = [
+                '--fs', '--no-osc', '--no-osd-bar', '--really-quiet',
+                '--no-input-default-bindings', '--cursor-autohide=always', '--ontop',
+                '--image-display-duration=inf'
+            ];
+            if (useDrmDirect) {
+                imgMpvArgs.push('--vo=gpu,drm', '--gpu-context=drm');
+            }
+            if (mpvRotateDeg > 0) imgMpvArgs.push('--video-rotate=' + mpvRotateDeg);
+            imgMpvArgs.push(fullPath);
             try {
-                activeFehProcess = spawn('mpv', [
-                    '--fs', '--no-osc', '--no-osd-bar', '--really-quiet',
-                    '--no-input-default-bindings', '--cursor-autohide=always', '--ontop',
-                    '--image-display-duration=inf', '--video-rotate=' + mpvRotateDeg, fullPath
-                ], { env: env });
+                activeFehProcess = spawn('mpv', imgMpvArgs, { env: env });
                 activeFehProcess.on('error', function () { activeFehProcess = null; });
             } catch (e) {
                 activeFehProcess = null;
@@ -946,7 +1188,6 @@ function playCurrentIndex() {
                     }
                 });
             } catch (e) {
-                console.error("[FEH EXCEPTION]", e.message);
                 activeFehProcess = null;
             }
         }
@@ -960,22 +1201,19 @@ function playCurrentIndex() {
         return;
     }
 
-    // --------------------------------------------------------------------------
-    // CASO B: VIDEO (omxplayer en RPi 3B+ legacy o mpv en RPi 3B+/4/5 Bookworm/Trixie o Video Wall)
-    // --------------------------------------------------------------------------
-    console.log("[PLAYER:VIDEO] Reproduciendo: " + path.basename(fullPath) + (mpvRotateDeg > 0 ? " [rot=" + mpvRotateDeg + "°]" : ""));
+    // CASO B: VIDEO (omxplayer legacy o mpv X11/Wayland/DRM con IPC activo)
+    console.log("[PLAYER:VIDEO] Reproduciendo: " + path.basename(fullPath) + (useDrmDirect ? " [DRM]" : "") + (mpvRotateDeg > 0 ? " [rot=" + mpvRotateDeg + "°]" : ""));
 
     var wallModeOn = isWallActive();
-    var playerBin = (wallModeOn && hasMpv) ? 'mpv' : (hasOmxplayer ? 'omxplayer' : (hasMpv ? 'mpv' : 'omxplayer'));
+    var playerBin = ((wallModeOn || useDrmDirect) && hasMpv) ? 'mpv' : (hasOmxplayer ? 'omxplayer' : (hasMpv ? 'mpv' : 'omxplayer'));
     var playerArgs = [];
 
     if (playerBin === 'omxplayer') {
         playerArgs = ['-b', '--no-osd', '--layer', '10000', '--no-keys'];
-        if (currentPlaylist.length === 1) {
-            playerArgs.push('--loop');
-        }
+        if (currentPlaylist.length === 1) playerArgs.push('--loop');
         playerArgs.push(fullPath);
     } else {
+        try { if (fs.existsSync(mpvIpcSocketPath)) fs.unlinkSync(mpvIpcSocketPath); } catch (se) {}
         var mpvBaseArgs = [
             '--fs', '--no-osc', '--no-osd-bar', '--really-quiet',
             '--no-input-default-bindings', '--cursor-autohide=always', '--ontop',
@@ -985,14 +1223,14 @@ function playCurrentIndex() {
             '--vd-lavc-fast', '--vd-lavc-skiploopfilter=nonref',
             '--audio-fallback-to-null=yes',
             '--cache=yes', '--demuxer-max-bytes=16M', '--demuxer-max-back-bytes=4M',
-            '--framedrop=vo'
+            '--framedrop=vo',
+            '--input-ipc-server=' + mpvIpcSocketPath
         ];
+        if (useDrmDirect) {
+            mpvBaseArgs.push('--vo=gpu,drm', '--gpu-context=drm');
+        }
         if (mpvRotateDeg > 0) {
             mpvBaseArgs.push('--video-rotate=' + mpvRotateDeg);
-        }
-        if (wallModeOn) {
-            try { if (fs.existsSync(mpvIpcSocketPath)) fs.unlinkSync(mpvIpcSocketPath); } catch (se) {}
-            mpvBaseArgs.push('--input-ipc-server=' + mpvIpcSocketPath);
         }
         var usedMpvPlaylist = false;
         if (currentPlaylist.length > 1 && currentMediaIndex === 0) {
@@ -1027,11 +1265,14 @@ function playCurrentIndex() {
     }
 
     stopWallSync();
+    watchdogStallCount = 0;
+    watchdogLastPos = -1;
     var playStartTime = Date.now();
     var playerStderr = '';
     try {
         var mediaProc = spawn(playerBin, playerArgs, { env: env, stdio: ['ignore', 'ignore', 'pipe'] });
         activePlayerProcess = mediaProc;
+        activePlayerBin = playerBin;
         if (wallModeOn && playerBin === 'mpv' && currentPlaylist.length === 1) {
             startWallSync(fullPath);
         }
@@ -1045,6 +1286,7 @@ function playCurrentIndex() {
         mediaProc.on('exit', function (code) {
             if (token !== playbackToken || !isPlaying) return;
             activePlayerProcess = null;
+            activePlayerBin = '';
             stopWallSync();
             var elapsed = Date.now() - playStartTime;
             var minExpectedMs = (!item.duration || item.duration >= 3) ? 1000 : 250;
@@ -1067,12 +1309,11 @@ function playCurrentIndex() {
             console.error("[" + playerBin.toUpperCase() + " ERROR]:", err.message);
             if (token !== playbackToken || !isPlaying) return;
             activePlayerProcess = null;
+            activePlayerBin = '';
             stopWallSync();
             currentMediaIndex++;
             setTimeout(function () {
-                if (token === playbackToken && isPlaying) {
-                    playCurrentIndex();
-                }
+                if (token === playbackToken && isPlaying) playCurrentIndex();
             }, 500);
         });
     } catch (e) {
@@ -1083,9 +1324,7 @@ function playCurrentIndex() {
     }
 }
 
-// Despachador principal de listas (acepta archivos o pares { file, duration })
 var seamlessTelemetryTimer = null;
-
 function stopSeamlessTelemetry() {
     if (seamlessTelemetryTimer) {
         clearTimeout(seamlessTelemetryTimer);
@@ -1100,9 +1339,7 @@ function startSeamlessTelemetry(items) {
     var step = function () {
         if (!isPlaying) return;
         var cur = items[idx % items.length];
-        if (cur && cur.idContent) {
-            URPNowPlaying = cur.idContent;
-        }
+        if (cur && cur.idContent) URPNowPlaying = cur.idContent;
         var durMs = ((cur && cur.duration > 0) ? parseInt(cur.duration, 10) : 10) * 1000;
         if (isNaN(durMs) || durMs < 1000) durMs = 10000;
         idx = (idx + 1) % items.length;
@@ -1136,7 +1373,6 @@ function playSignagePlaylist(playlist) {
     if (newItems.length === 0) return;
 
     var fileList = newItems.map(function (it) { return it.file; });
-
     if (isPlaying && _.isEqual(fileList, filesPlaying) && (activePlayerProcess != null || activeFehProcess != null || imageTimer != null)) {
         return;
     }
@@ -1150,7 +1386,6 @@ function playSignagePlaylist(playlist) {
     currentPlaylist = newItems;
     currentMediaIndex = 0;
     isPlaying = true;
-
     playCurrentIndex();
 }
 
@@ -1171,15 +1406,11 @@ function emergencyDiskPlayback() {
         if (!fs.existsSync(contentBasePath)) return;
 
         var diskFiles = fs.readdirSync(contentBasePath);
-
-        // Disparar conversion automatica de imagenes sueltas en content a video MP4
         convertExistingImages();
 
         var curWallSig = getWallSignature();
         var videoFiles = diskFiles.filter(function (f) {
-            if (!isVideoFile(f) || f.indexOf('.part') !== -1 || f.indexOf('temp_') !== -1) {
-                return false;
-            }
+            if (!isVideoFile(f) || f.indexOf('.part') !== -1 || f.indexOf('temp_') !== -1) return false;
             if (/_\d+s\.mp4$/i.test(f)) {
                 if (isWallTileActive()) {
                     if (f.indexOf('_' + curWallSig + '_') === -1) return false;
@@ -1202,10 +1433,9 @@ function emergencyDiskPlayback() {
             }
         });
 
-        // Si ya hay videos (incluyendo los MP4 generados de imagenes), reproducirlos en bucle (usando copia optimizada si ya existe)
         if (videoFiles.length > 0) {
             var resolvedDiskVideos = [];
-            console.log('[STARTUP] ¡' + videoFiles.length + ' video(s) encontrados en disco! Iniciando reproduccion continua:');
+            console.log('[STARTUP] ¡' + videoFiles.length + ' video(s) encontrados en disco! Iniciando reproducción continua:');
             for (var p = 0; p < videoFiles.length; p++) {
                 var rawDiskPath = path.join(contentBasePath, videoFiles[p]);
                 var optDiskPath = getOptimizedVideoPath(rawDiskPath);
@@ -1213,7 +1443,6 @@ function emergencyDiskPlayback() {
                     try {
                         if (fs.statSync(optDiskPath).size > 4096) {
                             resolvedDiskVideos.push(optDiskPath);
-                            console.log('  -> ' + videoFiles[p] + ' (optimizado)');
                             continue;
                         }
                     } catch (oe) {}
@@ -1222,7 +1451,6 @@ function emergencyDiskPlayback() {
                     scheduleVideoOptimization(rawDiskPath);
                 }
                 resolvedDiskVideos.push(videoFiles[p]);
-                console.log('  -> ' + videoFiles[p]);
             }
             playSignagePlaylist(resolvedDiskVideos);
             return;
@@ -1231,7 +1459,6 @@ function emergencyDiskPlayback() {
         var imageFiles = diskFiles.filter(function (f) {
             return isImg(f) && f.indexOf('.part') === -1 && f.indexOf('temp_') === -1;
         });
-
         if (imageFiles.length > 0) {
             playSignagePlaylist(imageFiles);
         } else {
@@ -1243,7 +1470,6 @@ function emergencyDiskPlayback() {
     }
 }
 
-// Directorios iniciales
 function ensureDir(p) {
     try {
         if (!fs.existsSync(p)) {
@@ -1259,11 +1485,10 @@ ensureDir(tempFolderPath);
 ensureDir(seamlessBasePath);
 ensureDir(optimizedBasePath);
 
-// Ejecutar reproduccion de disco inmediatamente al arrancar el script
 emergencyDiskPlayback();
 
 // ==============================================================================
-// 4. BASE DE DATOS LEVELDB ROBUSTA (Compatible level v6/v7, v8/v9/v10 y fallback JSON)
+// 4. BASE DE DATOS LEVELDB + BACKUP JSON ATOMICO
 // ==============================================================================
 var level = null;
 var db = null;
@@ -1359,7 +1584,6 @@ function wrapModernLevel(rawDb, jsonBackup) {
 
 var jsonFallbackDb = createJsonDbAdapter(basePath + 'URPDB.json');
 try {
-    // Si hubo un corte de luz o crash previo, limpiar lock huerfano para no congelar
     var lockFile = basePath + 'URPDB/LOCK';
     if (fs.existsSync(lockFile)) {
         try { fs.unlinkSync(lockFile); } catch (e) {}
@@ -1383,7 +1607,7 @@ try {
         db = jsonFallbackDb;
     }
 } catch (e) {
-    console.warn('[DB] LevelDB no disponible o bloqueada, usando almacenamiento JSON:', e.message);
+    console.warn('[DB] LevelDB no disponible, usando almacenamiento JSON:', e.message);
     db = jsonFallbackDb;
 }
 
@@ -1428,7 +1652,7 @@ function initDB() {
 initDB();
 
 // ==============================================================================
-// 5. UTILIDADES DE ARCHIVOS Y RED
+// 5. UTILIDADES DE ARCHIVOS, CRIPTOGRAFIA Y CONVERSION
 // ==============================================================================
 var d = require('domain').create();
 d.on('error', function (err) {
@@ -1439,12 +1663,7 @@ d.on('error', function (err) {
         console.error(convertDate(date) + " domain error caught:", err ? err.message : err);
 });
 
-var request = require('request');
-var async = require('async');
 var JSFtp = require('jsftp');
-var url = require('url');
-var http = require('http');
-var crypto = require('crypto');
 var algorithm = 'aes-256-ctr';
 var password = 'TBEE';
 
@@ -1462,10 +1681,7 @@ function evpBytesToKey(passStr, keyLen, ivLen) {
         totalLen += prev.length;
     }
     var derived = Buffer.concat(chunks);
-    return {
-        key: derived.slice(0, keyLen),
-        iv: derived.slice(keyLen, keyLen + ivLen)
-    };
+    return { key: derived.slice(0, keyLen), iv: derived.slice(keyLen, keyLen + ivLen) };
 }
 
 function decrypt(text) {
@@ -1486,9 +1702,9 @@ function decrypt(text) {
     }
 }
 
-function convertDate(d) {
+function convertDate(dt) {
     function pad(s) { return (s < 10) ? '0' + s : s; }
-    return [d.getFullYear(), pad(d.getMonth() + 1), pad(d.getDate())].join('-');
+    return [dt.getFullYear(), pad(dt.getMonth() + 1), pad(dt.getDate())].join('-');
 }
 
 var md5Cache = {};
@@ -1533,11 +1749,7 @@ function buildFtpPath(base, customerId, filename) {
 }
 
 function fileExist(filePath) {
-    try {
-        return fs.existsSync(filePath);
-    } catch (e) {
-        return false;
-    }
+    try { return fs.existsSync(filePath); } catch (e) { return false; }
 }
 
 function isImg(filename) {
@@ -1552,7 +1764,6 @@ function isVideoFile(filename) {
     return ['.mp4', '.mkv', '.avi', '.mov', '.webm', '.m4v', '.ts', '.mpg', '.mpeg', '.wmv', '.flv'].indexOf(ext) !== -1;
 }
 
-// Cola secuencial atómica para conversión de imagen a video MP4 (compatible VideoCore IV / MPV)
 var renderQueue = [];
 var activeRenderOutPath = '';
 var activeRenderCallbacks = [];
@@ -1583,31 +1794,24 @@ function processNextRender() {
         if (!success && fileExist(tmpPath)) {
             try { fs.unlinkSync(tmpPath); } catch (e) {}
         }
-
         for (var ci = 0; ci < cbs.length; ci++) {
             try { cbs[ci](success); } catch (e) {}
         }
-
         if (success) {
             setTimeout(function () {
                 checkSchedule();
+                prebuildAllScheduleBlocks();
             }, 500);
         }
         processNextRender();
     };
 
-    if (!fileExist(file)) {
-        console.warn('[RENDER] Imagen origen no encontrada: ' + file);
-        return finishJob(false);
-    }
+    if (!fileExist(file)) return finishJob(false);
 
     if (fileExist(outPath)) {
         try {
-            if (fs.statSync(outPath).size > 4096) {
-                return finishJob(true);
-            } else {
-                fs.unlinkSync(outPath);
-            }
+            if (fs.statSync(outPath).size > 4096) return finishJob(true);
+            fs.unlinkSync(outPath);
         } catch (e) {}
     }
 
@@ -1626,30 +1830,14 @@ function processNextRender() {
              'setsar=1,format=yuv420p';
 
     var ffArgs = [
-        '-nostdin',
-        '-y',
-        '-loglevel', 'error',
-        '-loop', '1',
-        '-framerate', '25',
-        '-t', String(duration),
-        '-i', file,
-        '-f', 'lavfi',
-        '-t', String(duration),
-        '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
+        '-nostdin', '-y', '-loglevel', 'error',
+        '-loop', '1', '-framerate', '25', '-t', String(duration), '-i', file,
+        '-f', 'lavfi', '-t', String(duration), '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
         '-vf', vf,
-        '-c:v', 'libx264',
-        '-threads', dims.threads,
-        '-preset', 'ultrafast',
-        '-profile:v', dims.profile,
-        '-level', dims.level,
-        '-pix_fmt', 'yuv420p',
-        '-r', '25',
-        '-g', '25',
-        '-bf', '0',
-        '-c:a', 'aac',
-        '-b:a', '128k',
-        '-t', String(duration),
-        '-movflags', '+faststart',
+        '-c:v', 'libx264', '-threads', dims.threads, '-preset', 'ultrafast',
+        '-profile:v', dims.profile, '-level', dims.level, '-pix_fmt', 'yuv420p',
+        '-r', '25', '-vsync', 'cfr', '-g', '25', '-bf', '0',
+        '-c:a', 'aac', '-b:a', '128k', '-t', String(duration), '-movflags', '+faststart',
         tmpPath
     ];
 
@@ -1673,9 +1861,7 @@ function processNextRender() {
         if (ffProc.stderr) {
             ffProc.stderr.on('data', function (chunk) {
                 stderrLog += chunk.toString('utf8');
-                if (stderrLog.length > 2048) {
-                    stderrLog = stderrLog.slice(-2048);
-                }
+                if (stderrLog.length > 2048) stderrLog = stderrLog.slice(-2048);
             });
         }
         ffProc.on('error', function (err) {
@@ -1689,26 +1875,17 @@ function processNextRender() {
             if (finished) return;
             finished = true;
             clearTimeout(renderTimeout);
-
             if (code !== 0) {
                 console.error('[RENDER] Error ffmpeg (code ' + code + '): ' + (stderrLog.trim() || 'sin detalle'));
                 return finishJob(false);
             }
-
             try {
-                if (!fs.existsSync(tmpPath) || fs.statSync(tmpPath).size <= 4096) {
-                    console.error('[RENDER] Archivo MP4 generado vacío o corrupto: ' + tmpPath);
-                    return finishJob(false);
-                }
-                if (fs.existsSync(outPath)) {
-                    try { fs.unlinkSync(outPath); } catch (e) {}
-                }
+                if (!fs.existsSync(tmpPath) || fs.statSync(tmpPath).size <= 4096) return finishJob(false);
+                if (fs.existsSync(outPath)) try { fs.unlinkSync(outPath); } catch (e) {}
                 fs.renameSync(tmpPath, outPath);
-                var finalSize = fs.statSync(outPath).size;
-                console.log('[RENDER] ¡Video MP4 generado exitosamente!: ' + outPath + ' (' + finalSize + ' bytes)');
+                console.log('[RENDER] ¡Video MP4 generado!: ' + path.basename(outPath));
                 return finishJob(true);
             } catch (err) {
-                console.error('[RENDER] Error finalizando MP4:', err.message);
                 return finishJob(false);
             }
         });
@@ -1716,7 +1893,6 @@ function processNextRender() {
         if (!finished) {
             finished = true;
             clearTimeout(renderTimeout);
-            console.error('[RENDER] Excepción iniciando ffmpeg:', e.message);
             finishJob(false);
         }
     }
@@ -1733,9 +1909,8 @@ function imgToVideo(file, name, time, callback) {
             if (fs.statSync(outPath).size > 4096) {
                 if (typeof callback === 'function') callback(true);
                 return;
-            } else {
-                fs.unlinkSync(outPath);
             }
+            fs.unlinkSync(outPath);
         } catch (e) {}
     }
 
@@ -1743,7 +1918,6 @@ function imgToVideo(file, name, time, callback) {
         if (typeof callback === 'function') activeRenderCallbacks.push(callback);
         return;
     }
-
     for (var qi = 0; qi < renderQueue.length; qi++) {
         if (renderQueue[qi].outPath === outPath) {
             if (typeof callback === 'function') renderQueue[qi].callbacks.push(callback);
@@ -1774,24 +1948,19 @@ function convertExistingImages(callback) {
             if (callback) callback();
             return;
         }
-        console.log('[CONVERT] Verificando ' + images.length + ' imagen(es) para conversión a video MP4...');
         async.eachSeries(images, function (imgFile, next) {
             var baseNoExt = normalizeName(imgFile).replace(/\.[^/.]+$/, "");
             var defaultDuration = 10;
-
             var scheduleArr = Array.isArray(schedule) ? schedule : [];
             for (var b = 0; b < scheduleArr.length; b++) {
                 var blkContents = scheduleArr[b].contents || [];
                 for (var c = 0; c < blkContents.length; c++) {
                     if (blkContents[c].content === imgFile || normalizeName(blkContents[c].content) === normalizeName(imgFile)) {
                         var parsedLen = parseInt(blkContents[c].length, 10);
-                        if (!isNaN(parsedLen) && parsedLen > 0) {
-                            defaultDuration = parsedLen;
-                        }
+                        if (!isNaN(parsedLen) && parsedLen > 0) defaultDuration = parsedLen;
                     }
                 }
             }
-
             var wallTag = isWallTileActive() ? ('_' + getWallSignature()) : '';
             var expectedVideo = contentBasePath + baseNoExt + wallTag + '_' + defaultDuration + 's.mp4';
             if (fileExist(expectedVideo)) {
@@ -1812,7 +1981,7 @@ function convertExistingImages(callback) {
 }
 
 // ==============================================================================
-// 5B. OPTIMIZACION AUTOMATICA DE VIDEOS PESADOS PARA RASPBERRY PI (NO BLOQUEANTE)
+// 5B. OPTIMIZACION AUTOMATICA DE VIDEOS + LIMPIEZA DE HUERFANOS (GARBAGE COLLECTOR)
 // ==============================================================================
 var videoOptQueue = [];
 var isOptimizingVideo = false;
@@ -1892,9 +2061,7 @@ function processNextVideoOpt() {
     var srcPath = job.srcPath;
     var outPath = job.outPath;
 
-    if (!fs.existsSync(srcPath) || failedOptMap[outPath]) {
-        return processNextVideoOpt();
-    }
+    if (!fs.existsSync(srcPath) || failedOptMap[outPath]) return processNextVideoOpt();
     if (fs.existsSync(outPath)) {
         try {
             if (fs.statSync(outPath).size > 4096) return processNextVideoOpt();
@@ -1951,6 +2118,7 @@ function processNextVideoOpt() {
             '-level', dims.level,
             '-pix_fmt', 'yuv420p',
             '-r', String(targetFps),
+            '-vsync', 'cfr',
             '-g', String(targetFps),
             '-bf', '0',
             '-crf', dims.crf,
@@ -1979,7 +2147,10 @@ function processNextVideoOpt() {
                 try { fs.unlinkSync(tmpPath); } catch (e) {}
             }
             if (ok) {
-                setTimeout(function () { checkSchedule(); }, 400);
+                setTimeout(function () {
+                    checkSchedule();
+                    prebuildAllScheduleBlocks();
+                }, 400);
             }
             setTimeout(processNextVideoOpt, 300);
         };
@@ -2003,7 +2174,6 @@ function processNextVideoOpt() {
             }
             ffProc.on('error', function (err) {
                 clearTimeout(optTimeout);
-                console.error('[OPT:VIDEO] Error iniciando ffmpeg:', err.message);
                 failedOptMap[outPath] = true;
                 finishOpt(false);
             });
@@ -2067,13 +2237,119 @@ function scheduleVideoOptimization(srcPath) {
     processNextVideoOpt();
 }
 
+// Garbage Collector de disco: limpia huérfanos fuera de la agenda actual (+ limpieza urgente < 500 MB)
+var lastGcAt = 0;
+function garbageCollectUnusedMedia(forceEmergency, callback) {
+    var result = { removedFiles: 0, freedBytes: 0, emergency: Boolean(forceEmergency) };
+    try {
+        var scheduleArr = Array.isArray(schedule) ? schedule : [];
+        if (scheduleArr.length === 0 && !forceEmergency) {
+            if (typeof callback === 'function') callback(result);
+            return result;
+        }
+
+        var keepFullPaths = {};
+        var markKeep = function (p) {
+            if (!p) return;
+            keepFullPaths[path.resolve(p)] = true;
+        };
+
+        for (var fp = 0; fp < filesPlaying.length; fp++) {
+            var playF = path.isAbsolute(filesPlaying[fp]) ? filesPlaying[fp] : path.join(contentBasePath, filesPlaying[fp]);
+            markKeep(playF);
+        }
+        if (activeVideoOptOutPath) markKeep(activeVideoOptOutPath);
+        if (activeRenderOutPath) markKeep(activeRenderOutPath);
+
+        var wallTagImg = isWallTileActive() ? ('_' + getWallSignature()) : '';
+        for (var b = 0; b < scheduleArr.length; b++) {
+            var blk = scheduleArr[b];
+            var blkItems = blk.contents || [];
+            var resolvedBlockItems = [];
+            for (var c = 0; c < blkItems.length; c++) {
+                var itm = blkItems[c];
+                var safeName = normalizeName(itm.content);
+                if (!safeName) continue;
+                markKeep(path.join(contentBasePath, safeName));
+                markKeep(path.join(contentBasePath, itm.content));
+
+                if (isImg(safeName) || isImg(itm.content)) {
+                    var dur = parseInt(itm.length, 10);
+                    if (isNaN(dur) || dur <= 0) dur = 10;
+                    var imgVid = safeName.replace(/\.[^/.]+$/, '') + wallTagImg + '_' + dur + 's.mp4';
+                    markKeep(path.join(contentBasePath, imgVid));
+                    resolvedBlockItems.push({ file: imgVid, duration: dur });
+                } else {
+                    var rawPath = path.join(contentBasePath, safeName);
+                    var optPath = getOptimizedVideoPath(rawPath);
+                    if (optPath) markKeep(optPath);
+                    resolvedBlockItems.push({
+                        file: (optPath && fs.existsSync(optPath)) ? optPath : safeName,
+                        duration: parseInt(itm.length, 10) || 10
+                    });
+                }
+            }
+            if (resolvedBlockItems.length > 1) {
+                var bHash = computeBlockHash(resolvedBlockItems);
+                markKeep(path.join(seamlessBasePath, 'block_' + blk.idScheduleBlock + '_' + bHash + '.mp4'));
+            }
+        }
+
+        var nowMs = Date.now();
+        var orphanAgeThresholdMs = forceEmergency ? 0 : (24 * 3600 * 1000);
+        var tempAgeThresholdMs = 2 * 3600 * 1000;
+
+        var scanAndPrune = function (dirPath, isTempDir) {
+            if (!fs.existsSync(dirPath)) return;
+            var entries = fs.readdirSync(dirPath);
+            for (var ei = 0; ei < entries.length; ei++) {
+                var fullP = path.resolve(path.join(dirPath, entries[ei]));
+                if (keepFullPaths[fullP]) continue;
+                try {
+                    var st = fs.statSync(fullP);
+                    if (!st.isFile()) continue;
+                    var ageMs = nowMs - st.mtime.getTime();
+                    if (isTempDir || entries[ei].indexOf('temp_') === 0 || /.part$/i.test(entries[ei])) {
+                        if (ageMs > tempAgeThresholdMs && !ftpWorking && !isRendering && !isOptimizingVideo && !isConcatenating) {
+                            fs.unlinkSync(fullP);
+                            result.removedFiles++;
+                            result.freedBytes += st.size;
+                        }
+                    } else if (ageMs >= orphanAgeThresholdMs) {
+                        fs.unlinkSync(fullP);
+                        result.removedFiles++;
+                        result.freedBytes += st.size;
+                    }
+                } catch (fe) {}
+            }
+        };
+
+        scanAndPrune(tempFolderPath, true);
+        scanAndPrune(optimizedBasePath, false);
+        scanAndPrune(seamlessBasePath, false);
+        if (scheduleArr.length > 0) {
+            scanAndPrune(contentBasePath, false);
+        }
+
+        if (result.removedFiles > 0) {
+            console.log('[GC:DISCO] Limpieza ' + (forceEmergency ? 'EMERGENCIA' : 'programada') + ': ' + result.removedFiles + ' archivo(s) huérfano(s) eliminado(s), ' + (result.freedBytes / (1024 * 1024)).toFixed(1) + ' MB liberados.');
+        }
+    } catch (e) {
+        console.error('[GC:DISCO] Error:', e.message);
+    }
+    lastGcAt = Date.now();
+    if (typeof callback === 'function') callback(result);
+    return result;
+}
+
+setTimeout(function () { garbageCollectUnusedMedia(false); }, 90000);
+setInterval(function () { garbageCollectUnusedMedia(false); }, 12 * 3600 * 1000);
+
 function fileSerch(contentToSearch, nameToSearch, timeToSearch) {
     var safeContent = normalizeName(contentToSearch);
-    var safeName = normalizeName(nameToSearch);
     var duration = parseInt(timeToSearch, 10);
     if (isNaN(duration) || duration <= 0) duration = 10;
 
-    // Si el contenido solicitado es una imagen, buscar y preferir su video MP4 convertido
     if (isImg(safeContent) || isImg(contentToSearch)) {
         var baseNoExt = safeContent.replace(/\.[^/.]+$/, "");
         var wallTagImg = isWallTileActive() ? ('_' + getWallSignature()) : '';
@@ -2083,15 +2359,11 @@ function fileSerch(contentToSearch, nameToSearch, timeToSearch) {
 
         if (fileExist(videoPath)) {
             try {
-                if (fs.statSync(videoPath).size > 4096) {
-                    return videoName;
-                } else {
-                    fs.unlinkSync(videoPath);
-                }
+                if (fs.statSync(videoPath).size > 4096) return videoName;
+                fs.unlinkSync(videoPath);
             } catch (e) {}
         }
 
-        // Si el MP4 aún no existe pero la imagen sí, iniciar conversión asíncrona inmediata
         var imgSource = fileExist(contentBasePath + safeContent) ? (contentBasePath + safeContent) :
                         (fileExist(contentBasePath + contentToSearch) ? (contentBasePath + contentToSearch) : null);
 
@@ -2099,48 +2371,38 @@ function fileSerch(contentToSearch, nameToSearch, timeToSearch) {
             imgToVideo(imgSource, videoBase, duration);
             return path.basename(imgSource);
         } else {
-            if (!ftpWorking && respuesta) {
-                checkContentsFTP();
-            }
+            if (!ftpWorking && respuesta) checkContentsFTP();
             return false;
         }
     }
 
     var targetPath = contentBasePath + safeContent;
     var fileName = safeContent;
-
     if (!fileExist(targetPath)) {
         if (fileExist(contentBasePath + contentToSearch)) {
             targetPath = contentBasePath + contentToSearch;
             fileName = contentToSearch;
         } else {
-            if (!ftpWorking && respuesta) {
-                checkContentsFTP();
-            }
+            if (!ftpWorking && respuesta) checkContentsFTP();
             return false;
         }
     }
 
-    // Preferir versión optimizada para Raspberry Pi si ya fue generada; sino encolar en segundo plano sin bloquear reproducción
     if (isVideoFile(targetPath) && (isArm || isLinux)) {
         var optPath = getOptimizedVideoPath(targetPath);
         if (optPath && fileExist(optPath)) {
             try {
-                if (fs.statSync(optPath).size > 4096) {
-                    return optPath;
-                } else {
-                    fs.unlinkSync(optPath);
-                }
+                if (fs.statSync(optPath).size > 4096) return optPath;
+                fs.unlinkSync(optPath);
             } catch (e) {}
         }
         scheduleVideoOptimization(targetPath);
     }
-
     return fileName;
 }
 
 // ==============================================================================
-// 6. GESTION DE HORARIOS Y REPRODUCCION CONTINUA SIN CORTES (SEAMLESS LOOP)
+// 6. HORARIOS, SEAMLESS LOOP + PRE-CONSTRUCCION ANTICIPADA DE TODOS LOS BLOQUES
 // ==============================================================================
 var activeSeamlessHash = '';
 var failedSeamlessHashes = {};
@@ -2173,18 +2435,13 @@ function parseFrameRate(frStr) {
 }
 
 function probeMediaFile(fullPath, cb) {
-    var ffprobeBin = 'ffprobe';
     var args = ['-v', 'error', '-show_entries', 'format=duration,bit_rate', '-show_entries', 'stream=codec_type,codec_name,profile,pix_fmt,width,height,r_frame_rate,avg_frame_rate,sample_rate,channels', '-of', 'json', fullPath];
     var out = '';
     var done = false;
     try {
-        var p = spawn(ffprobeBin, args, { stdio: ['ignore', 'pipe', 'ignore'] });
-        if (p.stdout) {
-            p.stdout.on('data', function (d) { out += d.toString('utf8'); });
-        }
-        p.on('error', function () {
-            if (!done) { done = true; cb(null); }
-        });
+        var p = spawn('ffprobe', args, { stdio: ['ignore', 'pipe', 'ignore'] });
+        if (p.stdout) p.stdout.on('data', function (dChunk) { out += dChunk.toString('utf8'); });
+        p.on('error', function () { if (!done) { done = true; cb(null); } });
         p.on('close', function (code) {
             if (done) return;
             done = true;
@@ -2192,17 +2449,9 @@ function probeMediaFile(fullPath, cb) {
             try {
                 var parsed = JSON.parse(out);
                 var streams = parsed.streams || [];
-                var hasVideo = false;
-                var hasAudio = false;
-                var videoCodec = '';
-                var profile = '';
-                var pixFmt = '';
-                var width = 0;
-                var height = 0;
-                var fps = 0;
-                var audioCodec = '';
-                var audioSampleRate = 0;
-                var audioChannels = 0;
+                var hasVideo = false, hasAudio = false;
+                var videoCodec = '', profile = '', pixFmt = '', width = 0, height = 0, fps = 0;
+                var audioCodec = '', audioSampleRate = 0, audioChannels = 0;
                 for (var si = 0; si < streams.length; si++) {
                     var st = streams[si];
                     if (st.codec_type === 'video' && !hasVideo) {
@@ -2224,24 +2473,11 @@ function probeMediaFile(fullPath, cb) {
                 var dur = (parsed.format && parsed.format.duration) ? parseFloat(parsed.format.duration) : 0;
                 var bitRate = (parsed.format && parsed.format.bit_rate) ? parseInt(parsed.format.bit_rate, 10) : 0;
                 cb({
-                    fullPath: fullPath,
-                    hasVideo: hasVideo,
-                    hasAudio: hasAudio,
-                    duration: dur,
-                    bitRate: bitRate,
-                    videoCodec: videoCodec,
-                    profile: profile,
-                    pixFmt: pixFmt,
-                    width: width,
-                    height: height,
-                    fps: fps,
-                    audioCodec: audioCodec,
-                    audioSampleRate: audioSampleRate,
-                    audioChannels: audioChannels
+                    fullPath: fullPath, hasVideo: hasVideo, hasAudio: hasAudio, duration: dur, bitRate: bitRate,
+                    videoCodec: videoCodec, profile: profile, pixFmt: pixFmt, width: width, height: height, fps: fps,
+                    audioCodec: audioCodec, audioSampleRate: audioSampleRate, audioChannels: audioChannels
                 });
-            } catch (e) {
-                cb(null);
-            }
+            } catch (e) { cb(null); }
         });
     } catch (e) {
         if (!done) { done = true; cb(null); }
@@ -2259,6 +2495,45 @@ function cleanupOldSeamless(idBlock, keepFileName) {
             }
         }
     } catch (e) {}
+}
+
+function prebuildAllScheduleBlocks() {
+    if (!bootGraceDone || isRendering || isOptimizingVideo || isConcatenating) return;
+    var scheduleArr = Array.isArray(schedule) ? schedule : [];
+    for (var b = 0; b < scheduleArr.length; b++) {
+        var blk = scheduleArr[b];
+        var blkItems = blk.contents || [];
+        if (blkItems.length < 2) continue;
+
+        var filesToPrebuild = [];
+        var allReadyVideos = true;
+        for (var c = 0; c < blkItems.length; c++) {
+            var itm = blkItems[c];
+            var found = fileSerch(itm.content, itm.name, itm.length);
+            if (!found || !isVideoFile(found)) {
+                allReadyVideos = false;
+                break;
+            }
+            filesToPrebuild.push({
+                file: path.isAbsolute(found) ? found : path.basename(found),
+                duration: itm.length || 10,
+                idContent: itm.idContent || 0
+            });
+        }
+        if (!allReadyVideos || filesToPrebuild.length < 2) continue;
+
+        var hash = computeBlockHash(filesToPrebuild);
+        var outPath = seamlessBasePath + 'block_' + blk.idScheduleBlock + '_' + hash + '.mp4';
+        if (failedSeamlessHashes[hash] || activeSeamlessHash === hash) continue;
+        if (fileExist(outPath)) {
+            try {
+                if (fs.statSync(outPath).size > 4096) continue;
+            } catch (e) {}
+        }
+        console.log('[PREBUILD] Pre-construyendo bloque horario ' + blk.idScheduleBlock + ' en segundo plano...');
+        scheduleSeamlessBuild(blk.idScheduleBlock, hash, filesToPrebuild, outPath);
+        break;
+    }
 }
 
 function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
@@ -2294,10 +2569,10 @@ function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
         });
     }, function (err, probed) {
         if (err || !probed || probed.some(function (x) { return x === null; })) {
-            console.warn('[SEAMLESS] No se pudo analizar todos los videos del bloque ' + idBlock + '. Se mantiene reproducción estándar.');
             failedSeamlessHashes[blockHash] = true;
             isConcatenating = false;
             activeSeamlessHash = '';
+            setTimeout(prebuildAllScheduleBlocks, 2000);
             return;
         }
 
@@ -2311,13 +2586,10 @@ function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
         var canFastCopy = probed.every(function (pi) {
             return pi.videoCodec === 'h264' &&
                    (pi.pixFmt === 'yuv420p' || pi.pixFmt === 'yuvj420p') &&
-                   pi.width === targetW &&
-                   pi.height === targetH &&
+                   pi.width === targetW && pi.height === targetH &&
                    pi.fps >= 23 && pi.fps <= 26 &&
-                   pi.hasAudio &&
-                   pi.audioCodec === 'aac' &&
-                   pi.audioSampleRate === 44100 &&
-                   pi.audioChannels === 2;
+                   pi.hasAudio && pi.audioCodec === 'aac' &&
+                   pi.audioSampleRate === 44100 && pi.audioChannels === 2;
         });
 
         if (canFastCopy) {
@@ -2332,7 +2604,7 @@ function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
                     '-f', 'concat', '-safe', '0', '-i', concatListPath,
                     '-c', 'copy', '-movflags', '+faststart', tmpPath
                 ];
-                console.log('[SEAMLESS] Todos los clips ya son uniformes (' + targetW + 'x' + targetH + '). Usando unión instantánea (-c copy)...');
+                console.log('[SEAMLESS] Unión instantánea (-c copy) para bloque ' + idBlock + ' (' + targetW + 'x' + targetH + ')...');
             } catch (le) {
                 canFastCopy = false;
                 concatListPath = null;
@@ -2344,8 +2616,8 @@ function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
             var filterParts = [];
             var concatInputs = '';
             var nextInputIdx = 0;
-
             var curWallSig = getWallSignature();
+
             for (var i = 0; i < probed.length; i++) {
                 var pi = probed[i];
                 var vIdx = nextInputIdx++;
@@ -2364,9 +2636,7 @@ function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
                 );
 
                 if (pi.hasAudio) {
-                    filterParts.push(
-                        '[' + vIdx + ':a]aresample=44100:async=1,aformat=sample_fmts=fltp:channel_layouts=stereo[a' + i + ']'
-                    );
+                    filterParts.push('[' + vIdx + ':a]aresample=44100:async=1,aformat=sample_fmts=fltp:channel_layouts=stereo[a' + i + ']');
                 } else {
                     var aIdx = nextInputIdx++;
                     var durStr = (pi.duration && pi.duration > 0) ? pi.duration.toFixed(3) : '10.000';
@@ -2377,26 +2647,14 @@ function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
             }
 
             filterParts.push(concatInputs + 'concat=n=' + probed.length + ':v=1:a=1[outv][outa]');
-
             ffArgs.push(
                 '-filter_complex', filterParts.join(';'),
-                '-map', '[outv]',
-                '-map', '[outa]',
-                '-c:v', 'libx264',
-                '-threads', dims.threads,
-                '-preset', 'ultrafast',
-                '-profile:v', dims.profile,
-                '-level', dims.level,
-                '-pix_fmt', 'yuv420p',
-                '-r', '25',
-                '-g', '25',
-                '-bf', '0',
-                '-crf', dims.crf,
-                '-maxrate', dims.maxRate,
-                '-bufsize', dims.bufSize,
-                '-c:a', 'aac',
-                '-b:a', '128k',
-                '-movflags', '+faststart',
+                '-map', '[outv]', '-map', '[outa]',
+                '-c:v', 'libx264', '-threads', dims.threads, '-preset', 'ultrafast',
+                '-profile:v', dims.profile, '-level', dims.level, '-pix_fmt', 'yuv420p',
+                '-r', '25', '-vsync', 'cfr', '-g', '25', '-bf', '0',
+                '-crf', dims.crf, '-maxrate', dims.maxRate, '-bufsize', dims.bufSize,
+                '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
                 tmpPath
             );
         }
@@ -2414,13 +2672,13 @@ function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
         var concatTimeout = setTimeout(function () {
             if (!finished) {
                 finished = true;
-                console.error('[SEAMLESS] Timeout construyendo loop continuo del bloque ' + idBlock);
                 try { if (ffProc) ffProc.kill('SIGKILL'); } catch (e) {}
                 cleanupListFile();
                 try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
                 failedSeamlessHashes[blockHash] = true;
                 isConcatenating = false;
                 activeSeamlessHash = '';
+                setTimeout(prebuildAllScheduleBlocks, 2000);
             }
         }, 1800000);
 
@@ -2437,11 +2695,11 @@ function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
                 finished = true;
                 clearTimeout(concatTimeout);
                 cleanupListFile();
-                console.error('[SEAMLESS] Error iniciando ffmpeg:', err.message);
                 try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
                 failedSeamlessHashes[blockHash] = true;
                 isConcatenating = false;
                 activeSeamlessHash = '';
+                setTimeout(prebuildAllScheduleBlocks, 2000);
             });
             ffProc.on('close', function (code) {
                 if (finished) return;
@@ -2455,6 +2713,7 @@ function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
                     console.error('[SEAMLESS] Error generando loop continuo (code ' + code + '): ' + (stderrLog.trim() || 'sin detalle'));
                     try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
                     failedSeamlessHashes[blockHash] = true;
+                    setTimeout(prebuildAllScheduleBlocks, 2000);
                     return;
                 }
 
@@ -2462,10 +2721,12 @@ function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
                     if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
                     fs.renameSync(tmpPath, outPath);
                     cleanupOldSeamless(idBlock, path.basename(outPath));
-                    console.log('[SEAMLESS] ¡Loop continuo 0ms listo!: ' + outPath + ' (' + (fs.statSync(outPath).size / (1024 * 1024)).toFixed(2) + ' MB)');
-                    setTimeout(function () { checkSchedule(); }, 300);
+                    console.log('[SEAMLESS] ¡Loop continuo 0ms listo!: ' + path.basename(outPath) + ' (' + (fs.statSync(outPath).size / (1024 * 1024)).toFixed(2) + ' MB)');
+                    setTimeout(function () {
+                        checkSchedule();
+                        prebuildAllScheduleBlocks();
+                    }, 300);
                 } catch (e) {
-                    console.error('[SEAMLESS] Error guardando loop continuo:', e.message);
                     try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (ue) {}
                     failedSeamlessHashes[blockHash] = true;
                 }
@@ -2517,16 +2778,13 @@ function playContent(idBlock) {
         }
     }
 
-    // Si ningun archivo del bloque coincide exactamente pero hay videos en disco, no detener
     if (filesToPlay.length === 0) {
-        console.warn('[PLAY] Bloque ' + idBlock + ' no tiene archivos listos aun en disco.');
+        console.warn('[PLAY] Bloque ' + idBlock + ' no tiene archivos listos aún en disco.');
         emergencyDiskPlayback();
         playContentRunning = false;
         return;
     }
 
-    // Si el bloque tiene 2+ elementos y todos ya son videos (incluidas imágenes convertidas),
-    // usar o generar el stream único continuo (cero cortes, cero negro, cero escritorio)
     var effectivePlaylist = filesToPlay;
     var allItemsAreVideos = filesToPlay.length > 1 && filesToPlay.every(function (it) {
         return isVideoFile(it.file);
@@ -2552,13 +2810,11 @@ function playContent(idBlock) {
                 }
             } catch (e) {}
         }
-
         if (effectivePlaylist.length > 1) {
             scheduleSeamlessBuild(idBlock, blockHash, filesToPlay, seamlessPath);
         }
     }
 
-    // Si ya estamos reproduciendo este mismo bloque con la misma lista y el reproductor está activo, no interrumpir
     var newFileList = effectivePlaylist.map(function (it) { return it.file; });
     if (String(blockPlaying) === String(idBlock) && isPlaying && _.isEqual(newFileList, filesPlaying) && (activePlayerProcess != null || activeFehProcess != null || imageTimer != null)) {
         playContentRunning = false;
@@ -2603,8 +2859,6 @@ function playOmx() {
         }
     }
 
-    // PROTECCION POR DESINCRONIZACION HORARIA:
-    // Si la hora de arranque no coincide o el reloj esta desfasado, reproducir el primer bloque disponible
     if (typeof blockToPlay === 'undefined' && maxSchedule > 0) {
         blockToPlay = scheduleArr[0].idScheduleBlock;
         console.log('[SCHEDULE] Usando bloque predeterminado ' + blockToPlay);
@@ -2613,7 +2867,6 @@ function playOmx() {
     if (typeof blockToPlay !== 'undefined') {
         playContent(blockToPlay);
     } else {
-        // Si no hay programacion, reproducir lo que haya en disco antes de parar
         emergencyDiskPlayback();
     }
 }
@@ -2663,10 +2916,8 @@ function waitToStart() {
 waitToStart();
 
 // ==============================================================================
-// 7. DESCARGAS FTP Y CONEXION AL SERVIDOR TBEE
+// 7. HARDWARE TELEMETRY, DESCARGAS/SUBIDAS FTP Y CONEXION TBEE.TV
 // ==============================================================================
-var os = require('os');
-
 var lastCpuInfo = null;
 function readProcStatCpu() {
     try {
@@ -2683,14 +2934,12 @@ function readProcStatCpu() {
 
 function getURPHardData(callback) {
     try {
-        // 1. Memoria RAM utilizada (%)
-        var totalMem = os.totalmem();
-        var freeMem = os.freemem();
+        var totalMem = osMod.totalmem();
+        var freeMem = osMod.freemem();
         if (totalMem > 0) {
             memPercentUsed = Math.round(((totalMem - freeMem) * 100) / totalMem);
         }
 
-        // 2. Uso real de CPU (%) mediante lectura de /proc/stat
         var cpuNow = readProcStatCpu();
         if (cpuNow) {
             if (lastCpuInfo) {
@@ -2700,9 +2949,9 @@ function getURPHardData(callback) {
                     cpuUsage = Math.max(0, Math.min(100, Math.round(((diffTotal - diffIdle) * 100) / diffTotal)));
                 }
             } else {
-                var cpus = os.cpus();
+                var cpus = osMod.cpus();
                 var numCpus = (cpus && cpus.length > 0) ? cpus.length : 4;
-                var load1m = os.loadavg()[0] || 0;
+                var load1m = osMod.loadavg()[0] || 0;
                 cpuUsage = Math.max(1, Math.min(100, Math.round((load1m / numCpus) * 100)));
             }
             lastCpuInfo = cpuNow;
@@ -2719,7 +2968,6 @@ function getURPHardData(callback) {
                 }
             };
 
-            // 3. Temperatura de SoC Raspberry Pi (vcgencmd o thermal_zone0)
             exec("/usr/bin/vcgencmd measure_temp 2>/dev/null || /opt/vc/bin/vcgencmd measure_temp 2>/dev/null || cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null", function (err, stdout) {
                 if (!err && stdout) {
                     var str = stdout.toString('utf8').trim();
@@ -2733,16 +2981,15 @@ function getURPHardData(callback) {
                 doneOne();
             });
 
-            // 4. Espacio libre en disco (formato legible: e.g., "12.4 GB")
             exec("df -k / | tail -n 1 | awk '{print $4}'", function (err, stdout) {
                 if (!err && stdout) {
                     var availKb = parseInt(stdout.toString('utf8').trim(), 10);
                     if (!isNaN(availKb) && availKb > 0) {
+                        freeDiskMb = Math.round(availKb / 1024);
                         var availGb = availKb / (1024 * 1024);
-                        if (availGb >= 1) {
-                            URPFreeSpace = availGb.toFixed(1) + ' GB';
-                        } else {
-                            URPFreeSpace = Math.round(availKb / 1024) + ' MB';
+                        URPFreeSpace = availGb >= 1 ? (availGb.toFixed(1) + ' GB') : (freeDiskMb + ' MB');
+                        if (freeDiskMb < 500 && (Date.now() - lastGcAt) > 600000) {
+                            garbageCollectUnusedMedia(true);
                         }
                     }
                 }
@@ -2768,53 +3015,37 @@ setInterval(function () { getURPHardData(); }, 60000);
 
 function getIpAddress(callback) {
     try {
-        var ifaces = os.networkInterfaces();
-        var fallbackIp = '';
-        var preferredIp = '';
-        var ethMac = '';
-        var wlanMac = '';
-        var anyMac = '';
+        var ifaces = osMod.networkInterfaces();
+        var fallbackIp = '', preferredIp = '', ethMac = '', wlanMac = '', anyMac = '';
 
         for (var dev in ifaces) {
             if (!ifaces.hasOwnProperty(dev)) continue;
-            // Ignorar interfaces virtuales o túneles
             if (/^(lo|docker|veth|br-|virbr|tun|tap)/.test(dev)) continue;
             var details = ifaces[dev];
             for (var i = 0; i < details.length; i++) {
-                var d = details[i];
-                if (d.family === 'IPv4' && !d.internal && d.address && d.address.indexOf('169.254.') !== 0) {
-                    if (/^(eth|en)/.test(dev)) {
-                        preferredIp = d.address;
-                    } else if (/^(wl|wlan)/.test(dev) && !preferredIp) {
-                        preferredIp = d.address;
-                    } else if (!fallbackIp) {
-                        fallbackIp = d.address;
-                    }
-                    if (d.mac && d.mac !== '00:00:00:00:00:00') {
-                        if (/^(eth|en)/.test(dev)) ethMac = d.mac;
-                        else if (/^(wl|wlan)/.test(dev)) wlanMac = d.mac;
-                        else if (!anyMac) anyMac = d.mac;
+                var dIt = details[i];
+                if (dIt.family === 'IPv4' && !dIt.internal && dIt.address && dIt.address.indexOf('169.254.') !== 0) {
+                    if (/^(eth|en)/.test(dev)) preferredIp = dIt.address;
+                    else if (/^(wl|wlan)/.test(dev) && !preferredIp) preferredIp = dIt.address;
+                    else if (!fallbackIp) fallbackIp = dIt.address;
+                    if (dIt.mac && dIt.mac !== '00:00:00:00:00:00') {
+                        if (/^(eth|en)/.test(dev)) ethMac = dIt.mac;
+                        else if (/^(wl|wlan)/.test(dev)) wlanMac = dIt.mac;
+                        else if (!anyMac) anyMac = dIt.mac;
                     }
                 }
             }
         }
-
-        if (!macAdd) {
-            macAdd = ethMac || wlanMac || anyMac || '';
-        }
+        if (!macAdd) macAdd = ethMac || wlanMac || anyMac || '';
         var detectedIp = preferredIp || fallbackIp;
 
-        // Verificar mediante la ruta de salida real cuál es la IP activa en este instante
         if (isArm || isLinux) {
             exec("ip -4 route get 8.8.8.8 2>/dev/null", function (err, stdout) {
                 var outStr = (!err && stdout) ? stdout.toString('utf8') : '';
                 var match = /src\s+(\d{1,3}(?:\.\d{1,3}){3})/.exec(outStr);
                 var routeIp = (match && match[1]) ? match[1] : '';
-                if (routeIp) {
-                    URPdata.URPIpAddress = routeIp;
-                } else if (detectedIp) {
-                    URPdata.URPIpAddress = detectedIp;
-                }
+                if (routeIp) URPdata.URPIpAddress = routeIp;
+                else if (detectedIp) URPdata.URPIpAddress = detectedIp;
                 if (typeof callback === 'function') callback();
             });
             return;
@@ -2848,8 +3079,7 @@ function initNetwork() {
 initNetwork();
 
 function setWSCheckInterval() {
-    if (WSCheckIntervalId != null)
-        clearInterval(WSCheckIntervalId);
+    if (WSCheckIntervalId != null) clearInterval(WSCheckIntervalId);
     WSCheckIntervalId = setInterval(getContents, WSCheckTime);
 }
 
@@ -2868,7 +3098,6 @@ function checkContentsFTP() {
             itemsToVerify.push(blockItems[bi]);
         }
     }
-
     if (itemsToVerify.length === 0) return;
 
     for (var i = 0; i < itemsToVerify.length; i++) {
@@ -2880,20 +3109,12 @@ function checkContentsFTP() {
             var needsDownload = false;
 
             if (!fileExist(localPath)) {
-                if (fileExist(contentBasePath + rawFileName)) {
-                    localPath = contentBasePath + rawFileName;
-                } else {
-                    needsDownload = true;
-                }
+                if (fileExist(contentBasePath + rawFileName)) localPath = contentBasePath + rawFileName;
+                else needsDownload = true;
             }
-
             if (!needsDownload && itm.md5) {
-                var diskHash = getFileMD5(localPath);
-                if (diskHash !== itm.md5.toLowerCase()) {
-                    needsDownload = true;
-                }
+                if (getFileMD5(localPath) !== itm.md5.toLowerCase()) needsDownload = true;
             }
-
             if (needsDownload) {
                 var remoteFtpPath = buildFtpPath(ftpBasePath, URPdata.idCustomer, rawFileName);
                 var task = {
@@ -2905,15 +3126,10 @@ function checkContentsFTP() {
                     length: itm.length,
                     content: rawFileName
                 };
-
                 var inQueue = false;
                 for (var q = 0; q < FTPcontents.length; q++) {
-                    if (FTPcontents[q].contentPath === task.contentPath) {
-                        inQueue = true;
-                        break;
-                    }
+                    if (FTPcontents[q].contentPath === task.contentPath) { inQueue = true; break; }
                 }
-
                 if (!inQueue) {
                     console.log('[FTP] Encolando descarga: ' + task.ftpPath);
                     FTPcontents.push(task);
@@ -2927,9 +3143,7 @@ function checkContentsFTP() {
             ftpWorking = true;
             initQueue(downloadQueue, FTPcontents);
         } else {
-            connectFTP(function () {
-                initQueue(downloadQueue, FTPcontents);
-            });
+            connectFTP(function () { initQueue(downloadQueue, FTPcontents); });
         }
     }
 }
@@ -2939,7 +3153,6 @@ var connectFTP = d.bind(function (callback) {
         ftpWorking = false;
         return;
     }
-
     var clientOnConnect = function () {
         ftp.auth(ftpUser, ftpPass, function (err) {
             if (!err) {
@@ -2947,21 +3160,13 @@ var connectFTP = d.bind(function (callback) {
                 if (callback) callback();
             } else {
                 ftpWorking = false;
-                console.error("[FTP] Error de autenticacion (" + ftpUser + "):", err);
+                console.error("[FTP] Error de autenticación (" + ftpUser + "):", err);
             }
         });
     };
-
     try {
-        if (ftp && ftp.raw) {
-            try { ftp.raw.quit(); } catch (e) {}
-        }
-        ftp = new JSFtp({
-            host: ftpHost,
-            port: parseInt(ftpPort, 10) || 21,
-            user: ftpUser,
-            pass: ftpPass
-        });
+        if (ftp && ftp.raw) try { ftp.raw.quit(); } catch (e) {}
+        ftp = new JSFtp({ host: ftpHost, port: parseInt(ftpPort, 10) || 21, user: ftpUser, pass: ftpPass });
         ftp.on("connect", clientOnConnect);
         ftp.on("error", function (err) {
             ftpWorking = false;
@@ -2982,18 +3187,14 @@ function handleDownloadedFile(content, tempPartPath, callback) {
     if (matches) {
         try {
             fs.renameSync(tempPartPath, content.contentPath);
-            console.log('[FTP] Archivo completado exitosamente: ' + content.contentPath);
+            console.log('[FTP] Archivo completado: ' + content.contentPath);
         } catch (e) {
             try {
                 fs.writeFileSync(content.contentPath, fs.readFileSync(tempPartPath));
                 fs.unlinkSync(tempPartPath);
-                console.log('[FTP] Archivo copiado exitosamente: ' + content.contentPath);
-            } catch (e2) {
-                console.error('[FTP] Error moviendo archivo descargado:', e2.message);
-            }
+            } catch (e2) {}
         }
 
-        // Si el archivo descargado es una imagen, convertir de inmediato a video MP4; si es video, analizar/optimizar en segundo plano
         if (isImg(content.content)) {
             var imgDuration = parseInt(content.length, 10);
             if (isNaN(imgDuration) || imgDuration <= 0) imgDuration = 10;
@@ -3008,12 +3209,11 @@ function handleDownloadedFile(content, tempPartPath, callback) {
         if (qIdx !== -1) FTPcontents.splice(qIdx, 1);
 
         checkSchedule();
+        setTimeout(prebuildAllScheduleBlocks, 1500);
         if (callback) callback();
     } else {
         console.error("[FTP] MD5 mismatch para " + content.ftpPath);
-        if (fs.existsSync(tempPartPath)) {
-            try { fs.unlinkSync(tempPartPath); } catch (e) {}
-        }
+        if (fs.existsSync(tempPartPath)) try { fs.unlinkSync(tempPartPath); } catch (e) {}
         var errIdx = getIndex(FTPcontents, content);
         if (errIdx !== -1) FTPcontents.splice(errIdx, 1);
         if (callback) callback();
@@ -3041,40 +3241,21 @@ function runJsFtpDownload(content, tempPartPath, callback) {
         return;
     }
 
-    if (fs.existsSync(tempPartPath)) {
-        try { fs.unlinkSync(tempPartPath); } catch (e) {}
-    }
-
-    var isDone = false;
-    var lastBytes = 0;
-    var stallChecks = 0;
-    var startedAt = Date.now();
-
+    if (fs.existsSync(tempPartPath)) try { fs.unlinkSync(tempPartPath); } catch (e) {}
+    var isDone = false, lastBytes = 0, stallChecks = 0, startedAt = Date.now();
     var progressMonitor = setInterval(function () {
-        if (isDone) {
-            clearInterval(progressMonitor);
-            return;
-        }
+        if (isDone) { clearInterval(progressMonitor); return; }
         var curBytes = 0;
-        try {
-            if (fs.existsSync(tempPartPath)) {
-                curBytes = fs.statSync(tempPartPath).size;
-            }
-        } catch (e) {}
-
+        try { if (fs.existsSync(tempPartPath)) curBytes = fs.statSync(tempPartPath).size; } catch (e) {}
         if (curBytes > lastBytes) {
-            var mbps = (((curBytes - lastBytes) * 8) / (30 * 1000 * 1000)).toFixed(2);
             lastBytes = curBytes;
             stallChecks = 0;
-            console.log('[FTP] Descargando ' + path.basename(content.ftpPath) + ': ' + (curBytes / (1024 * 1024)).toFixed(2) + ' MB (' + mbps + ' Mbps)...');
         } else {
             stallChecks++;
         }
-
         if (stallChecks >= 4 || (Date.now() - startedAt) > 1800000) {
             isDone = true;
             clearInterval(progressMonitor);
-            console.error('[FTP] Descarga estancada o timeout en ' + path.basename(content.ftpPath) + '. Reiniciando conexión...');
             try { if (ftp && ftp.raw) ftp.raw.quit(); } catch (e) {}
             try { if (ftp && ftp.socket) ftp.socket.destroy(); } catch (e) {}
             ftpWorking = false;
@@ -3088,12 +3269,8 @@ function runJsFtpDownload(content, tempPartPath, callback) {
         if (isDone) return;
         isDone = true;
         clearInterval(progressMonitor);
-
         if (hadErr) {
-            console.error("[FTP] Error de transferencia: " + hadErr);
-            if (fs.existsSync(tempPartPath)) {
-                try { fs.unlinkSync(tempPartPath); } catch (e) {}
-            }
+            if (fs.existsSync(tempPartPath)) try { fs.unlinkSync(tempPartPath); } catch (e) {}
             var idx = getIndex(FTPcontents, content);
             if (idx !== -1) FTPcontents.splice(idx, 1);
             if (callback) callback();
@@ -3104,62 +3281,35 @@ function runJsFtpDownload(content, tempPartPath, callback) {
 }
 
 var downloadFTP = d.bind(function (content, callback) {
-    console.log('[FTP] Descargando: ' + content.ftpPath);
     var tempPartPath = content.tempPath + '.part';
-
-    // Eliminar archivos .part viejos (>1h) para evitar mezclar versiones distintas
     if (fs.existsSync(tempPartPath)) {
         try {
-            var partStat = fs.statSync(tempPartPath);
-            if ((Date.now() - partStat.mtime.getTime()) > 3600000) {
+            if ((Date.now() - fs.statSync(tempPartPath).mtime.getTime()) > 3600000) {
                 fs.unlinkSync(tempPartPath);
             }
         } catch (e) {}
     }
 
-    // Motor rápido nativo en C (curl) con soporte de reanudación (-C -) y 0% overhead JS
     if (hasCurl && ftpHost && ftpUser) {
         var remoteRel = content.ftpPath.charAt(0) === '/' ? content.ftpPath.slice(1) : content.ftpPath;
-        var encodedPath = remoteRel.split('/').map(function (seg) {
-            return encodeURIComponent(seg);
-        }).join('/');
+        var encodedPath = remoteRel.split('/').map(function (seg) { return encodeURIComponent(seg); }).join('/');
         var ftpUrl = 'ftp://' + ftpHost + ':' + (parseInt(ftpPort, 10) || 21) + '/' + encodedPath;
 
         var startCurlAttempt = function (allowResume) {
             var curlArgs = [
-                '--ftp-pasv',
-                '--connect-timeout', '20',
-                '--speed-limit', '1024',
-                '--speed-time', '90',
-                '-sS',
-                '-o', tempPartPath,
-                '-u', ftpUser + ':' + (ftpPass || '')
+                '--ftp-pasv', '--connect-timeout', '20', '--speed-limit', '1024', '--speed-time', '90',
+                '-sS', '-o', tempPartPath, '-u', ftpUser + ':' + (ftpPass || '')
             ];
-
             if (allowResume && fs.existsSync(tempPartPath)) {
-                try {
-                    if (fs.statSync(tempPartPath).size > 0) {
-                        curlArgs.push('-C', '-');
-                    }
-                } catch (e) {}
+                try { if (fs.statSync(tempPartPath).size > 0) curlArgs.push('-C', '-'); } catch (e) {}
             }
             curlArgs.push(ftpUrl);
 
-            var isDone = false;
-            var lastBytes = 0;
-            var startedAt = Date.now();
-            var curlErr = '';
-            var curlProc = null;
-
+            var isDone = false, lastBytes = 0, startedAt = Date.now(), curlErr = '', curlProc = null;
             var progressMonitor = setInterval(function () {
-                if (isDone) {
-                    clearInterval(progressMonitor);
-                    return;
-                }
+                if (isDone) { clearInterval(progressMonitor); return; }
                 var curBytes = 0;
-                try {
-                    if (fs.existsSync(tempPartPath)) curBytes = fs.statSync(tempPartPath).size;
-                } catch (e) {}
+                try { if (fs.existsSync(tempPartPath)) curBytes = fs.statSync(tempPartPath).size; } catch (e) {}
                 if (curBytes > lastBytes) {
                     var mbps = (((curBytes - lastBytes) * 8) / (30 * 1000 * 1000)).toFixed(2);
                     lastBytes = curBytes;
@@ -3193,23 +3343,15 @@ var downloadFTP = d.bind(function (content, callback) {
                     if (isDone) return;
                     isDone = true;
                     clearInterval(progressMonitor);
-
                     if (code === 0 && fs.existsSync(tempPartPath)) {
-                        var elapsedSec = Math.max(1, (Date.now() - startedAt) / 1000);
-                        var totalMb = (fs.statSync(tempPartPath).size / (1024 * 1024)).toFixed(2);
-                        console.log('[FTP:CURL] Descarga completada (' + totalMb + ' MB en ' + elapsedSec.toFixed(1) + 's)');
                         handleDownloadedFile(content, tempPartPath, callback);
                         return;
                     }
-
-                    // Si el servidor FTP rechazó reanudar (-C -), reintentar desde 0 una vez
                     if (allowResume && (code === 33 || code === 36)) {
                         try { if (fs.existsSync(tempPartPath)) fs.unlinkSync(tempPartPath); } catch (e) {}
-                        startCurlAttempt(false);
-                        return;
+                        return startCurlAttempt(false);
                     }
-
-                    console.warn('[FTP:CURL] Falló (code ' + code + '): ' + (curlErr.trim() || 'sin detalle') + '. Usando fallback JSFtp...');
+                    console.warn('[FTP:CURL] Falló (code ' + code + '): ' + (curlErr.trim() || 'sin detalle'));
                     runJsFtpDownload(content, tempPartPath, callback);
                 });
             } catch (e) {
@@ -3220,11 +3362,9 @@ var downloadFTP = d.bind(function (content, callback) {
                 }
             }
         };
-
         startCurlAttempt(true);
         return;
     }
-
     runJsFtpDownload(content, tempPartPath, callback);
 });
 
@@ -3255,6 +3395,159 @@ function getIndex(arr, val) {
     return -1;
 }
 
+// ==============================================================================
+// 7A. SCREENSHOT, UPLOAD LOGS, CLEAN LOGS Y BACKGROUND DESDE TBEE.TV
+// ==============================================================================
+function callUpdateWS(endpointUrl, value) {
+    httpRequest({
+        url: endpointUrl,
+        method: 'POST',
+        json: true,
+        timeout: 6000,
+        body: { idDisplay: URPdata.idDisplay, value: value }
+    }, function () {});
+}
+
+function uploadFileViaFtp(localPath, remoteFtpPath, callback) {
+    if (!fs.existsSync(localPath) || !ftpHost || !ftpUser) {
+        if (typeof callback === 'function') callback(new Error('FTP unavailable'));
+        return;
+    }
+    if (hasCurl) {
+        var rel = remoteFtpPath.charAt(0) === '/' ? remoteFtpPath.slice(1) : remoteFtpPath;
+        var encoded = rel.split('/').map(function (s) { return encodeURIComponent(s); }).join('/');
+        var ftpUrl = 'ftp://' + ftpHost + ':' + (parseInt(ftpPort, 10) || 21) + '/' + encoded;
+        var p = spawn('curl', ['--ftp-pasv', '--ftp-create-dirs', '--connect-timeout', '15', '-sS', '-T', localPath, '-u', ftpUser + ':' + (ftpPass || ''), ftpUrl], { stdio: 'ignore' });
+        p.on('error', function (e) { if (typeof callback === 'function') callback(e); });
+        p.on('close', function (code) {
+            if (typeof callback === 'function') callback(code === 0 ? null : new Error('curl upload code=' + code));
+        });
+        return;
+    }
+    try {
+        var client = new JSFtp({ host: ftpHost, port: parseInt(ftpPort, 10) || 21, user: ftpUser, pass: ftpPass });
+        client.put(localPath, remoteFtpPath, function (err) {
+            try { if (client && client.raw) client.raw.quit(); } catch (qe) {}
+            if (typeof callback === 'function') callback(err || null);
+        });
+    } catch (e) {
+        if (typeof callback === 'function') callback(e);
+    }
+}
+
+function execUploadLogs(callback) {
+    var homeDir = process.env.HOME || '/home/pi';
+    var logsPath = fs.existsSync(homeDir + '/.pm2/logs') ? (homeDir + '/.pm2/logs') : '/home/pi/.pm2/logs';
+    if (!fs.existsSync(logsPath)) {
+        callUpdateWS('http://' + baseUrl + '/ws/updateUploadLogsDisplay.php', 0);
+        if (typeof callback === 'function') callback(false);
+        return;
+    }
+    var files = [];
+    try { files = fs.readdirSync(logsPath); } catch (e) {}
+    var toUpload = files.filter(function (f) {
+        try { return fs.statSync(path.join(logsPath, f)).isFile(); } catch (e) { return false; }
+    });
+    async.eachSeries(toUpload, function (f, next) {
+        var fp = path.join(logsPath, f);
+        var remote = buildFtpPath(ftpBasePath, URPdata.idCustomer, (URPdata.idZone || 0) + '_' + (URPdata.idStore || 0) + '_' + (URPdata.idURP || 0) + '_' + f);
+        uploadFileViaFtp(fp, remote, function () { next(); });
+    }, function () {
+        callUpdateWS('http://' + baseUrl + '/ws/updateUploadLogsDisplay.php', 0);
+        console.log('[LOGS] Logs subidos a tbee.tv (' + toUpload.length + ' archivo(s)).');
+        if (typeof callback === 'function') callback(true);
+    });
+}
+
+function uploadLogs(callback) {
+    if (URPdata.isVideoWall && Array.isArray(wall) && wall.length > 0) {
+        for (var w = 0; w < wall.length; w++) {
+            httpRequest('http://' + wall[w].ip + ':' + wall[w].port + '/uploadLogs', function () {});
+        }
+    }
+    execUploadLogs(callback);
+}
+
+function execCleanLogs() {
+    if (isArm || isLinux) {
+        exec("pm2 flush 2>/dev/null || true", function () {});
+    }
+    recentLogs = [];
+    console.log('[LOGS] Logs locales limpiados.');
+}
+
+function cleanLogs() {
+    if (URPdata.isVideoWall && Array.isArray(wall) && wall.length > 0) {
+        for (var w = 0; w < wall.length; w++) {
+            httpRequest('http://' + wall[w].ip + ':' + wall[w].port + '/cleanLogs', function () {});
+        }
+    }
+    execCleanLogs();
+}
+
+function execScreenshot(callback) {
+    var outShot = basePath + 'screenshot.jpg';
+    if (!isArm && !isLinux) {
+        if (typeof callback === 'function') callback(false, outShot);
+        return;
+    }
+    var env = getGuiEnv();
+    var cmd = '';
+    if (hasWaylandDisplay && hasGrim) {
+        cmd = 'grim -t jpeg -q 80 "' + outShot + '"';
+    } else if (hasX11Display && hasScrot) {
+        cmd = 'scrot -q 80 -o "' + outShot + '"';
+    } else if (hasRaspi2png) {
+        cmd = 'raspi2png -p "' + outShot + '"';
+    } else if (hasX11Display) {
+        cmd = 'ffmpeg -nostdin -y -loglevel error -f x11grab -i :0.0 -frames:v 1 "' + outShot + '"';
+    } else {
+        cmd = 'ffmpeg -nostdin -y -loglevel error -f fbdev -i /dev/fb0 -frames:v 1 "' + outShot + '"';
+    }
+    exec(cmd, { env: env, timeout: 10000 }, function (err) {
+        var ok = !err && fs.existsSync(outShot) && fs.statSync(outShot).size > 512;
+        if (ok && ftpHost && ftpUser) {
+            var nowD = new Date();
+            var timeTag = nowD.toTimeString().slice(0, 8).replace(/:/g, '-');
+            var remote = buildFtpPath(ftpBasePath, URPdata.idCustomer, (URPdata.idZone || 0) + '_' + (URPdata.idStore || 0) + '_' + (URPdata.idURP || 0) + '_' + convertDate(nowD) + '_' + timeTag + '_screenshot.jpg');
+            uploadFileViaFtp(outShot, remote, function () {
+                callUpdateWS('http://' + baseUrl + '/ws/updateScreenshotDisplay.php', 0);
+                if (typeof callback === 'function') callback(true, outShot);
+            });
+        } else {
+            callUpdateWS('http://' + baseUrl + '/ws/updateScreenshotDisplay.php', 0);
+            if (typeof callback === 'function') callback(ok, outShot);
+        }
+    });
+}
+
+function takeScreenshot(callback) {
+    if (URPdata.isVideoWall && Array.isArray(wall) && wall.length > 0) {
+        for (var w = 0; w < wall.length; w++) {
+            httpRequest('http://' + wall[w].ip + ':' + wall[w].port + '/screenshot', function () {});
+        }
+    }
+    execScreenshot(callback);
+}
+
+function downloadBackgroundFile() {
+    if (!URPdata.idCustomer) return;
+    var bgUrl = 'http://' + baseUrl + '/content/' + URPdata.idCustomer + '/background.png';
+    var bgPath = basePath + 'background.png';
+    httpRequest({ url: bgUrl, encoding: null, timeout: 15000 }, function (err, res, body) {
+        if (!err && res && res.statusCode === 200 && body && body.length > 256) {
+            try {
+                fs.writeFileSync(bgPath + '.tmp', body);
+                fs.renameSync(bgPath + '.tmp', bgPath);
+                console.log('[BG] background.png actualizado (' + body.length + ' bytes).');
+            } catch (e) {}
+        }
+    });
+}
+
+// ==============================================================================
+// 7B. OTA SERVIDOR + OTA GITHUB CON ROLLBACK AUTOMATICO (.ota_pending)
+// ==============================================================================
 var isUpdatingCode = false;
 function isNewerVersion(remoteVer, localVer) {
     if (!remoteVer || !localVer) return false;
@@ -3269,75 +3562,72 @@ function isNewerVersion(remoteVer, localVer) {
     return false;
 }
 
+function writeOtaPendingMarker(targetPath, backupPath, version) {
+    try {
+        fs.writeFileSync(otaPendingPath, JSON.stringify({
+            ts: Date.now(),
+            version: version,
+            targetPath: targetPath,
+            backupPath: backupPath
+        }), 'utf8');
+    } catch (e) {}
+}
+
 function checkURPVersion(remoteVersion, remoteMD5) {
     if (URPUpdated || isUpdatingCode) return;
     if (!isNewerVersion(remoteVersion, URPVersion)) return;
 
     isUpdatingCode = true;
-    var updateUrl = 'http://' + baseUrl + '/URP/' + URPType + '.js';
-    var tempNewPath = tempFolderPath + URPType + '.new.js';
-    var targetPath = __filename || (basePath + URPType + '.js');
+    var scriptName = path.basename(__filename) || (URPType + '.js');
+    var updateUrl = 'http://' + baseUrl + '/URP/' + scriptName;
+    var tempNewPath = tempFolderPath + scriptName + '.new.js';
+    var targetPath = __filename || (basePath + scriptName);
+    var backupPath = targetPath + '.bak';
 
-    console.log('[OTA] Nueva versión disponible en servidor: ' + remoteVersion + ' (actual: ' + URPVersion + '). Descargando desde ' + updateUrl);
-
-    request({ url: updateUrl, encoding: null, timeout: 20000, followRedirect: true }, function (err, res, body) {
+    httpRequest({ url: updateUrl, encoding: null, timeout: 20000 }, function (err, res, body) {
         if (err || !res || res.statusCode !== 200 || !body || body.length < 5000) {
-            console.error('[OTA] Error descargando actualización (status=' + (res ? res.statusCode : 'ERR') + ')');
             isUpdatingCode = false;
             return;
         }
-
         var downloadedMd5 = crypto.createHash('md5').update(body).digest('hex').toLowerCase();
-        if (remoteMD5 && String(remoteMD5).trim().length === 32) {
-            if (downloadedMd5 !== String(remoteMD5).trim().toLowerCase()) {
-                console.error('[OTA] MD5 inválido en actualización. Esperado=' + remoteMD5 + ' Recibido=' + downloadedMd5);
-                isUpdatingCode = false;
-                return;
-            }
+        if (remoteMD5 && String(remoteMD5).trim().length === 32 && downloadedMd5 !== String(remoteMD5).trim().toLowerCase()) {
+            isUpdatingCode = false;
+            return;
         }
-
         try {
             fs.writeFileSync(tempNewPath, body);
             execSync('node --check "' + tempNewPath + '"', { stdio: 'ignore' });
         } catch (chkErr) {
-            console.error('[OTA] El archivo descargado tiene errores de sintaxis. Abortando actualización.');
             try { if (fs.existsSync(tempNewPath)) fs.unlinkSync(tempNewPath); } catch (e) {}
             isUpdatingCode = false;
             return;
         }
-
         try {
             if (fs.existsSync(targetPath)) {
-                try { fs.writeFileSync(targetPath + '.bak', fs.readFileSync(targetPath)); } catch (be) {}
+                try { fs.writeFileSync(backupPath, fs.readFileSync(targetPath)); } catch (be) {}
             }
-            try {
-                fs.renameSync(tempNewPath, targetPath);
-            } catch (re) {
+            try { fs.renameSync(tempNewPath, targetPath); } catch (re) {
                 fs.writeFileSync(targetPath, fs.readFileSync(tempNewPath));
                 fs.unlinkSync(tempNewPath);
             }
+            writeOtaPendingMarker(targetPath, backupPath, remoteVersion);
             URPUpdated = true;
             isUpdatingCode = false;
-            console.log('[OTA] Actualización a v' + remoteVersion + ' verificada. Reiniciando servicio para aplicar...');
             stopOmx(function () {
                 exec('pm2 restart all 2>/dev/null || true', function () {
                     setTimeout(function () { process.exit(0); }, 500);
                 });
             });
         } catch (applyErr) {
-            console.error('[OTA] Error aplicando actualización:', applyErr.message);
             isUpdatingCode = false;
         }
     });
 }
 
-// ==============================================================================
-// 7B. AUTO-ACTUALIZACION REMOTA DESDE GITHUB (OTA SIN TOCAR EL SERVIDOR)
-// ==============================================================================
 var GITHUB_OTA_ENABLED = true;
 var GITHUB_OTA_REPO = 'JulianDS95/URPSignageTv';
 var GITHUB_OTA_BRANCH = 'main';
-var GITHUB_OTA_INTERVAL_MS = 300000; // Verifica cada 5 minutos
+var GITHUB_OTA_INTERVAL_MS = 300000;
 var lastFailedGithubMd5 = '';
 
 function getGithubOtaToken() {
@@ -3359,7 +3649,7 @@ function syncCompanionWallScript(branch, headers) {
     var wallShUrl = 'https://raw.githubusercontent.com/' + GITHUB_OTA_REPO + '/' + branch + '/urp-wall.sh?t=' + Date.now();
     var wallTarget = basePath + 'urp-wall.sh';
     var wallTmp = tempFolderPath + 'urp-wall.github.tmp.sh';
-    request({ url: wallShUrl, headers: headers, encoding: 'utf8', timeout: 15000, followRedirect: true }, function (err, res, body) {
+    httpRequest({ url: wallShUrl, headers: headers, encoding: 'utf8', timeout: 15000 }, function (err, res, body) {
         if (err || !res || res.statusCode !== 200 || !body || body.indexOf('URP_WALL_NODE_EOF') === -1) return;
         try {
             if (!fs.existsSync(tempFolderPath)) fs.mkdirSync(tempFolderPath);
@@ -3395,46 +3685,42 @@ function checkGithubOTA(branchOverride, manualCallback) {
     }
 
     var branch = branchOverride || GITHUB_OTA_BRANCH || 'main';
-    var targetPath = __filename || (basePath + URPType + '.js');
+    var scriptName = path.basename(__filename) || 'URPPI3-v2.5.js';
+    var targetPath = __filename || (basePath + scriptName);
+    var backupPath = targetPath + '.bak';
     var localMd5 = getFileMD5(targetPath);
-    var ghUrl = 'https://raw.githubusercontent.com/' + GITHUB_OTA_REPO + '/' + branch + '/' + URPType + '.js?t=' + Date.now();
+    var ghUrl = 'https://raw.githubusercontent.com/' + GITHUB_OTA_REPO + '/' + branch + '/' + scriptName + '?t=' + Date.now();
     var token = getGithubOtaToken();
 
     var headers = {
         'User-Agent': 'URP-Signage-Client/' + URPVersion,
         'Cache-Control': 'no-cache'
     };
-    if (token) {
-        headers['Authorization'] = 'Bearer ' + token;
-    }
+    if (token) headers['Authorization'] = 'Bearer ' + token;
 
     isUpdatingCode = true;
-    request({ url: ghUrl, headers: headers, encoding: null, timeout: 20000, followRedirect: true }, function (err, res, body) {
+    httpRequest({ url: ghUrl, headers: headers, encoding: null, timeout: 20000 }, function (err, res, body) {
         if (!err && res && res.statusCode === 404 && !branchOverride && branch === 'main') {
             isUpdatingCode = false;
             return checkGithubOTA('master', manualCallback);
         }
-
         if (err || !res || res.statusCode !== 200 || !body || body.length < 5000) {
             isUpdatingCode = false;
             if (manualCallback) manualCallback({ updated: false, reason: 'download_error', status: res ? res.statusCode : 'ERR' });
             return;
         }
-
         var bodyStr = body.toString('utf8');
         if (bodyStr.indexOf("var URPType = 'URPPI3'") === -1) {
             isUpdatingCode = false;
             if (manualCallback) manualCallback({ updated: false, reason: 'invalid_payload' });
             return;
         }
-
         var downloadedMd5 = crypto.createHash('md5').update(body).digest('hex').toLowerCase();
         if (localMd5 && downloadedMd5 === localMd5.toLowerCase()) {
             isUpdatingCode = false;
             if (manualCallback) manualCallback({ updated: false, reason: 'up_to_date', version: URPVersion });
             return;
         }
-
         if (lastFailedGithubMd5 && downloadedMd5 === lastFailedGithubMd5) {
             isUpdatingCode = false;
             if (manualCallback) manualCallback({ updated: false, reason: 'previously_failed_syntax' });
@@ -3443,16 +3729,13 @@ function checkGithubOTA(branchOverride, manualCallback) {
 
         var verMatch = bodyStr.match(/var\s+URPVersion\s*=\s*['"]([^'"]+)['"]/);
         var remoteVersion = verMatch ? verMatch[1] : URPVersion;
-        var tempNewPath = tempFolderPath + URPType + '.github.new.js';
-
-        console.log('[OTA:GITHUB] Nuevo código detectado en ' + GITHUB_OTA_REPO + '/' + branch + ' (v' + remoteVersion + ', md5=' + downloadedMd5.slice(0, 8) + '). Validando...');
+        var tempNewPath = tempFolderPath + scriptName + '.github.new.js';
 
         try {
             if (!fs.existsSync(tempFolderPath)) fs.mkdirSync(tempFolderPath);
             fs.writeFileSync(tempNewPath, body);
             execSync('node --check "' + tempNewPath + '"', { stdio: 'ignore' });
         } catch (chkErr) {
-            console.error('[OTA:GITHUB] El archivo en GitHub tiene error de sintaxis. Se mantiene la versión actual.');
             lastFailedGithubMd5 = downloadedMd5;
             try { if (fs.existsSync(tempNewPath)) fs.unlinkSync(tempNewPath); } catch (e) {}
             isUpdatingCode = false;
@@ -3462,19 +3745,18 @@ function checkGithubOTA(branchOverride, manualCallback) {
 
         try {
             if (fs.existsSync(targetPath)) {
-                try { fs.writeFileSync(targetPath + '.bak', fs.readFileSync(targetPath)); } catch (be) {}
+                try { fs.writeFileSync(backupPath, fs.readFileSync(targetPath)); } catch (be) {}
             }
-            try {
-                fs.renameSync(tempNewPath, targetPath);
-            } catch (re) {
+            try { fs.renameSync(tempNewPath, targetPath); } catch (re) {
                 fs.writeFileSync(targetPath, fs.readFileSync(tempNewPath));
                 fs.unlinkSync(tempNewPath);
             }
             try { fs.chmodSync(targetPath, '755'); } catch (ce) {}
+            writeOtaPendingMarker(targetPath, backupPath, remoteVersion);
 
             URPUpdated = true;
             isUpdatingCode = false;
-            console.log('[OTA:GITHUB] Actualización aplicada (v' + remoteVersion + '). Reiniciando reproductor...');
+            console.log('[OTA:GITHUB] Actualización aplicada (v' + remoteVersion + '). Reiniciando con rollback protegido...');
             syncCompanionWallScript(branch, headers);
             if (manualCallback) manualCallback({ updated: true, version: remoteVersion });
 
@@ -3484,7 +3766,6 @@ function checkGithubOTA(branchOverride, manualCallback) {
                 });
             });
         } catch (applyErr) {
-            console.error('[OTA:GITHUB] Error aplicando actualización:', applyErr.message);
             isUpdatingCode = false;
             if (manualCallback) manualCallback({ updated: false, reason: 'write_error' });
         }
@@ -3525,56 +3806,35 @@ function callWS() {
                 }
             };
 
-            request(options, function (err, httpResponse, data) {
+            httpRequest(options, function (err, httpResponse, data) {
                 if (!err && httpResponse && httpResponse.statusCode == 200) {
                     respuesta = true;
                     if (data && typeof data === 'object') {
-                        // Comando remoto 1: Reinicio confirmado desde el servidor
                         if (data.reboot === 1 || data.reboot === '1') {
-                            var rebootAck = {
+                            httpRequest({
                                 url: 'http://' + baseUrl + '/ws/updateRebootDisplay.php',
                                 method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
                                 json: true,
                                 timeout: 5000,
-                                body: {
-                                    idDisplay: data.idDisplay || URPdata.idDisplay,
-                                    reboot: 0
-                                }
-                            };
-                            request(rebootAck, function () {
-                                resetURP();
-                            });
+                                body: { idDisplay: data.idDisplay || URPdata.idDisplay, reboot: 0 }
+                            }, function () { resetURP(); });
                             return;
                         }
-
-                        // Comando remoto 2: Apagado desde el servidor (si la API lo envía por WS)
                         if (data.shutdown === 1 || data.shutdown === '1') {
-                            var shutdownAck = {
+                            httpRequest({
                                 url: 'http://' + baseUrl + '/ws/updateShutdownDisplay.php',
                                 method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
                                 json: true,
                                 timeout: 3000,
-                                body: {
-                                    idDisplay: data.idDisplay || URPdata.idDisplay,
-                                    shutdown: 0
-                                }
-                            };
-                            request(shutdownAck, function () {
-                                shutdownURP();
-                            });
+                                body: { idDisplay: data.idDisplay || URPdata.idDisplay, shutdown: 0 }
+                            }, function () { shutdownURP(); });
                             return;
                         }
-
-                        // Comando remoto 3: Eliminar contenido desde el servidor (si la API lo envía por WS)
                         if (data.deleteContents === 1 || data.deleteContents === '1' || data.deleteContent === 1 || data.deleteContent === '1') {
                             deleteContentFiles();
                         }
 
-                        if (!URPUpdated && data.URPVersion) {
-                            checkURPVersion(data.URPVersion, data.URPCodeMD5);
-                        }
+                        if (!URPUpdated && data.URPVersion) checkURPVersion(data.URPVersion, data.URPCodeMD5);
 
                         URPdata.idURP = data.idURP;
                         ftpHost = data.ftpHost;
@@ -3598,10 +3858,8 @@ function callWS() {
                         }
                         var nextWallActive = isWallActive();
                         if (prevWallActive !== nextWallActive) {
-                            console.log('[VIDEOWALL:REMOTO] tbee.tv cambió Video Wall -> ' + (nextWallActive ? 'ACTIVADO (' + wallConfig.mode + ' ' + wallConfig.rows + 'x' + wallConfig.cols + ' #' + wallConfig.screenId + ')' : 'DESACTIVADO (Modo Normal URPPI3)'));
-                            stopOmx(function () {
-                                setTimeout(function () { checkSchedule(); }, 300);
-                            });
+                            console.log('[VIDEOWALL:REMOTO] tbee.tv cambió Video Wall -> ' + (nextWallActive ? 'ACTIVADO' : 'DESACTIVADO'));
+                            stopOmx(function () { setTimeout(function () { checkSchedule(); }, 300); });
                         }
 
                         URPdata.idCustomer = data.idCustomer;
@@ -3614,22 +3872,26 @@ function callWS() {
                         URPdata.autoRebootMinute = data.autoRebootMinute;
                         URPdata.vertical = (data.vertical == 1);
 
+                        if (data.cleanLogs == 1 || data.cleanLogs === '1') cleanLogs();
+                        if (data.uploadLogs == 1 || data.uploadLogs === '1') uploadLogs();
+                        if (data.screenshot == 1 || data.screenshot === '1') takeScreenshot();
+                        if (data.background == 1 || data.background === '1') downloadBackgroundFile();
+
                         if (data.blocks != undefined) {
                             if (data.blocks.length > 0) {
                                 var newBlocksStr = JSON.stringify(data.blocks);
                                 var oldBlocksStr = JSON.stringify(schedule);
                                 if (newBlocksStr !== oldBlocksStr) {
-                                    console.log("[SCHEDULE] Nueva programación recibida del servidor (" + data.blocks.length + " bloques).");
+                                    console.log("[SCHEDULE] Nueva programación recibida (" + data.blocks.length + " bloques).");
                                     schedule = data.blocks;
                                     if (db) db.put('schedule', newBlocksStr);
                                     checkContentsFTP();
                                     checkSchedule();
+                                    setTimeout(prebuildAllScheduleBlocks, 2000);
                                 } else {
                                     checkContentsFTP();
                                 }
                             } else {
-                                // Si el manager vació la programación, detener y limpiar bloques locales
-                                console.log("[SCHEDULE] Programación vacía en servidor. Deteniendo reproducción.");
                                 schedule = [];
                                 contents = [];
                                 max = 0;
@@ -3639,9 +3901,7 @@ function callWS() {
                                     db.del('schedule', function () {});
                                     db.del('contents', function () {});
                                 }
-                                stopOmx(function () {
-                                    setBackground();
-                                });
+                                stopOmx(function () { setBackground(); });
                             }
                         }
                         if (db) db.put('URPData', JSON.stringify(URPdata));
@@ -3657,7 +3917,6 @@ function getContents() {
         require('dns').resolve(baseUrl, function (err) {
             if (err) {
                 iConn = false;
-                // Si no hay conexion con tbee.tv, seguir reproduciendo videos de disco
                 emergencyDiskPlayback();
             } else {
                 iConn = true;
@@ -3683,13 +3942,9 @@ function clearDirectoryFiles(dirPath) {
                 } else {
                     fs.unlinkSync(filePath);
                 }
-            } catch (err) {
-                console.error('[DELETE] Error borrando ' + filePath + ':', err.message);
-            }
+            } catch (err) {}
         }
-    } catch (e) {
-        console.error('[DELETE] Error leyendo directorio ' + dirPath + ':', e.message);
-    }
+    } catch (e) {}
 }
 
 function execDeleteContents(callback) {
@@ -3714,7 +3969,6 @@ function execDeleteContents(callback) {
             db.del('contents', function () {});
         }
         setBackground();
-        console.log('[DELETE] Carpeta content/ y caché limpiados correctamente.');
         if (typeof callback === 'function') callback();
     });
 }
@@ -3722,7 +3976,7 @@ function execDeleteContents(callback) {
 function deleteContentFiles(callback) {
     if (URPdata.isVideoWall && Array.isArray(wall) && wall.length > 0) {
         for (var w = 0; w < wall.length; w++) {
-            request.get('http://' + wall[w].ip + ':' + wall[w].port + '/deleteContents').on('error', function () {});
+            httpRequest('http://' + wall[w].ip + ':' + wall[w].port + '/deleteContents', function () {});
         }
     }
     execDeleteContents(callback);
@@ -3742,7 +3996,7 @@ function rebootDevice() {
 function resetURP() {
     if (URPdata.isVideoWall && Array.isArray(wall) && wall.length > 0) {
         for (var w = 0; w < wall.length; w++) {
-            request.get('http://' + wall[w].ip + ':' + wall[w].port + '/reboot').on('error', function () {});
+            httpRequest('http://' + wall[w].ip + ':' + wall[w].port + '/reboot', function () {});
         }
         setTimeout(rebootDevice, 45000);
     } else {
@@ -3764,7 +4018,7 @@ function shutdownDevice() {
 function shutdownURP() {
     if (URPdata.isVideoWall && Array.isArray(wall) && wall.length > 0) {
         for (var w = 0; w < wall.length; w++) {
-            request.get('http://' + wall[w].ip + ':' + wall[w].port + '/shutdown').on('error', function () {});
+            httpRequest('http://' + wall[w].ip + ':' + wall[w].port + '/shutdown', function () {});
         }
         setTimeout(shutdownDevice, 45000);
     } else {
@@ -3772,34 +4026,475 @@ function shutdownURP() {
     }
 }
 
-// Servidor Express local para control remoto desde tbee.tv Manager
+// ==============================================================================
+// 8. MINI PANEL WEB LOCAL + CONFIGURADOR VIDEO WALL + API HTTP (:8090)
+// ==============================================================================
+function writeHdmiRotateToConfig(rot) {
+    if (!isArm && !isLinux) return { ok: false, reason: 'No es Raspberry/Linux' };
+    var cfg = fs.existsSync('/boot/firmware/config.txt')
+        ? '/boot/firmware/config.txt'
+        : (fs.existsSync('/boot/config.txt') ? '/boot/config.txt' : '');
+    if (!cfg) return { ok: false, reason: 'config.txt no encontrado' };
+    var val = parseInt(rot, 10);
+    if (isNaN(val) || val < 0 || val > 3) val = 0;
+    try {
+        var raw = fs.readFileSync(cfg, 'utf8');
+        var lines = raw.split(/\r?\n/);
+        var replaced = false;
+        var outLines = [];
+        for (var i = 0; i < lines.length; i++) {
+            var ln = lines[i];
+            if (/^\s*#?\s*display_hdmi_rotate\s*=/.test(ln)) {
+                if (!replaced) {
+                    outLines.push(val === 0 ? '#display_hdmi_rotate=1' : ('display_hdmi_rotate=' + val));
+                    replaced = true;
+                }
+            } else {
+                outLines.push(ln);
+            }
+        }
+        if (!replaced && val > 0) {
+            outLines.push('');
+            outLines.push('# Rotacion URP (' + val + ')');
+            outLines.push('display_hdmi_rotate=' + val);
+        }
+        var content = outLines.join('\n');
+        var tmpFile = '/tmp/urp_config_' + Date.now() + '.txt';
+        fs.writeFileSync(tmpFile, content, 'utf8');
+        try {
+            execSync('sudo -n cp "' + tmpFile + '" "' + cfg + '" && rm -f "' + tmpFile + '"', { stdio: 'ignore', timeout: 4000 });
+            return { ok: true, path: cfg };
+        } catch (se) {
+            try {
+                fs.writeFileSync(cfg, content, 'utf8');
+                try { fs.unlinkSync(tmpFile); } catch (ue) {}
+                return { ok: true, path: cfg };
+            } catch (we) {
+                try { fs.unlinkSync(tmpFile); } catch (ue2) {}
+                return { ok: false, reason: 'Sin permisos sudo sin clave para editar ' + cfg + ' (ejecutá urp-wall desde SSH para aplicar HDMI rotate)' };
+            }
+        }
+    } catch (e) {
+        return { ok: false, reason: e.message };
+    }
+}
+
+function clearWallDerivedCaches() {
+    failedSeamlessHashes = {};
+    clearDirectoryFiles(optimizedBasePath);
+    clearDirectoryFiles(seamlessBasePath);
+    try {
+        if (fs.existsSync(contentBasePath)) {
+            var cfiles = fs.readdirSync(contentBasePath);
+            for (var i = 0; i < cfiles.length; i++) {
+                if (/_W[TM][^_]*_.*_\d+s\.mp4$/i.test(cfiles[i]) || /_WM_\d+s\.mp4$/i.test(cfiles[i])) {
+                    try { fs.unlinkSync(path.join(contentBasePath, cfiles[i])); } catch (e) {}
+                }
+            }
+        }
+    } catch (e) {}
+}
+
+function readJsonBody(req, callback) {
+    if (req.body && typeof req.body === 'object') {
+        return callback(null, req.body);
+    }
+    var raw = '';
+    var aborted = false;
+    req.on('data', function (chunk) {
+        raw += chunk;
+        if (raw.length > 65536 && !aborted) {
+            aborted = true;
+            callback(new Error('Body demasiado grande'));
+        }
+    });
+    req.on('end', function () {
+        if (aborted) return;
+        try {
+            callback(null, raw ? JSON.parse(raw) : {});
+        } catch (e) {
+            callback(e);
+        }
+    });
+    req.on('error', function (err) {
+        if (!aborted) {
+            aborted = true;
+            callback(err);
+        }
+    });
+}
+
+function buildLocalDashboardHtml() {
+    return '<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">' +
+        '<title>URP Signage Monitor v' + URPVersion + '</title>' +
+        '<style>' +
+        '*{box-sizing:border-box}' +
+        'body{margin:0;font-family:system-ui,-apple-system,sans-serif;background:#090d16;color:#e2e8f0;padding:18px}' +
+        '.wrap{max-width:1040px;margin:0 auto}' +
+        '.top{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;margin-bottom:18px}' +
+        'h1{margin:0;font-size:19px;color:#fff} h2{margin:0 0 8px 0;font-size:16px;color:#fff} .sub{font-size:12px;color:#94a3b8}' +
+        '.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px;margin-bottom:14px}' +
+        '.card{background:#111827;border:1px solid #1f2937;border-radius:12px;padding:14px;margin-bottom:14px}' +
+        '.k{font-size:11px;text-transform:uppercase;color:#94a3b8;margin-bottom:4px;letter-spacing:.04em}' +
+        '.v{font-size:18px;font-weight:700;color:#fff}' +
+        '.btns{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px}' +
+        'button{border:0;border-radius:8px;padding:9px 13px;font-size:12px;font-weight:600;cursor:pointer;color:#fff;background:#1e293b;transition:filter .15s}' +
+        'button:hover{filter:brightness(1.15)} .b-blue{background:#2563eb}.b-indigo{background:#4f46e5}.b-amber{background:#d97706}.b-red{background:#dc2626}.b-green{background:#059669}.b-ghost{background:#0f172a;border:1px solid #334155}' +
+        'pre{background:#030712;border:1px solid #1f2937;border-radius:10px;padding:12px;font-size:11px;line-height:1.45;max-height:290px;overflow:auto;color:#cbd5e1;margin:0}' +
+        '.shot{max-width:100%;border-radius:8px;border:1px solid #1f2937;margin-top:8px;display:none}' +
+        '.hide{display:none!important}' +
+        '.msg{padding:10px 12px;border-radius:9px;font-size:12px;margin-bottom:14px;border:1px solid #1e40af;background:#0f172a;color:#bfdbfe;display:none}' +
+        '.msg.err{border-color:#991b1b;background:#1f1215;color:#fecaca} .msg.ok{border-color:#065f46;background:#091f18;color:#a7f3d0}' +
+        '.fgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin-bottom:12px}' +
+        'label.lbl{display:block;font-size:11px;color:#94a3b8;text-transform:uppercase;margin-bottom:5px}' +
+        'select,input[type=number],input[type=text]{width:100%;background:#030712;border:1px solid #334155;border-radius:8px;padding:8px 10px;color:#f8fafc;font-size:13px}' +
+        '.stepRow{display:flex;gap:6px;align-items:center} .stepRow button{min-width:36px;padding:8px 10px}' +
+        '.presets{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px} .pbtn{padding:6px 10px;font-size:11px;background:#0f172a;border:1px solid #334155}' +
+        '.pbtn.on{background:#2563eb;border-color:#3b82f6}' +
+        '.mwrap{overflow-x:auto;padding:8px 0}' +
+        '.mgrid{display:inline-grid;gap:6px;background:#030712;padding:10px;border-radius:10px;border:1px solid #1f2937}' +
+        '.mcell{min-width:54px;height:42px;border-radius:7px;border:1px solid #334155;background:#111827;color:#cbd5e1;font-size:11px;font-weight:700;display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer}' +
+        '.mcell small{font-size:9px;font-weight:400;color:#64748b} .mcell.active{background:#2563eb;border-color:#60a5fa;color:#fff} .mcell.active small{color:#dbeafe}' +
+        '.warnBox{padding:9px 11px;border-radius:8px;background:#291d09;border:1px solid #b45309;color:#fde68a;font-size:12px;margin-top:8px;display:none;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}' +
+        '.chkRow{display:flex;align-items:center;gap:8px;font-size:13px;color:#e2e8f0;padding-top:6px}' +
+        '</style></head><body><div class="wrap">' +
+        '<div class="top"><div><h1>URP Signage Monitor <span id="ver"></span></h1><div class="sub" id="meta">Cargando...</div></div>' +
+        '<div class="sub" id="conn"></div></div>' +
+        '<div id="msgBox" class="msg"></div>' +
+
+        '<div id="viewMonitor">' +
+        '<div class="grid" style="margin-bottom:0">' +
+        '<div class="card"><div class="k">Reproduciendo</div><div class="v" id="now" style="font-size:13px;word-break:break-all">-</div></div>' +
+        '<div class="card"><div class="k">CPU / RAM / Temp</div><div class="v" id="hw">-</div></div>' +
+        '<div class="card"><div class="k">Disco Libre</div><div class="v" id="disk">-</div></div>' +
+        '<div class="card"><div class="k">Video Wall</div><div class="v" id="vw" style="font-size:13px">-</div></div>' +
+        '</div>' +
+        '<div class="btns">' +
+        '<button id="btnOpenWall" class="b-indigo">Configurar Video Wall</button>' +
+        '<button id="btnUpdate" class="b-blue">Buscar OTA GitHub</button>' +
+        '<button id="btnGc" class="b-green">Limpiar Huérfanos</button>' +
+        '<button id="btnShot">Captura de Pantalla</button>' +
+        '<button id="btnCleanLogs">Limpiar Logs</button>' +
+        '<button id="btnReboot" class="b-amber">Reiniciar Pi</button>' +
+        '<button id="btnShutdown" class="b-red">Apagar Pi</button>' +
+        '<button id="btnDelete" class="b-red">Borrar Contenidos</button>' +
+        '</div>' +
+        '<div class="card"><div class="k">Colas y Agenda</div><div id="queues" class="sub" style="margin-top:4px">-</div><img id="shotImg" class="shot" alt="Screenshot"></div>' +
+        '<div class="card"><div class="k">Logs en vivo</div><pre id="logs">Cargando...</pre></div>' +
+        '</div>' +
+
+        '<div id="viewWall" class="hide">' +
+        '<div class="top" style="margin-bottom:12px">' +
+        '<div><h2>Configurador de Video Wall</h2><div class="sub" id="vwSub">Sin límite de 3 pantallas: soporta IDs 1..999 y matrices hasta 32x32</div></div>' +
+        '<button id="btnBackWall" class="b-ghost">&larr; Volver atrás</button>' +
+        '</div>' +
+
+        '<div class="card">' +
+        '<div class="fgrid">' +
+        '<div><label class="lbl" for="wAct">Activación</label><select id="wAct">' +
+        '<option value="server">Remoto desde tbee.tv (sigue check del servidor)</option>' +
+        '<option value="local_on">Siempre ACTIVO (Local en esta Pi)</option>' +
+        '<option value="local_off">DESACTIVADO (Modo Normal URPPI3)</option>' +
+        '</select></div>' +
+        '<div><label class="lbl" for="wMode">Modo de proyección</label><select id="wMode">' +
+        '<option value="tile">Mosaico / Imagen partida (tile)</option>' +
+        '<option value="mirror">Espejo sincronizado (mirror)</option>' +
+        '</select></div>' +
+        '<div><label class="lbl" for="wScreenId">ID de esta Pantalla (1 - 999)</label>' +
+        '<div class="stepRow"><button type="button" id="btnIdMinus">-</button>' +
+        '<input type="number" id="wScreenId" min="1" max="999" value="1">' +
+        '<button type="button" id="btnIdPlus">+</button></div></div>' +
+        '</div>' +
+
+        '<div class="k" style="margin-top:6px">Disposición rápida</div>' +
+        '<div id="wPresets" class="presets">' +
+        '<button type="button" class="pbtn" data-r="1" data-c="2">1x2</button>' +
+        '<button type="button" class="pbtn" data-r="1" data-c="3">1x3</button>' +
+        '<button type="button" class="pbtn" data-r="1" data-c="4">1x4</button>' +
+        '<button type="button" class="pbtn" data-r="1" data-c="5">1x5</button>' +
+        '<button type="button" class="pbtn" data-r="1" data-c="6">1x6</button>' +
+        '<button type="button" class="pbtn" data-r="2" data-c="1">2x1</button>' +
+        '<button type="button" class="pbtn" data-r="2" data-c="2">2x2</button>' +
+        '<button type="button" class="pbtn" data-r="2" data-c="3">2x3</button>' +
+        '<button type="button" class="pbtn" data-r="3" data-c="3">3x3</button>' +
+        '</div>' +
+
+        '<div class="fgrid">' +
+        '<div><label class="lbl" for="wRows">Filas (1 - 32)</label><input type="number" id="wRows" min="1" max="32" value="1"></div>' +
+        '<div><label class="lbl" for="wCols">Columnas (1 - 32)</label><input type="number" id="wCols" min="1" max="32" value="3"></div>' +
+        '<div><label class="lbl" for="wBezel">Bisel / Marco físico (px)</label><input type="number" id="wBezel" min="0" max="400" value="0"></div>' +
+        '</div>' +
+
+        '<div class="fgrid">' +
+        '<div><label class="lbl" for="wOrient">Orientación HDMI</label><select id="wOrient">' +
+        '<option value="0">0° Horizontal Normal</option>' +
+        '<option value="1">90° Vertical Derecha</option>' +
+        '<option value="2">180° Invertido</option>' +
+        '<option value="3">270° Vertical Izquierda</option>' +
+        '</select></div>' +
+        '<div><label class="lbl" for="wSync">Sincronización</label><select id="wSync">' +
+        '<option value="ntp">NTP automático (sin Master)</option>' +
+        '<option value="master">Master LAN (esta Pi es reloj :8090)</option>' +
+        '<option value="slave">Slave LAN (seguir IP de Master)</option>' +
+        '</select></div>' +
+        '<div id="wMasterWrap"><label class="lbl" for="wMasterIp">IP del Master LAN</label><input type="text" id="wMasterIp" placeholder="Ej: 192.168.1.50"></div>' +
+        '</div>' +
+
+        '<label class="chkRow"><input type="checkbox" id="wDrm"> Salida DRM/KMS directa (forzar mpv sin X11/Wayland)</label>' +
+
+        '<div id="wWarn" class="warnBox"><span id="wWarnTxt"></span><button type="button" id="btnAutoExpand" class="b-amber">Ajustar matriz a 1&times;ID</button></div>' +
+        '<div style="margin-top:12px"><div class="k" id="wMatrixLabel">Vista de matriz (clic para elegir posición)</div><div class="mwrap"><div id="wMatrix" class="mgrid"></div></div></div>' +
+        '</div>' +
+
+        '<div class="btns">' +
+        '<button type="button" id="btnCancelWall" class="b-ghost">&larr; Volver sin guardar</button>' +
+        '<button type="button" id="btnResetWall">Restaurar guardado</button>' +
+        '<button type="button" id="btnSaveWall" class="b-green">Guardar y Aplicar</button>' +
+        '</div>' +
+        '</div>' +
+
+        '</div><script>' +
+        'var lastStatus = null;' +
+        'var wallLoaded = false;' +
+        'var nl = String.fromCharCode(10);' +
+        'function byId(id){ return document.getElementById(id); }' +
+        'function showMsg(txt, kind){' +
+        '  var m = byId("msgBox");' +
+        '  if (!txt) { m.style.display = "none"; m.className = "msg"; return; }' +
+        '  m.textContent = txt;' +
+        '  m.className = "msg " + (kind || "");' +
+        '  m.style.display = "block";' +
+        '}' +
+        'function clampInt(val, min, max, fallback){' +
+        '  var n = parseInt(val, 10);' +
+        '  if (isNaN(n)) return fallback;' +
+        '  return Math.max(min, Math.min(max, n));' +
+        '}' +
+        'function syncToForm(cfg, serverFlag){' +
+        '  if (!cfg) return;' +
+        '  byId("wAct").value = cfg.activationMode === "server" ? "server" : (cfg.enabled ? "local_on" : "local_off");' +
+        '  byId("wMode").value = cfg.mode === "mirror" ? "mirror" : "tile";' +
+        '  byId("wRows").value = clampInt(cfg.rows, 1, 32, 1);' +
+        '  byId("wCols").value = clampInt(cfg.cols, 1, 32, 3);' +
+        '  byId("wScreenId").value = clampInt(cfg.screenId, 1, 999, 1);' +
+        '  byId("wBezel").value = clampInt(cfg.bezelPx, 0, 400, 0);' +
+        '  byId("wOrient").value = String(clampInt(cfg.orientation, 0, 3, 0));' +
+        '  if (cfg.syncMode === "master" && cfg.masterIp) { byId("wSync").value = "slave"; }' +
+        '  else if (cfg.syncMode === "master") { byId("wSync").value = "master"; }' +
+        '  else { byId("wSync").value = "ntp"; }' +
+        '  byId("wMasterIp").value = cfg.masterIp || "";' +
+        '  byId("wDrm").checked = Boolean(cfg.drmMode);' +
+        '  byId("vwSub").textContent = "Control tbee.tv ahora: " + (serverFlag ? "ACTIVO" : "DESACTIVADO") + " | Soporta IDs 1..999 y matrices hasta 32x32";' +
+        '  updateWallPreview();' +
+        '}' +
+        'function updateWallPreview(){' +
+        '  var rows = clampInt(byId("wRows").value, 1, 32, 1);' +
+        '  var cols = clampInt(byId("wCols").value, 1, 32, 3);' +
+        '  var sid = clampInt(byId("wScreenId").value, 1, 999, 1);' +
+        '  var mode = byId("wMode").value;' +
+        '  var syncVal = byId("wSync").value;' +
+        '  byId("wMasterWrap").style.display = (syncVal === "slave") ? "block" : "none";' +
+        '  var pbtns = byId("wPresets").querySelectorAll("button");' +
+        '  for (var p = 0; p < pbtns.length; p++) {' +
+        '    var pr = parseInt(pbtns[p].getAttribute("data-r"), 10);' +
+        '    var pc = parseInt(pbtns[p].getAttribute("data-c"), 10);' +
+        '    pbtns[p].className = (pr === rows && pc === cols) ? "pbtn on" : "pbtn";' +
+        '  }' +
+        '  var total = rows * cols;' +
+        '  var warn = byId("wWarn");' +
+        '  if (mode === "tile" && sid > total) {' +
+        '    byId("wWarnTxt").textContent = "ID #" + sid + " supera los " + total + " espacios de " + rows + "x" + cols + " (usará posición modular #" + (((sid - 1) % total) + 1) + " si no ampliás la matriz).";' +
+        '    warn.style.display = "flex";' +
+        '  } else {' +
+        '    warn.style.display = "none";' +
+        '  }' +
+        '  var showR = Math.min(rows, 6);' +
+        '  var showC = Math.min(cols, 8);' +
+        '  var grid = byId("wMatrix");' +
+        '  grid.style.gridTemplateColumns = "repeat(" + showC + ", minmax(54px, 1fr))";' +
+        '  grid.innerHTML = "";' +
+        '  for (var r = 0; r < showR; r++) {' +
+        '    for (var c = 0; c < showC; c++) {' +
+        '      var cid = (r * cols) + c + 1;' +
+        '      var cell = document.createElement("div");' +
+        '      cell.className = "mcell" + (cid === sid ? " active" : "");' +
+        '      cell.setAttribute("data-id", String(cid));' +
+        '      var lbl = document.createElement("span");' +
+        '      lbl.textContent = "#" + cid;' +
+        '      var sub = document.createElement("small");' +
+        '      sub.textContent = "f" + (r + 1) + ",c" + (c + 1);' +
+        '      cell.appendChild(lbl);' +
+        '      cell.appendChild(sub);' +
+        '      cell.onclick = function(){' +
+        '        byId("wScreenId").value = this.getAttribute("data-id");' +
+        '        updateWallPreview();' +
+        '      };' +
+        '      grid.appendChild(cell);' +
+        '    }' +
+        '  }' +
+        '  var effIdx = (sid - 1) % total;' +
+        '  var effR = Math.floor(effIdx / cols) + 1;' +
+        '  var effC = (effIdx % cols) + 1;' +
+        '  byId("wMatrixLabel").textContent = "Matriz " + rows + "x" + cols + " (" + total + " espacios) | ID actual #" + sid + " -> fila " + effR + ", col " + effC + (rows > showR || cols > showC ? " (vista parcial 6x8)" : "");' +
+        '}' +
+        'function openWallView(){' +
+        '  showMsg("");' +
+        '  if (lastStatus && lastStatus.wallConfig) {' +
+        '    syncToForm(lastStatus.wallConfig, lastStatus.serverVideoWallFlag);' +
+        '    wallLoaded = true;' +
+        '  }' +
+        '  byId("viewMonitor").className = "hide";' +
+        '  byId("viewWall").className = "";' +
+        '}' +
+        'function closeWallView(){' +
+        '  showMsg("");' +
+        '  byId("viewWall").className = "hide";' +
+        '  byId("viewMonitor").className = "";' +
+        '}' +
+        'function refresh(){' +
+        '  fetch("/api/status").then(function(r){ return r.json(); }).then(function(s){' +
+        '    lastStatus = s;' +
+        '    byId("ver").textContent = "v" + s.version;' +
+        '    byId("meta").textContent = (s.model || "Linux") + " • IP " + (s.ip || "-") + " • " + s.displayBackend;' +
+        '    byId("conn").textContent = s.connection ? "tbee.tv ONLINE" : "MODO OFFLINE";' +
+        '    byId("now").textContent = s.filesPlaying.join(", ") || "En espera";' +
+        '    byId("hw").textContent = s.cpuUsage + "% / " + s.memPercentUsed + "% / " + s.temperature + "°C";' +
+        '    byId("disk").textContent = s.freeSpace;' +
+        '    byId("vw").textContent = s.wallActive ? (s.wallConfig.mode + " " + s.wallConfig.rows + "x" + s.wallConfig.cols + " #" + s.wallConfig.screenId + " (drift " + (s.wallSyncStatus.driftMs || 0) + "ms)") : ("Normal (" + (s.wallConfig.activationMode === "server" ? "remoto tbee.tv OFF" : "desactivado") + ")");' +
+        '    byId("queues").textContent = "Bloque activo: " + s.blockPlaying + " | Bloques hoy: " + s.scheduleCount + " | Descargas FTP: " + s.queues.ftp + " | Imágenes: " + s.queues.render + " | Videos Opt: " + s.queues.videoOpt + " | Seamless activo: " + (s.queues.concatenating ? "Sí" : "No");' +
+        '    byId("logs").textContent = (s.logs || []).join(nl) || "Sin logs";' +
+        '    if (!wallLoaded && s.wallConfig) { syncToForm(s.wallConfig, s.serverVideoWallFlag); wallLoaded = true; }' +
+        '  }).catch(function(){});' +
+        '}' +
+        'function act(u){' +
+        '  fetch(u).then(function(r){ return r.text(); }).then(function(t){' +
+        '    showMsg(t, "ok");' +
+        '    refresh();' +
+        '  }).catch(function(e){ showMsg("Error: " + e.message, "err"); });' +
+        '}' +
+        'function saveWall(){' +
+        '  var actVal = byId("wAct").value;' +
+        '  var syncVal = byId("wSync").value;' +
+        '  var masterIp = byId("wMasterIp").value.trim();' +
+        '  if (syncVal === "slave" && !masterIp) {' +
+        '    showMsg("Ingresá la IP local del equipo Master.", "err");' +
+        '    return;' +
+        '  }' +
+        '  var payload = {' +
+        '    activationMode: (actVal === "server") ? "server" : "local",' +
+        '    enabled: (actVal !== "local_off"),' +
+        '    mode: byId("wMode").value,' +
+        '    rows: clampInt(byId("wRows").value, 1, 32, 1),' +
+        '    cols: clampInt(byId("wCols").value, 1, 32, 3),' +
+        '    screenId: clampInt(byId("wScreenId").value, 1, 999, 1),' +
+        '    bezelPx: clampInt(byId("wBezel").value, 0, 400, 0),' +
+        '    orientation: clampInt(byId("wOrient").value, 0, 3, 0),' +
+        '    syncMode: (syncVal === "ntp") ? "ntp" : "master",' +
+        '    masterIp: (syncVal === "slave") ? masterIp : "",' +
+        '    drmMode: Boolean(byId("wDrm").checked)' +
+        '  };' +
+        '  fetch("/api/wall", {' +
+        '    method: "POST",' +
+        '    headers: { "Content-Type": "application/json" },' +
+        '    body: JSON.stringify(payload)' +
+        '  }).then(function(r){ return r.json(); }).then(function(res){' +
+        '    if (!res || !res.ok) { showMsg((res && res.error) ? res.error : "Error al guardar Video Wall", "err"); return; }' +
+        '    wallLoaded = false;' +
+        '    closeWallView();' +
+        '    var info = "Video Wall guardado (" + res.config.mode + " " + res.config.rows + "x" + res.config.cols + " #" + res.config.screenId + ").";' +
+        '    if (res.rotChanged) info += res.rotUpdated ? " HDMI rotate actualizado en config.txt (reiniciá la Pi para rotación física completa)." : " Aviso: rotación HDMI requiere sudo desde SSH (urp-wall).";' +
+        '    showMsg(info, "ok");' +
+        '    refresh();' +
+        '  }).catch(function(e){ showMsg("Error guardando Video Wall: " + e.message, "err"); });' +
+        '}' +
+        'byId("btnOpenWall").onclick = openWallView;' +
+        'byId("btnBackWall").onclick = closeWallView;' +
+        'byId("btnCancelWall").onclick = function(){ wallLoaded = false; if (lastStatus && lastStatus.wallConfig) syncToForm(lastStatus.wallConfig, lastStatus.serverVideoWallFlag); closeWallView(); };' +
+        'byId("btnResetWall").onclick = function(){ if (lastStatus && lastStatus.wallConfig) syncToForm(lastStatus.wallConfig, lastStatus.serverVideoWallFlag); showMsg("Valores restaurados al estado guardado.", ""); };' +
+        'byId("btnSaveWall").onclick = saveWall;' +
+        'byId("btnIdMinus").onclick = function(){ byId("wScreenId").value = Math.max(1, clampInt(byId("wScreenId").value, 1, 999, 1) - 1); updateWallPreview(); };' +
+        'byId("btnIdPlus").onclick = function(){ byId("wScreenId").value = Math.min(999, clampInt(byId("wScreenId").value, 1, 999, 1) + 1); updateWallPreview(); };' +
+        'byId("btnAutoExpand").onclick = function(){' +
+        '  var sid = clampInt(byId("wScreenId").value, 1, 999, 1);' +
+        '  byId("wRows").value = 1;' +
+        '  byId("wCols").value = Math.min(32, sid);' +
+        '  updateWallPreview();' +
+        '};' +
+        'var pbtns = byId("wPresets").querySelectorAll("button");' +
+        'for (var bi = 0; bi < pbtns.length; bi++) {' +
+        '  pbtns[bi].onclick = function(){' +
+        '    byId("wRows").value = this.getAttribute("data-r");' +
+        '    byId("wCols").value = this.getAttribute("data-c");' +
+        '    updateWallPreview();' +
+        '  };' +
+        '}' +
+        'var liveIds = ["wAct", "wMode", "wRows", "wCols", "wScreenId", "wBezel", "wOrient", "wSync"];' +
+        'for (var li = 0; li < liveIds.length; li++) {' +
+        '  byId(liveIds[li]).onchange = updateWallPreview;' +
+        '  byId(liveIds[li]).oninput = updateWallPreview;' +
+        '}' +
+        'byId("btnUpdate").onclick = function(){ act("/update"); };' +
+        'byId("btnGc").onclick = function(){ act("/gc"); };' +
+        'byId("btnCleanLogs").onclick = function(){ act("/cleanLogs"); };' +
+        'byId("btnShot").onclick = function(){ fetch("/screenshot").then(function(){ var img = byId("shotImg"); img.src = "/screenshot.jpg?t=" + Date.now(); img.style.display = "block"; showMsg("Captura actualizada.", "ok"); }); };' +
+        'byId("btnReboot").onclick = function(){ if (confirm("¿Reiniciar Raspberry Pi?")) act("/reboot"); };' +
+        'byId("btnShutdown").onclick = function(){ if (confirm("¿Apagar Raspberry Pi?")) act("/shutdown"); };' +
+        'byId("btnDelete").onclick = function(){ if (confirm("¿Borrar todo el contenido local?")) act("/deleteContents"); };' +
+        'refresh();' +
+        'setInterval(refresh, 4000);' +
+        '</script></body></html>';
+}
+
 var express = require('express');
 var app = express();
 app.use(express.static(__dirname + '/web'));
 
-// Cabeceras CORS completas para permitir comandos directos desde tbee.tv
 app.use(function (req, res, next) {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    if (req.method === 'OPTIONS') {
-        return res.status(200).end();
-    }
+    if (req.method === 'OPTIONS') return res.status(200).end();
     next();
 });
 
-app.get('/play', function (req, res) {
-    checkSchedule();
-    res.status(200).send('Play');
+app.get('/', function (req, res) {
+    res.status(200).type('html').send(buildLocalDashboardHtml());
 });
-app.get('/stop', function (req, res) {
-    stopOmx();
-    res.status(200).send('Stop');
+
+app.get('/api/status', function (req, res) {
+    loadWallConfig();
+    res.json({
+        version: URPVersion,
+        model: piModelStr,
+        totalRamMB: totalRamMB,
+        displayBackend: useDrmDirect ? 'DRM/KMS' : (hasWaylandDisplay ? 'Wayland' : 'X11'),
+        ip: URPdata.URPIpAddress || '',
+        mac: macAdd,
+        uptimeSec: Math.round(process.uptime()),
+        connection: iConn,
+        freeSpace: URPFreeSpace,
+        freeDiskMb: freeDiskMb,
+        temperature: temperature,
+        cpuUsage: cpuUsage,
+        memPercentUsed: memPercentUsed,
+        blockPlaying: blockPlaying,
+        nowPlayingId: URPNowPlaying,
+        filesPlaying: filesPlaying,
+        scheduleCount: Array.isArray(schedule) ? schedule.length : 0,
+        serverVideoWallFlag: Boolean(URPdata && URPdata.isVideoWall),
+        wallActive: isWallActive(),
+        wallConfig: wallConfig,
+        wallSyncStatus: wallSyncStatus,
+        queues: {
+            ftp: FTPcontents.length,
+            render: renderQueue.length + (isRendering ? 1 : 0),
+            videoOpt: videoOptQueue.length + (isOptimizingVideo ? 1 : 0),
+            concatenating: isConcatenating
+        },
+        logs: recentLogs
+    });
 });
-app.get('/pause', function (req, res) {
-    if (refreshIntervalId != null) clearInterval(refreshIntervalId);
-    res.status(200).send('Pause');
-});
+
 app.get('/resetContent', function (req, res) {
     blockPlaying = 0;
     checkSchedule();
@@ -3821,6 +4516,30 @@ app.get('/deleteContent', function (req, res) {
     res.status(200).send('Delete Contents');
     deleteContentFiles();
 });
+app.get('/gc', function (req, res) {
+    garbageCollectUnusedMedia(false, function (info) {
+        res.json(info);
+    });
+});
+app.get('/cleanLogs', function (req, res) {
+    cleanLogs();
+    res.status(200).send('Clean Logs');
+});
+app.get('/uploadLogs', function (req, res) {
+    uploadLogs(function (ok) {
+        res.status(200).send(ok ? 'Logs uploaded' : 'No logs');
+    });
+});
+app.get('/screenshot', function (req, res) {
+    takeScreenshot(function (ok) {
+        res.status(ok ? 200 : 500).send(ok ? 'Screenshot OK' : 'Screenshot failed');
+    });
+});
+app.get('/screenshot.jpg', function (req, res) {
+    var p = basePath + 'screenshot.jpg';
+    if (fs.existsSync(p)) return res.sendFile(p);
+    res.status(404).send('No screenshot');
+});
 app.get('/contents', function (req, res) {
     try {
         var files = fs.readdirSync(contentBasePath);
@@ -3840,19 +4559,11 @@ app.get('/schedule', function (req, res) {
         schedule: schedule
     });
 });
-app.get('/URPTemperature', function (req, res) {
-    res.json({ temperature: temperature });
-});
-app.get('/URPmemPercentUsed', function (req, res) {
-    res.json({ memPercentUsed: memPercentUsed });
-});
-app.get('/URPcpuUsage', function (req, res) {
-    res.json({ cpuUsage: cpuUsage });
-});
+app.get('/URPTemperature', function (req, res) { res.json({ temperature: temperature }); });
+app.get('/URPmemPercentUsed', function (req, res) { res.json({ memPercentUsed: memPercentUsed }); });
+app.get('/URPcpuUsage', function (req, res) { res.json({ cpuUsage: cpuUsage }); });
 app.get('/update', function (req, res) {
-    checkGithubOTA(function (result) {
-        res.json(result);
-    });
+    checkGithubOTA(function (result) { res.json(result); });
 });
 app.get('/wall', function (req, res) {
     loadWallConfig();
@@ -3865,6 +4576,70 @@ app.get('/wall', function (req, res) {
         config: wallConfig,
         syncStatus: wallSyncStatus,
         masterState: wallMasterState
+    });
+});
+app.post('/api/wall', function (req, res) {
+    readJsonBody(req, function (err, body) {
+        if (err || !body || typeof body !== 'object') {
+            return res.status(400).json({ ok: false, error: 'JSON inválido' });
+        }
+        try {
+            loadWallConfig();
+            var prevRot = wallConfig.orientation;
+            var rows = Math.max(1, Math.min(32, parseInt(body.rows, 10) || 1));
+            var cols = Math.max(1, Math.min(32, parseInt(body.cols, 10) || 1));
+            var total = rows * cols;
+            var screenId = Math.max(1, Math.min(999, parseInt(body.screenId, 10) || 1));
+            var effIdx = (screenId - 1) % total;
+            var orientation = [0, 1, 2, 3].indexOf(parseInt(body.orientation, 10)) !== -1 ? parseInt(body.orientation, 10) : 0;
+            var actMode = (body.activationMode === 'server' || body.activationMode === 'local') ? body.activationMode : 'local';
+            var nextCfg = {
+                enabled: (actMode === 'server') ? true : Boolean(body.enabled),
+                activationMode: actMode,
+                mode: (body.mode === 'mirror') ? 'mirror' : 'tile',
+                screenId: screenId,
+                rows: rows,
+                cols: cols,
+                row: Math.floor(effIdx / cols),
+                col: effIdx % cols,
+                bezelPx: Math.max(0, Math.min(400, parseInt(body.bezelPx, 10) || 0)),
+                orientation: orientation,
+                syncMode: (body.syncMode === 'master') ? 'master' : 'ntp',
+                masterIp: String(body.masterIp || '').trim(),
+                drmMode: Boolean(body.drmMode),
+                updatedAt: new Date().toISOString()
+            };
+
+            ensureDir(basePath);
+            var tmpPath = wallConfigPath + '.tmp';
+            fs.writeFileSync(tmpPath, JSON.stringify(nextCfg, null, 2) + '\n', 'utf8');
+            fs.renameSync(tmpPath, wallConfigPath);
+            wallConfigMtime = 0;
+            loadWallConfig();
+
+            var rotChanged = (orientation !== prevRot);
+            var rotUpdated = false;
+            if (rotChanged) {
+                var rotRes = writeHdmiRotateToConfig(orientation);
+                rotUpdated = Boolean(rotRes && rotRes.ok);
+            }
+
+            clearWallDerivedCaches();
+            blockPlaying = 0;
+            stopOmx(function () {
+                setTimeout(function () { checkSchedule(); }, 250);
+            });
+
+            res.json({
+                ok: true,
+                config: wallConfig,
+                wallActive: isWallActive(),
+                rotChanged: rotChanged,
+                rotUpdated: rotUpdated
+            });
+        } catch (saveErr) {
+            res.status(500).json({ ok: false, error: saveErr.message });
+        }
     });
 });
 app.get('/wall/sync', function (req, res) {
@@ -3888,14 +4663,14 @@ app.get('/wall/sync', function (req, res) {
 var server = http.createServer(app);
 server.on('error', function (err) {
     if (err.code === 'EADDRINUSE') {
-        console.warn("[SERVER] Puerto " + URPPort + " ya ocupado por otra instancia previa. La reproducción continuará normalmente.");
+        console.warn("[SERVER] Puerto " + URPPort + " ya ocupado por otra instancia previa.");
     } else {
         console.error("[SERVER ERROR]", err.message);
     }
 });
 try {
     server.listen(URPPort, function () {
-        console.log("URPPI3 Server escuchando en puerto " + URPPort);
+        console.log("URPPI3 Server v" + URPVersion + " escuchando en puerto " + URPPort);
     });
 } catch (e) {
     console.warn("[SERVER] Excepción al escuchar:", e.message);
