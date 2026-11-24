@@ -86,7 +86,7 @@ fi
 
 # 3. Crear estructura de carpetas y package.json
 echo "[3/7] Creando directorios e instalando módulos Node.js en /home/pi/URP..."
-mkdir -p /home/pi/URP/content /home/pi/URP/temp /home/pi/URP/seamless /home/pi/URP/web
+mkdir -p /home/pi/URP/content /home/pi/URP/temp /home/pi/URP/seamless /home/pi/URP/optimized /home/pi/URP/web
 cd /home/pi/URP
 
 cat << 'EOF' > /home/pi/URP/package.json

@@ -1,6 +1,6 @@
 var URPActive = true;
 var URPType = 'URPPI3';
-var URPVersion = '2.3.1';
+var URPVersion = '2.3.2';
 var URPUpdated = false;
 var isArm = process.arch === 'arm' || process.arch === 'arm64';
 var isLinux = process.platform === 'linux';
@@ -24,6 +24,7 @@ var basePath = '/home/pi/URP/';
 var contentBasePath = basePath + 'content/';
 var tempFolderPath = basePath + 'temp/';
 var seamlessBasePath = basePath + 'seamless/';
+var optimizedBasePath = basePath + 'optimized/';
 var URPdata = {};
 var schedule = [];
 var contents = [];
@@ -441,11 +442,10 @@ function playCurrentIndex() {
     }
     try {
         var fSize = fs.statSync(fullPath).size;
-        var fExt = path.extname(fullPath).toLowerCase();
-        var minSize = (fExt === '.mp4' || fExt === '.mkv' || fExt === '.avi') ? 4096 : 1;
+        var minSize = isVideoFile(fullPath) ? 4096 : 1;
         if (fSize < minSize) {
             console.warn("[PLAYER] Archivo vacío o corrupto (" + fSize + " bytes): " + fullPath + ". Saltando...");
-            if (/_\d+s\.mp4$/i.test(fullPath)) {
+            if (/_\d+s\.mp4$/i.test(fullPath) || fullPath.indexOf(seamlessBasePath) === 0 || fullPath.indexOf(optimizedBasePath) === 0) {
                 try { fs.unlinkSync(fullPath); } catch (ue) {}
             }
             currentMediaIndex++;
@@ -556,7 +556,10 @@ function playCurrentIndex() {
         var mpvBaseArgs = [
             '--fs', '--no-osc', '--no-osd-bar', '--really-quiet',
             '--no-input-default-bindings', '--cursor-autohide=always', '--ontop',
-            '--hwdec=auto', '--keep-open=no'
+            '--hwdec=auto', '--keep-open=no',
+            '--cache=yes', '--demuxer-max-bytes=16M', '--demuxer-max-back-bytes=4M',
+            '--hr-seek=no', '--framedrop=vo', '--sws-scaler=fast-bilinear',
+            '--vd-lavc-threads=2'
         ];
         if (mpvRotateDeg > 0) {
             mpvBaseArgs.push('--video-rotate=' + mpvRotateDeg);
@@ -568,8 +571,7 @@ function playCurrentIndex() {
             for (var vpIdx = 0; vpIdx < currentPlaylist.length; vpIdx++) {
                 var vpItem = currentPlaylist[vpIdx];
                 var vpPath = path.isAbsolute(vpItem.file) ? vpItem.file : (contentBasePath + vpItem.file);
-                var vpExt = path.extname(vpPath).toLowerCase();
-                if (vpExt !== '.jpg' && vpExt !== '.jpeg' && vpExt !== '.png' && vpExt !== '.bmp' && fs.existsSync(vpPath)) {
+                if (isVideoFile(vpPath) && fs.existsSync(vpPath)) {
                     try {
                         if (fs.statSync(vpPath).size > 1024) {
                             mpvPlaylistPaths.push(vpPath);
@@ -604,7 +606,7 @@ function playCurrentIndex() {
             activePlayerProcess = null;
             var elapsed = Date.now() - playStartTime;
             var minExpectedMs = (!item.duration || item.duration >= 3) ? 1000 : 250;
-            var isConvertedOrSeamless = (/_\d+s\.mp4$/i.test(fullPath) || fullPath.indexOf(seamlessBasePath) === 0);
+            var isConvertedOrSeamless = (/_\d+s\.mp4$/i.test(fullPath) || fullPath.indexOf(seamlessBasePath) === 0 || fullPath.indexOf(optimizedBasePath) === 0);
             if (isConvertedOrSeamless && (code !== 0 || elapsed < minExpectedMs)) {
                 console.error("[PLAYER] Video inválido o fallido (" + path.basename(fullPath) + ", code=" + code + ", " + elapsed + "ms). Eliminando para regenerar...");
                 try { fs.unlinkSync(fullPath); } catch (ue) {}
@@ -728,9 +730,7 @@ function emergencyDiskPlayback() {
         convertExistingImages();
 
         var videoFiles = diskFiles.filter(function (f) {
-            var ext = path.extname(f).toLowerCase();
-            if ((ext !== '.mp4' && ext !== '.mkv' && ext !== '.avi') ||
-                f.indexOf('.part') !== -1 || f.indexOf('temp_') !== -1) {
+            if (!isVideoFile(f) || f.indexOf('.part') !== -1 || f.indexOf('temp_') !== -1) {
                 return false;
             }
             try {
@@ -748,13 +748,29 @@ function emergencyDiskPlayback() {
             }
         });
 
-        // Si ya hay videos (incluyendo los MP4 generados de imagenes), reproducirlos en bucle
+        // Si ya hay videos (incluyendo los MP4 generados de imagenes), reproducirlos en bucle (usando copia optimizada si ya existe)
         if (videoFiles.length > 0) {
-            console.log('[STARTUP] ¡' + videoFiles.length + ' video(s) MP4 encontrados en disco! Iniciando reproduccion continua:');
+            var resolvedDiskVideos = [];
+            console.log('[STARTUP] ¡' + videoFiles.length + ' video(s) encontrados en disco! Iniciando reproduccion continua:');
             for (var p = 0; p < videoFiles.length; p++) {
+                var rawDiskPath = path.join(contentBasePath, videoFiles[p]);
+                var optDiskPath = getOptimizedVideoPath(rawDiskPath);
+                if (optDiskPath && fs.existsSync(optDiskPath)) {
+                    try {
+                        if (fs.statSync(optDiskPath).size > 4096) {
+                            resolvedDiskVideos.push(optDiskPath);
+                            console.log('  -> ' + videoFiles[p] + ' (optimizado)');
+                            continue;
+                        }
+                    } catch (oe) {}
+                }
+                if (!/_\d+s\.mp4$/i.test(videoFiles[p])) {
+                    scheduleVideoOptimization(rawDiskPath);
+                }
+                resolvedDiskVideos.push(videoFiles[p]);
                 console.log('  -> ' + videoFiles[p]);
             }
-            playSignagePlaylist(videoFiles);
+            playSignagePlaylist(resolvedDiskVideos);
             return;
         }
 
@@ -787,6 +803,7 @@ ensureDir(basePath);
 ensureDir(contentBasePath);
 ensureDir(tempFolderPath);
 ensureDir(seamlessBasePath);
+ensureDir(optimizedBasePath);
 
 // Ejecutar reproduccion de disco inmediatamente al arrancar el script
 emergencyDiskPlayback();
@@ -1071,6 +1088,12 @@ function isImg(filename) {
     return ['png', 'jpg', 'jpeg'].indexOf(ext) !== -1;
 }
 
+function isVideoFile(filename) {
+    if (!filename) return false;
+    var ext = path.extname(filename).toLowerCase();
+    return ['.mp4', '.mkv', '.avi', '.mov', '.webm', '.m4v', '.ts', '.mpg', '.mpeg', '.wmv', '.flv'].indexOf(ext) !== -1;
+}
+
 // Cola secuencial atómica para conversión de imagen a video MP4 (compatible VideoCore IV / MPV)
 var renderQueue = [];
 var activeRenderOutPath = '';
@@ -1323,6 +1346,253 @@ function convertExistingImages(callback) {
     }
 }
 
+// ==============================================================================
+// 5B. OPTIMIZACION AUTOMATICA DE VIDEOS PESADOS PARA RASPBERRY PI (NO BLOQUEANTE)
+// ==============================================================================
+var videoOptQueue = [];
+var isOptimizingVideo = false;
+var activeVideoOptOutPath = '';
+var noOptNeededMap = {};
+var failedOptMap = {};
+
+function getOptimizedVideoPath(srcPath) {
+    try {
+        if (!srcPath || !fs.existsSync(srcPath)) return null;
+        var st = fs.statSync(srcPath);
+        var ori = isPortraitOrientation() ? 'V' : 'H';
+        var baseName = path.basename(srcPath).replace(/\.[^/.]+$/, '');
+        var safeBase = normalizeName(baseName).replace(/[^a-zA-Z0-9._-]/g, '_');
+        return optimizedBasePath + 'opt_' + safeBase + '_' + st.size + '_' + st.mtime.getTime() + '_' + ori + '.mp4';
+    } catch (e) {
+        return null;
+    }
+}
+
+function cleanupOldOptimizedForBase(safeBasePrefix, keepFileName) {
+    try {
+        if (!fs.existsSync(optimizedBasePath)) return;
+        var files = fs.readdirSync(optimizedBasePath);
+        for (var i = 0; i < files.length; i++) {
+            if (files[i].indexOf(safeBasePrefix) === 0 && files[i] !== keepFileName && files[i].indexOf('temp_') !== 0) {
+                try { fs.unlinkSync(path.join(optimizedBasePath, files[i])); } catch (e) {}
+            }
+        }
+    } catch (e) {}
+}
+
+function needsPiVideoOptimization(info) {
+    if (!info || !info.hasVideo) return { needed: false, reason: 'no_video' };
+    var ext = path.extname(info.fullPath).toLowerCase();
+    if (ext !== '.mp4') return { needed: true, reason: 'contenedor ' + ext };
+    if (info.videoCodec && info.videoCodec !== 'h264') return { needed: true, reason: 'codec ' + info.videoCodec };
+    if (info.pixFmt && info.pixFmt !== 'yuv420p' && info.pixFmt !== 'yuvj420p') return { needed: true, reason: 'pix_fmt ' + info.pixFmt };
+    if (info.profile && /(10|422|444)/i.test(info.profile)) return { needed: true, reason: 'profile ' + info.profile };
+
+    var w = info.width || 0;
+    var h = info.height || 0;
+    var maxDim = Math.max(w, h);
+    var minDim = Math.min(w, h);
+    if (maxDim > 1920 || minDim > 1080) return { needed: true, reason: 'resolucion ' + w + 'x' + h };
+    if (info.fps && info.fps > 32) return { needed: true, reason: info.fps.toFixed(1) + 'fps' };
+    if (info.bitRate && info.bitRate > 8500000) return { needed: true, reason: (info.bitRate / 1000000).toFixed(1) + 'Mbps' };
+    if (info.hasAudio && info.audioCodec && info.audioCodec !== 'aac' && info.audioCodec !== 'mp3') {
+        return { needed: true, reason: 'audio ' + info.audioCodec };
+    }
+    return { needed: false, reason: 'compatible' };
+}
+
+function processNextVideoOpt() {
+    if (isOptimizingVideo || videoOptQueue.length === 0) return;
+    if (isRendering || isConcatenating) {
+        setTimeout(processNextVideoOpt, 3000);
+        return;
+    }
+
+    var job = videoOptQueue.shift();
+    var srcPath = job.srcPath;
+    var outPath = job.outPath;
+
+    if (!fs.existsSync(srcPath) || failedOptMap[outPath]) {
+        return processNextVideoOpt();
+    }
+    if (fs.existsSync(outPath)) {
+        try {
+            if (fs.statSync(outPath).size > 4096) return processNextVideoOpt();
+            fs.unlinkSync(outPath);
+        } catch (e) {}
+    }
+
+    isOptimizingVideo = true;
+    activeVideoOptOutPath = outPath;
+
+    probeMediaFile(srcPath, function (info) {
+        if (!info || !info.hasVideo) {
+            isOptimizingVideo = false;
+            activeVideoOptOutPath = '';
+            return processNextVideoOpt();
+        }
+
+        var check = needsPiVideoOptimization(info);
+        if (!check.needed) {
+            try {
+                var stOk = fs.statSync(srcPath);
+                noOptNeededMap[srcPath] = stOk.size + ':' + stOk.mtime.getTime();
+            } catch (e) {}
+            isOptimizingVideo = false;
+            activeVideoOptOutPath = '';
+            return processNextVideoOpt();
+        }
+
+        ensureDir(optimizedBasePath);
+        var isVert = isPortraitOrientation();
+        var maxW = isVert ? 1080 : 1920;
+        var maxH = isVert ? 1920 : 1080;
+        var targetFps = (info.fps && info.fps > 0 && info.fps <= 25) ? Math.max(15, Math.round(info.fps)) : 25;
+        var vf = 'scale=' + maxW + ':' + maxH + ':force_original_aspect_ratio=decrease,' +
+                 'scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1,format=yuv420p';
+
+        var tmpPath = optimizedBasePath + 'temp_' + Date.now() + '_' + path.basename(outPath);
+        if (fs.existsSync(tmpPath)) {
+            try { fs.unlinkSync(tmpPath); } catch (e) {}
+        }
+
+        var ffArgs = [
+            '-nostdin', '-y', '-loglevel', 'error',
+            '-i', srcPath,
+            '-vf', vf,
+            '-c:v', 'libx264',
+            '-threads', '2',
+            '-preset', 'veryfast',
+            '-profile:v', 'main',
+            '-level', '4.0',
+            '-pix_fmt', 'yuv420p',
+            '-r', String(targetFps),
+            '-g', String(targetFps),
+            '-bf', '0',
+            '-crf', '22',
+            '-maxrate', '5500k',
+            '-bufsize', '11000k'
+        ];
+        if (info.hasAudio) {
+            ffArgs.push('-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '128k');
+        } else {
+            ffArgs.push('-an');
+        }
+        ffArgs.push('-movflags', '+faststart', tmpPath);
+
+        console.log('[OPT:VIDEO] Normalizando video en segundo plano (' + check.reason + '): ' + path.basename(srcPath));
+
+        var finished = false;
+        var ffProc = null;
+        var stderrLog = '';
+
+        var finishOpt = function (ok) {
+            if (finished) return;
+            finished = true;
+            isOptimizingVideo = false;
+            activeVideoOptOutPath = '';
+            if (!ok && fs.existsSync(tmpPath)) {
+                try { fs.unlinkSync(tmpPath); } catch (e) {}
+            }
+            if (ok) {
+                setTimeout(function () { checkSchedule(); }, 400);
+            }
+            setTimeout(processNextVideoOpt, 300);
+        };
+
+        var optTimeout = setTimeout(function () {
+            if (!finished) {
+                console.error('[OPT:VIDEO] Timeout normalizando ' + path.basename(srcPath));
+                try { if (ffProc) ffProc.kill('SIGKILL'); } catch (e) {}
+                failedOptMap[outPath] = true;
+                finishOpt(false);
+            }
+        }, 1800000);
+
+        var launchFfmpeg = function (useNice) {
+            var bin = useNice ? 'nice' : 'ffmpeg';
+            var args = useNice ? ['-n', '15', 'ffmpeg'].concat(ffArgs) : ffArgs;
+            try {
+                ffProc = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+                if (ffProc.stderr) {
+                    ffProc.stderr.on('data', function (chunk) {
+                        stderrLog += chunk.toString('utf8');
+                        if (stderrLog.length > 2048) stderrLog = stderrLog.slice(-2048);
+                    });
+                }
+                ffProc.on('error', function (err) {
+                    if (useNice) {
+                        return launchFfmpeg(false);
+                    }
+                    clearTimeout(optTimeout);
+                    console.error('[OPT:VIDEO] Error iniciando ffmpeg:', err.message);
+                    failedOptMap[outPath] = true;
+                    finishOpt(false);
+                });
+                ffProc.on('close', function (code) {
+                    clearTimeout(optTimeout);
+                    if (code !== 0 || !fs.existsSync(tmpPath) || fs.statSync(tmpPath).size <= 4096) {
+                        console.error('[OPT:VIDEO] Falló conversión (' + path.basename(srcPath) + ', code=' + code + '): ' + (stderrLog.trim() || 'sin detalle'));
+                        failedOptMap[outPath] = true;
+                        return finishOpt(false);
+                    }
+                    try {
+                        if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
+                        fs.renameSync(tmpPath, outPath);
+                        var basePrefix = 'opt_' + normalizeName(path.basename(srcPath).replace(/\.[^/.]+$/, '')).replace(/[^a-zA-Z0-9._-]/g, '_') + '_';
+                        cleanupOldOptimizedForBase(basePrefix, path.basename(outPath));
+                        console.log('[OPT:VIDEO] ¡Video fluido listo!: ' + path.basename(outPath) + ' (' + (fs.statSync(outPath).size / (1024 * 1024)).toFixed(2) + ' MB)');
+                        return finishOpt(true);
+                    } catch (e) {
+                        failedOptMap[outPath] = true;
+                        return finishOpt(false);
+                    }
+                });
+            } catch (e) {
+                if (useNice) return launchFfmpeg(false);
+                clearTimeout(optTimeout);
+                failedOptMap[outPath] = true;
+                finishOpt(false);
+            }
+        };
+
+        launchFfmpeg(isLinux);
+    });
+}
+
+function scheduleVideoOptimization(srcPath) {
+    if (!isArm && !isLinux) return;
+    if (!srcPath || !fs.existsSync(srcPath)) return;
+    if (!isVideoFile(srcPath) || /_\d+s\.mp4$/i.test(srcPath)) return;
+    if (srcPath.indexOf(optimizedBasePath) === 0 || srcPath.indexOf(seamlessBasePath) === 0) return;
+
+    try {
+        var st = fs.statSync(srcPath);
+        if (st.size <= 4096) return;
+        if (noOptNeededMap[srcPath] === (st.size + ':' + st.mtime.getTime())) return;
+    } catch (e) {
+        return;
+    }
+
+    var outPath = getOptimizedVideoPath(srcPath);
+    if (!outPath || failedOptMap[outPath]) return;
+
+    if (fs.existsSync(outPath)) {
+        try {
+            if (fs.statSync(outPath).size > 4096) return;
+            fs.unlinkSync(outPath);
+        } catch (e) {}
+    }
+
+    if (isOptimizingVideo && activeVideoOptOutPath === outPath) return;
+    for (var qi = 0; qi < videoOptQueue.length; qi++) {
+        if (videoOptQueue[qi].outPath === outPath) return;
+    }
+
+    videoOptQueue.push({ srcPath: srcPath, outPath: outPath });
+    processNextVideoOpt();
+}
+
 function fileSerch(contentToSearch, nameToSearch, timeToSearch) {
     var safeContent = normalizeName(contentToSearch);
     var safeName = normalizeName(nameToSearch);
@@ -1375,6 +1645,21 @@ function fileSerch(contentToSearch, nameToSearch, timeToSearch) {
         }
     }
 
+    // Preferir versión optimizada para Raspberry Pi si ya fue generada; sino encolar en segundo plano sin bloquear reproducción
+    if (isVideoFile(targetPath) && (isArm || isLinux)) {
+        var optPath = getOptimizedVideoPath(targetPath);
+        if (optPath && fileExist(optPath)) {
+            try {
+                if (fs.statSync(optPath).size > 4096) {
+                    return optPath;
+                } else {
+                    fs.unlinkSync(optPath);
+                }
+            } catch (e) {}
+        }
+        scheduleVideoOptimization(targetPath);
+    }
+
     return fileName;
 }
 
@@ -1398,9 +1683,21 @@ function computeBlockHash(items) {
     return crypto.createHash('md5').update(parts.join('|')).digest('hex').slice(0, 12);
 }
 
+function parseFrameRate(frStr) {
+    if (!frStr) return 0;
+    var parts = String(frStr).split('/');
+    if (parts.length === 2) {
+        var num = parseFloat(parts[0]);
+        var den = parseFloat(parts[1]);
+        if (den > 0 && !isNaN(num)) return num / den;
+    }
+    var val = parseFloat(frStr);
+    return isNaN(val) ? 0 : val;
+}
+
 function probeMediaFile(fullPath, cb) {
     var ffprobeBin = 'ffprobe';
-    var args = ['-v', 'error', '-show_entries', 'format=duration', '-show_entries', 'stream=codec_type,codec_name,width,height,r_frame_rate', '-of', 'json', fullPath];
+    var args = ['-v', 'error', '-show_entries', 'format=duration,bit_rate', '-show_entries', 'stream=codec_type,codec_name,profile,pix_fmt,width,height,r_frame_rate,avg_frame_rate,sample_rate,channels', '-of', 'json', fullPath];
     var out = '';
     var done = false;
     try {
@@ -1420,12 +1717,51 @@ function probeMediaFile(fullPath, cb) {
                 var streams = parsed.streams || [];
                 var hasVideo = false;
                 var hasAudio = false;
+                var videoCodec = '';
+                var profile = '';
+                var pixFmt = '';
+                var width = 0;
+                var height = 0;
+                var fps = 0;
+                var audioCodec = '';
+                var audioSampleRate = 0;
+                var audioChannels = 0;
                 for (var si = 0; si < streams.length; si++) {
-                    if (streams[si].codec_type === 'video') hasVideo = true;
-                    if (streams[si].codec_type === 'audio') hasAudio = true;
+                    var st = streams[si];
+                    if (st.codec_type === 'video' && !hasVideo) {
+                        hasVideo = true;
+                        videoCodec = (st.codec_name || '').toLowerCase();
+                        profile = st.profile || '';
+                        pixFmt = (st.pix_fmt || '').toLowerCase();
+                        width = parseInt(st.width, 10) || 0;
+                        height = parseInt(st.height, 10) || 0;
+                        fps = parseFrameRate(st.avg_frame_rate) || parseFrameRate(st.r_frame_rate);
+                    }
+                    if (st.codec_type === 'audio' && !hasAudio) {
+                        hasAudio = true;
+                        audioCodec = (st.codec_name || '').toLowerCase();
+                        audioSampleRate = parseInt(st.sample_rate, 10) || 0;
+                        audioChannels = parseInt(st.channels, 10) || 0;
+                    }
                 }
                 var dur = (parsed.format && parsed.format.duration) ? parseFloat(parsed.format.duration) : 0;
-                cb({ fullPath: fullPath, hasVideo: hasVideo, hasAudio: hasAudio, duration: dur });
+                var bitRate = (parsed.format && parsed.format.bit_rate) ? parseInt(parsed.format.bit_rate, 10) : 0;
+                cb({
+                    fullPath: fullPath,
+                    hasVideo: hasVideo,
+                    hasAudio: hasAudio,
+                    duration: dur,
+                    bitRate: bitRate,
+                    videoCodec: videoCodec,
+                    profile: profile,
+                    pixFmt: pixFmt,
+                    width: width,
+                    height: height,
+                    fps: fps,
+                    audioCodec: audioCodec,
+                    audioSampleRate: audioSampleRate,
+                    audioChannels: audioChannels
+                });
             } catch (e) {
                 cb(null);
             }
@@ -1491,67 +1827,110 @@ function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
         var isVert = isPortraitOrientation();
         var targetW = isVert ? 1080 : 1920;
         var targetH = isVert ? 1920 : 1080;
-        var ffArgs = ['-nostdin', '-y', '-loglevel', 'error'];
-        var filterParts = [];
-        var concatInputs = '';
-        var nextInputIdx = 0;
+        var tmpPath = seamlessBasePath + 'temp_' + Date.now() + '_' + path.basename(outPath);
+        var concatListPath = null;
+        var ffArgs = [];
 
-        for (var i = 0; i < probed.length; i++) {
-            var pi = probed[i];
-            var vIdx = nextInputIdx++;
-            ffArgs.push('-i', pi.fullPath);
+        var canFastCopy = probed.every(function (pi) {
+            return pi.videoCodec === 'h264' &&
+                   (pi.pixFmt === 'yuv420p' || pi.pixFmt === 'yuvj420p') &&
+                   pi.width === targetW &&
+                   pi.height === targetH &&
+                   pi.fps >= 24 && pi.fps <= 26 &&
+                   pi.hasAudio &&
+                   pi.audioCodec === 'aac' &&
+                   pi.audioSampleRate === 44100 &&
+                   pi.audioChannels === 2;
+        });
 
-            filterParts.push(
-                '[' + vIdx + ':v]scale=' + targetW + ':' + targetH + ':force_original_aspect_ratio=decrease,' +
-                'scale=trunc(iw/2)*2:trunc(ih/2)*2,' +
-                'pad=' + targetW + ':' + targetH + ':(' + targetW + '-iw)/2:(' + targetH + '-ih)/2:black,' +
-                'setsar=1,fps=25,format=yuv420p[v' + i + ']'
-            );
-
-            if (pi.hasAudio) {
-                filterParts.push(
-                    '[' + vIdx + ':a]aresample=44100:async=1,aformat=sample_fmts=fltp:channel_layouts=stereo[a' + i + ']'
-                );
-            } else {
-                var aIdx = nextInputIdx++;
-                var durStr = (pi.duration && pi.duration > 0) ? pi.duration.toFixed(3) : '10.000';
-                ffArgs.push('-f', 'lavfi', '-t', durStr, '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100');
-                filterParts.push('[' + aIdx + ':a]aformat=sample_fmts=fltp:channel_layouts=stereo[a' + i + ']');
+        if (canFastCopy) {
+            concatListPath = seamlessBasePath + 'concat_' + Date.now() + '_' + idBlock + '.txt';
+            var listLines = probed.map(function (pi) {
+                return "file '" + pi.fullPath.replace(/'/g, "'\\''") + "'";
+            });
+            try {
+                fs.writeFileSync(concatListPath, listLines.join('\n') + '\n', 'utf8');
+                ffArgs = [
+                    '-nostdin', '-y', '-loglevel', 'error',
+                    '-f', 'concat', '-safe', '0', '-i', concatListPath,
+                    '-c', 'copy', '-movflags', '+faststart', tmpPath
+                ];
+                console.log('[SEAMLESS] Todos los clips ya son uniformes (' + targetW + 'x' + targetH + '). Usando unión instantánea (-c copy)...');
+            } catch (le) {
+                canFastCopy = false;
+                concatListPath = null;
             }
-            concatInputs += '[v' + i + '][a' + i + ']';
         }
 
-        filterParts.push(concatInputs + 'concat=n=' + probed.length + ':v=1:a=1[outv][outa]');
+        if (!canFastCopy) {
+            ffArgs = ['-nostdin', '-y', '-loglevel', 'error'];
+            var filterParts = [];
+            var concatInputs = '';
+            var nextInputIdx = 0;
 
-        var tmpPath = seamlessBasePath + 'temp_' + Date.now() + '_' + path.basename(outPath);
-        ffArgs.push(
-            '-filter_complex', filterParts.join(';'),
-            '-map', '[outv]',
-            '-map', '[outa]',
-            '-c:v', 'libx264',
-            '-threads', '2',
-            '-preset', 'ultrafast',
-            '-profile:v', 'main',
-            '-level', '4.0',
-            '-pix_fmt', 'yuv420p',
-            '-r', '25',
-            '-g', '25',
-            '-bf', '0',
-            '-c:a', 'aac',
-            '-b:a', '128k',
-            '-movflags', '+faststart',
-            tmpPath
-        );
+            for (var i = 0; i < probed.length; i++) {
+                var pi = probed[i];
+                var vIdx = nextInputIdx++;
+                ffArgs.push('-i', pi.fullPath);
+
+                filterParts.push(
+                    '[' + vIdx + ':v]scale=' + targetW + ':' + targetH + ':force_original_aspect_ratio=decrease,' +
+                    'scale=trunc(iw/2)*2:trunc(ih/2)*2,' +
+                    'pad=' + targetW + ':' + targetH + ':(' + targetW + '-iw)/2:(' + targetH + '-ih)/2:black,' +
+                    'setsar=1,fps=25,format=yuv420p[v' + i + ']'
+                );
+
+                if (pi.hasAudio) {
+                    filterParts.push(
+                        '[' + vIdx + ':a]aresample=44100:async=1,aformat=sample_fmts=fltp:channel_layouts=stereo[a' + i + ']'
+                    );
+                } else {
+                    var aIdx = nextInputIdx++;
+                    var durStr = (pi.duration && pi.duration > 0) ? pi.duration.toFixed(3) : '10.000';
+                    ffArgs.push('-f', 'lavfi', '-t', durStr, '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100');
+                    filterParts.push('[' + aIdx + ':a]aformat=sample_fmts=fltp:channel_layouts=stereo[a' + i + ']');
+                }
+                concatInputs += '[v' + i + '][a' + i + ']';
+            }
+
+            filterParts.push(concatInputs + 'concat=n=' + probed.length + ':v=1:a=1[outv][outa]');
+
+            ffArgs.push(
+                '-filter_complex', filterParts.join(';'),
+                '-map', '[outv]',
+                '-map', '[outa]',
+                '-c:v', 'libx264',
+                '-threads', '2',
+                '-preset', 'ultrafast',
+                '-profile:v', 'main',
+                '-level', '4.0',
+                '-pix_fmt', 'yuv420p',
+                '-r', '25',
+                '-g', '25',
+                '-bf', '0',
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                '-movflags', '+faststart',
+                tmpPath
+            );
+        }
 
         var stderrLog = '';
         var finished = false;
         var ffProc = null;
+
+        var cleanupListFile = function () {
+            if (concatListPath && fs.existsSync(concatListPath)) {
+                try { fs.unlinkSync(concatListPath); } catch (e) {}
+            }
+        };
 
         var concatTimeout = setTimeout(function () {
             if (!finished) {
                 finished = true;
                 console.error('[SEAMLESS] Timeout construyendo loop continuo del bloque ' + idBlock);
                 try { if (ffProc) ffProc.kill('SIGKILL'); } catch (e) {}
+                cleanupListFile();
                 try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
                 failedSeamlessHashes[blockHash] = true;
                 isConcatenating = false;
@@ -1571,6 +1950,7 @@ function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
                 if (finished) return;
                 finished = true;
                 clearTimeout(concatTimeout);
+                cleanupListFile();
                 console.error('[SEAMLESS] Error iniciando ffmpeg:', err.message);
                 try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
                 failedSeamlessHashes[blockHash] = true;
@@ -1581,6 +1961,7 @@ function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
                 if (finished) return;
                 finished = true;
                 clearTimeout(concatTimeout);
+                cleanupListFile();
                 isConcatenating = false;
                 activeSeamlessHash = '';
 
@@ -1607,6 +1988,7 @@ function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
             if (!finished) {
                 finished = true;
                 clearTimeout(concatTimeout);
+                cleanupListFile();
                 isConcatenating = false;
                 activeSeamlessHash = '';
             }
@@ -1642,7 +2024,7 @@ function playContent(idBlock) {
         var fileName = fileSerch(itm.content, itm.name, itm.length);
         if (fileName !== false) {
             filesToPlay.push({
-                file: path.basename(fileName),
+                file: path.isAbsolute(fileName) ? fileName : path.basename(fileName),
                 duration: itm.length || 10,
                 idContent: itm.idContent || 0
             });
@@ -1661,8 +2043,7 @@ function playContent(idBlock) {
     // usar o generar el stream único continuo (cero cortes, cero negro, cero escritorio)
     var effectivePlaylist = filesToPlay;
     var allItemsAreVideos = filesToPlay.length > 1 && filesToPlay.every(function (it) {
-        var e = path.extname(it.file).toLowerCase();
-        return (e === '.mp4' || e === '.mkv' || e === '.avi');
+        return isVideoFile(it.file);
     });
 
     if (allItemsAreVideos) {
@@ -2114,12 +2495,14 @@ function handleDownloadedFile(content, tempPartPath, callback) {
             }
         }
 
-        // Si el archivo descargado es una imagen, convertir de inmediato a video MP4
+        // Si el archivo descargado es una imagen, convertir de inmediato a video MP4; si es video, analizar/optimizar en segundo plano
         if (isImg(content.content)) {
             var imgDuration = parseInt(content.length, 10);
             if (isNaN(imgDuration) || imgDuration <= 0) imgDuration = 10;
             var baseImgName = normalizeName(content.content).replace(/\.[^/.]+$/, "");
             imgToVideo(content.contentPath, baseImgName + '_' + imgDuration + 's', imgDuration);
+        } else if (isVideoFile(content.contentPath)) {
+            scheduleVideoOptimization(content.contentPath);
         }
 
         var qIdx = getIndex(FTPcontents, content);
@@ -2775,10 +3158,13 @@ function execDeleteContents(callback) {
     FTPcontents = [];
     ftpWorking = false;
     failedSeamlessHashes = {};
+    noOptNeededMap = {};
+    failedOptMap = {};
     stopOmx(function () {
         clearDirectoryFiles(contentBasePath);
         clearDirectoryFiles(tempFolderPath);
         clearDirectoryFiles(seamlessBasePath);
+        clearDirectoryFiles(optimizedBasePath);
         schedule = [];
         contents = [];
         max = 0;

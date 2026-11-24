@@ -7,10 +7,11 @@ Se conecta al servidor Manager (`tbee.tv`), sincroniza horarios y contenidos por
 
 ## ¿Qué hace esta aplicación?
 
-- **Reproducción continua sin cortes (`Seamless Loop`):** Concatena automáticamente los videos e imágenes de cada bloque horario en un único stream MP4 continuo (`/home/pi/URP/seamless/`), evitando flashes negros o destellos del escritorio entre archivos.
+- **Reproducción continua sin cortes (`Seamless Loop`):** Concatena automáticamente los videos e imágenes de cada bloque horario en un único stream MP4 continuo (`/home/pi/URP/seamless/`), evitando flashes negros o destellos del escritorio entre archivos (con unión instantánea `-c copy` cuando los clips ya están estandarizados).
+- **Optimización automática de cualquier video subido:** Analiza cada video nuevo con `ffprobe`; si supera la capacidad óptima de la Raspberry (4K, 60fps, HEVC/H.265, VP9, AV1, 10-bit, `>8.5 Mbps`, contenedores `.mov`/`.mkv`/`.webm`, etc.), lo normaliza automáticamente en segundo plano con prioridad baja (`nice -n 15`) a **H.264 8-bit ≤1080p @25fps (`/home/pi/URP/optimized/`)** sin bloquear la reproducción ni alterar el archivo original de `content/`.
 - **Conversión automática de imágenes a video MP4:** Transforma `.jpg`, `.jpeg` y `.png` a H.264 (`1920x1080` o `1080x1920`) respetando la duración configurada en el Manager, en segundo plano y con escritura atómica (`temp_*`).
 - **Descarga FTP reanudable (`curl`):** Descarga archivos grandes con soporte de reanudación (`-C -`), monitoreo de velocidad en Mbps y verificación MD5 de bajo consumo de memoria (con respaldo automático en `JSFtp`).
-- **Motor dual por hardware:** Utiliza `omxplayer` en sistemas legacy (Buster/Bullseye) y `mpv` optimizado (`--hwdec=auto`, `--ontop`, playlist en ventana única) en sistemas modernos (Bookworm/Trixie y Pi 4/5).
+- **Motor dual por hardware:** Utiliza `omxplayer` en sistemas legacy (Buster/Bullseye) y `mpv` optimizado (`--hwdec=auto`, buffer RAM de 16 MB, `--framedrop=vo`, `--ontop`, playlist en ventana única) en sistemas modernos (Bookworm/Trixie y Pi 4/5).
 - **Cortina negra y modo kiosko limpio:** Desactiva fondo de escritorio, barras de tareas (`lxpanel`/`wf-panel-pi`), salvapantallas, cursor y **todos los popups/notificaciones del sistema**.
 - **Modo Offline resiliente:** Si se corta internet, continúa reproduciendo al instante la programación guardada localmente (`URPDB` / `URPDB.json` y contenido en disco).
 - **Auto-actualización remota desde GitHub (OTA):** Cada **5 minutos** verifica si hay una versión nueva de `URPPI3.js` en `JulianDS95/URPSignageTv`, valida sintaxis con `node --check`, crea respaldo (`.bak`) y reinicia el servicio automáticamente.
@@ -21,7 +22,7 @@ Se conecta al servidor Manager (`tbee.tv`), sincroniza horarios y contenidos por
 
 | Archivo | Descripción |
 | :--- | :--- |
-| `URPPI3.js` | Cliente principal de cartelería digital (`v2.3.0`), servidor HTTP local (`:8090`) y motor OTA. |
+| `URPPI3.js` | Cliente principal de cartelería digital (`v2.3.2`), servidor HTTP local (`:8090`) y motor OTA. |
 | `install-urp.sh` | Instalador automático *zero-touch* para Raspberry Pi recién flasheada. |
 | `README.md` | Documentación completa de instalación, comandos, rotación e historial de mejoras. |
 
@@ -121,7 +122,7 @@ curl -fsSL "https://raw.githubusercontent.com/JulianDS95/URPSignageTv/main/URPPI
 | Reiniciar reproductor | `pm2 restart URP` |
 | Forzar chequeo OTA inmediato | `curl http://localhost:8090/update` |
 | Ver programación actual | `curl http://localhost:8090/schedule` |
-| Regenerar caché seamless | `rm -rf /home/pi/URP/seamless/* && pm2 restart URP` |
+| Regenerar caché seamless/optimizada | `rm -rf /home/pi/URP/seamless/* /home/pi/URP/optimized/* && pm2 restart URP` |
 | Reiniciar la Raspberry Pi | `sudo reboot` |
 
 ### Endpoints HTTP locales (Puerto `8090`)
@@ -133,6 +134,12 @@ curl -fsSL "https://raw.githubusercontent.com/JulianDS95/URPSignageTv/main/URPPI
 ---
 
 ## Historial de mejoras por actualización
+
+### `v2.3.2` — Reproducción fluida universal de videos (Auto-normalización inteligente)
+- **Motor de optimización automática en segundo plano (`/home/pi/URP/optimized/`):** Inspecciona cada video con `ffprobe` (códec, perfil, `pix_fmt`, resolución, FPS, bitrate y audio). Si ya es MP4 H.264 8-bit ≤1080p ≤32fps ≤8.5 Mbps, lo reproduce directo sin gastar CPU. Si es pesado (4K, 60fps, HEVC/H.265, VP9, AV1, 10-bit, `>8.5 Mbps`, `.mov`/`.mkv`/`.webm`), lo transcodifica en segundo plano con prioridad baja (`nice -n 15`, `-threads 2`, H.264 Main L4.0 `yuv420p`, max `5.5 Mbps`, `+faststart`) sin bloquear la pantalla ni tocar `content/` (mantiene intacto el MD5 del FTP).
+- **Tuning anti-tirones en `mpv`:** Agregados `--cache=yes`, `--demuxer-max-bytes=16M`, `--demuxer-max-back-bytes=4M`, `--hr-seek=no`, `--framedrop=vo`, `--sws-scaler=fast-bilinear` y `--vd-lavc-threads=2`.
+- **Unión `seamless` instantánea (`-c copy`):** Cuando todos los clips de un bloque ya están estandarizados a la resolución/FPS objetivo, `ffmpeg` los une sin re-codificar en menos de un segundo.
+- Soporte ampliado de formatos de entrada: `.mp4`, `.mkv`, `.avi`, `.mov`, `.webm`, `.m4v`, `.ts`, `.mpg`, `.mpeg`, `.wmv`, `.flv`.
 
 ### `v2.3.1` — Motor de rotación de 3 niveles (garantizado en Trixie/Wayland/X11)
 - Detección automática del estado físico de la salida HDMI (`xrandr` X11 + `wlr-randr` Wayland con auto-descubrimiento de `XDG_RUNTIME_DIR`/`WAYLAND_DISPLAY`).
