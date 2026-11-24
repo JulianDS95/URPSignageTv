@@ -1,6 +1,6 @@
 var URPActive = true;
 var URPType = 'URPPI3';
-var URPVersion = '2.3.3';
+var URPVersion = '2.3.4';
 var URPUpdated = false;
 var isArm = process.arch === 'arm' || process.arch === 'arm64';
 var isLinux = process.platform === 'linux';
@@ -61,7 +61,6 @@ var hasOmxplayer = false;
 var hasMpv = false;
 var hasCurl = false;
 var hasNice = false;
-var hasIonice = false;
 var piModelStr = '';
 var totalRamMB = Math.round(osMod.totalmem() / (1024 * 1024));
 var isPi4Or5 = false;
@@ -72,14 +71,13 @@ setTimeout(function () {
     if (Array.isArray(schedule) && schedule.length > 0) {
         checkSchedule();
     }
-}, 12000);
+}, 5000);
 
 if (isArm || isLinux) {
     try { execSync('command -v omxplayer', { stdio: 'ignore' }); hasOmxplayer = true; } catch (e) {}
     try { execSync('command -v mpv', { stdio: 'ignore' }); hasMpv = true; } catch (e) {}
     try { execSync('command -v curl', { stdio: 'ignore' }); hasCurl = true; } catch (e) {}
     try { execSync('command -v nice', { stdio: 'ignore' }); hasNice = true; } catch (e) {}
-    try { execSync('command -v ionice', { stdio: 'ignore' }); hasIonice = true; } catch (e) {}
     try {
         if (fs.existsSync('/proc/device-tree/model')) {
             piModelStr = fs.readFileSync('/proc/device-tree/model', 'utf8').replace(/\0/g, '').trim();
@@ -91,7 +89,7 @@ if (isArm || isLinux) {
 
 function getTargetVideoDims() {
     var isVert = isPortraitOrientation();
-    // En Pi 3B+/Zero 2W con mpv (Bookworm/Trixie sin omxplayer), 720p fastdecode garantiza fluidez total
+    // En Pi 3B+/Zero 2W con mpv (Bookworm/Trixie sin omxplayer), 720p H.264 Main L4.0 garantiza fluidez total
     var use720p = isLowPowerPi && !hasOmxplayer;
     var longEdge = use720p ? 1280 : 1920;
     var shortEdge = use720p ? 720 : 1080;
@@ -100,25 +98,19 @@ function getTargetVideoDims() {
         height: isVert ? longEdge : shortEdge,
         use720p: use720p,
         profile: 'main',
-        level: use720p ? '3.1' : '4.0',
+        level: '4.0',
         crf: use720p ? '23' : '22',
-        maxRate: use720p ? '3000k' : '5500k',
-        bufSize: use720p ? '6000k' : '11000k',
+        maxRate: use720p ? '3200k' : '5500k',
+        bufSize: use720p ? '6400k' : '11000k',
         threads: isLowPowerPi ? '1' : '2'
     };
 }
 
 function spawnFfmpegLowPriority(ffArgs) {
-    var bin = 'ffmpeg';
-    var args = ffArgs;
-    if (isLinux && hasIonice && hasNice) {
-        bin = 'ionice';
-        args = ['-c', '3', 'nice', '-n', '19', 'ffmpeg'].concat(ffArgs);
-    } else if (isLinux && hasNice) {
-        bin = 'nice';
-        args = ['-n', '19', 'ffmpeg'].concat(ffArgs);
+    if (isLinux && hasNice) {
+        return spawn('nice', ['-n', '15', 'ffmpeg'].concat(ffArgs), { stdio: ['ignore', 'ignore', 'pipe'] });
     }
-    return spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    return spawn('ffmpeg', ffArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
 }
 
 // ==============================================================================
@@ -676,13 +668,9 @@ function playCurrentIndex() {
         var mpvBaseArgs = [
             '--fs', '--no-osc', '--no-osd-bar', '--really-quiet',
             '--no-input-default-bindings', '--cursor-autohide=always', '--ontop',
-            '--hwdec=auto-copy', '--keep-open=no',
-            '--scale=bilinear', '--dscale=bilinear', '--cscale=bilinear',
-            '--correct-downscaling=no', '--linear-downscaling=no', '--sigmoid-upscaling=no',
-            '--deband=no', '--interpolation=no', '--tscale=nearest',
+            '--hwdec=auto', '--keep-open=no',
             '--cache=yes', '--demuxer-max-bytes=16M', '--demuxer-max-back-bytes=4M',
-            '--hr-seek=no', '--framedrop=vo', '--sws-scaler=fast-bilinear',
-            '--vd-lavc-threads=4'
+            '--framedrop=vo'
         ];
         if (mpvRotateDeg > 0) {
             mpvBaseArgs.push('--video-rotate=' + mpvRotateDeg);
@@ -720,15 +708,25 @@ function playCurrentIndex() {
     }
 
     var playStartTime = Date.now();
+    var playerStderr = '';
     try {
-        var mediaProc = spawn(playerBin, playerArgs, { env: env });
+        var mediaProc = spawn(playerBin, playerArgs, { env: env, stdio: ['ignore', 'ignore', 'pipe'] });
         activePlayerProcess = mediaProc;
+        if (mediaProc.stderr) {
+            mediaProc.stderr.on('data', function (chunk) {
+                playerStderr += chunk.toString('utf8');
+                if (playerStderr.length > 1024) playerStderr = playerStderr.slice(-1024);
+            });
+        }
 
         mediaProc.on('exit', function (code) {
             if (token !== playbackToken || !isPlaying) return;
             activePlayerProcess = null;
             var elapsed = Date.now() - playStartTime;
             var minExpectedMs = (!item.duration || item.duration >= 3) ? 1000 : 250;
+            if (code !== 0 && playerStderr.trim()) {
+                console.error("[" + playerBin.toUpperCase() + " EXIT code=" + code + "]: " + playerStderr.trim());
+            }
             var isConvertedOrSeamless = (/_\d+s\.mp4$/i.test(fullPath) || fullPath.indexOf(seamlessBasePath) === 0 || fullPath.indexOf(optimizedBasePath) === 0);
             if (isConvertedOrSeamless && (code !== 0 || elapsed < minExpectedMs)) {
                 console.error("[PLAYER] Video inválido o fallido (" + path.basename(fullPath) + ", code=" + code + ", " + elapsed + "ms). Eliminando para regenerar...");
@@ -1303,7 +1301,6 @@ function processNextRender() {
         '-c:v', 'libx264',
         '-threads', dims.threads,
         '-preset', 'ultrafast',
-        '-tune', 'fastdecode',
         '-profile:v', dims.profile,
         '-level', dims.level,
         '-pix_fmt', 'yuv420p',
@@ -1598,7 +1595,6 @@ function processNextVideoOpt() {
             '-c:v', 'libx264',
             '-threads', dims.threads,
             '-preset', 'veryfast',
-            '-tune', 'fastdecode',
             '-profile:v', dims.profile,
             '-level', dims.level,
             '-pix_fmt', 'yuv420p',
@@ -2029,7 +2025,6 @@ function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
                 '-c:v', 'libx264',
                 '-threads', dims.threads,
                 '-preset', 'ultrafast',
-                '-tune', 'fastdecode',
                 '-profile:v', dims.profile,
                 '-level', dims.level,
                 '-pix_fmt', 'yuv420p',
