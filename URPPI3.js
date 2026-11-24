@@ -1,6 +1,6 @@
 var URPActive = true;
 var URPType = 'URPPI3';
-var URPVersion = '2.4.0';
+var URPVersion = '2.4.1';
 var URPUpdated = false;
 var isArm = process.arch === 'arm' || process.arch === 'arm64';
 var isLinux = process.platform === 'linux';
@@ -200,7 +200,7 @@ loadWallConfig();
 
 function getTargetVideoDims() {
     var isVert = isPortraitOrientation();
-    // En Pi 3B+/Zero 2W con mpv (Bookworm/Trixie sin omxplayer), 720p H.264 Main L4.0 garantiza fluidez total
+    // En Pi 3B+/Zero 2W con mpv (Bookworm/Trixie sin omxplayer), 720p H.264 Baseline L3.1 garantiza decodificación fluida sin tirones
     var use720p = isLowPowerPi && !hasOmxplayer;
     var longEdge = use720p ? 1280 : 1920;
     var shortEdge = use720p ? 720 : 1080;
@@ -208,11 +208,11 @@ function getTargetVideoDims() {
         width: isVert ? shortEdge : longEdge,
         height: isVert ? longEdge : shortEdge,
         use720p: use720p,
-        profile: 'main',
-        level: '4.0',
-        crf: use720p ? '23' : '22',
-        maxRate: use720p ? '3200k' : '5500k',
-        bufSize: use720p ? '6400k' : '11000k',
+        profile: use720p ? 'baseline' : 'main',
+        level: use720p ? '3.1' : '4.0',
+        crf: use720p ? '24' : '22',
+        maxRate: use720p ? '2500k' : '4200k',
+        bufSize: use720p ? '5000k' : '8400k',
         threads: isLowPowerPi ? '1' : '2'
     };
 }
@@ -461,7 +461,7 @@ function suppressDesktopPopups() {
     var xEnv = "export DISPLAY=:0; export XAUTHORITY=\"" + getXauthPath() + "\"; ";
     // No invocar pcmanfm --desktop-off en bucle cada 20s porque dispara 'Drawing desktop' y consume CPU si lxsession lo reinicia
     var cmd = xEnv + "pkill -9 -f 'lwrespawn.*(pcmanfm|wf-panel)' 2>/dev/null || true; " +
-              "pkill -9 -x wf-panel-pi lxpanel mako dunst xfce4-notifyd notification-daemon lxqt-notificationd piwiz blueman-applet nm-applet zenity yad 2>/dev/null || true; " +
+              "pkill -9 -x wf-panel-pi lxpanel xcompmgr picom compton mako dunst xfce4-notifyd notification-daemon lxqt-notificationd piwiz blueman-applet nm-applet zenity yad 2>/dev/null || true; " +
               xEnv + "xset s off -dpms s noblank 2>/dev/null || true";
     exec(cmd, function () {});
 }
@@ -980,6 +980,10 @@ function playCurrentIndex() {
             '--fs', '--no-osc', '--no-osd-bar', '--really-quiet',
             '--no-input-default-bindings', '--cursor-autohide=always', '--ontop',
             '--hwdec=auto', '--keep-open=no',
+            '--scale=bilinear', '--cscale=bilinear', '--dscale=bilinear',
+            '--dither-depth=no', '--deband=no',
+            '--vd-lavc-fast', '--vd-lavc-skiploopfilter=nonref',
+            '--audio-fallback-to-null=yes',
             '--cache=yes', '--demuxer-max-bytes=16M', '--demuxer-max-back-bytes=4M',
             '--framedrop=vo'
         ];
@@ -1826,7 +1830,7 @@ function getOptimizedVideoPath(srcPath) {
         var wallSuffix = wallSig ? ('_' + wallSig) : '';
         var baseName = path.basename(srcPath).replace(/\.[^/.]+$/, '');
         var safeBase = normalizeName(baseName).replace(/[^a-zA-Z0-9._-]/g, '_');
-        return optimizedBasePath + 'opt_' + safeBase + '_' + st.size + '_' + st.mtime.getTime() + '_' + ori + '_' + dims.width + 'x' + dims.height + wallSuffix + '.mp4';
+        return optimizedBasePath + 'opt_' + safeBase + '_' + st.size + '_' + st.mtime.getTime() + '_' + ori + '_' + dims.width + 'x' + dims.height + wallSuffix + '_p2.mp4';
     } catch (e) {
         return null;
     }
@@ -1862,9 +1866,12 @@ function needsPiVideoOptimization(info) {
     var minDim = Math.min(w, h);
     var limitLong = dims.use720p ? 1280 : 1920;
     var limitShort = dims.use720p ? 720 : 1080;
-    var maxFps = dims.use720p ? 28 : 32;
-    var maxBps = dims.use720p ? 4200000 : 8500000;
+    var maxFps = 26;
+    var maxBps = dims.use720p ? 3200000 : 6000000;
 
+    if (dims.use720p && info.profile && /high/i.test(info.profile)) {
+        return { needed: true, reason: 'perfil ' + info.profile + ' pesado para 3B+' };
+    }
     if (maxDim > limitLong || minDim > limitShort) return { needed: true, reason: 'resolucion ' + w + 'x' + h + ' -> ' + limitLong + 'p' };
     if (info.fps && info.fps > maxFps) return { needed: true, reason: info.fps.toFixed(1) + 'fps' };
     if (info.bitRate && info.bitRate > maxBps) return { needed: true, reason: (info.bitRate / 1000000).toFixed(1) + 'Mbps' };

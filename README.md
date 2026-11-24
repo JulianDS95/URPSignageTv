@@ -22,7 +22,7 @@ Se conecta al servidor Manager (`tbee.tv`), sincroniza horarios y contenidos por
 
 | Archivo | Descripción |
 | :--- | :--- |
-| `URPPI3.js` | Cliente principal de cartelería digital (`v2.4.0`), motor Video Wall por mosaico/espejo, servidor HTTP (`:8090`) y OTA. |
+| `URPPI3.js` | Cliente principal de cartelería digital (`v2.4.1`), motor Video Wall por mosaico/espejo, servidor HTTP (`:8090`) y OTA. |
 | `urp-wall.sh` | Configurador ejecutable independiente (`urp-wall`) para activar Video Wall, elegir ID, disposición y orientación. |
 | `install-urp.sh` | Instalador automático *zero-touch* para Raspberry Pi recién flasheada. |
 | `README.md` | Documentación completa de instalación, Video Wall, comandos, rotación e historial de mejoras. |
@@ -191,6 +191,12 @@ Para que todas las pantallas se mantengan perfectamente alineadas y sin deformac
 ---
 
 ## Historial de mejoras por actualización
+
+### `v2.4.1` — Reproducción de video ultra fluida (`mpv` X11/GPU + Baseline L3.1)
+- **Escalado GPU liviano y decodificación rápida en `mpv`:** Configurados `--scale=bilinear --cscale=bilinear --dscale=bilinear --dither-depth=no --deband=no --vd-lavc-fast --vd-lavc-skiploopfilter=nonref --audio-fallback-to-null=yes` sobre `--vo=gpu`, reduciendo drásticamente el uso de CPU/GPU al decodificar y escalar en Raspberry Pi 3B+, 4 y 5.
+- **Sin compositor X11 en segundo plano:** `suppressDesktopPopups()` ahora cierra también `xcompmgr`, `picom` y `compton` para que `mpv` dibuje directo a pantalla sin sobrecarga de composición ni *stutter*.
+- **Perfil H.264 Baseline L3.1 en Pi 3B+ / Zero 2W y tope de 25 fps:** `needsPiVideoOptimization()` normaliza videos de `30/60 fps` a `25 fps` constantes y convierte cualquier video `High` o pesado en Pi 3B+ a **H.264 Constrained Baseline L3.1** (`720p`, `≤2.5 Mbps`, sin B-frames, 1 hilo seguro). En Pi 4/5 ajusta el bitrate objetivo a `4.2 Mbps` (`maxBps ≤ 6 Mbps`).
+- **Regeneración automática de caché (`_p2`):** El sufijo `_p2.mp4` en `optimized/` fuerza la re-optimización automática en segundo plano de videos previamente procesados con perfiles más pesados, limpiando los archivos anteriores.
 
 ### `v2.4.0` — Video Wall autónomo + Control remoto `tbee.tv` + Configurador ejecutable (`urp-wall`)
 - **Ejecutable independiente `urp-wall` (`/home/pi/URP/urp-wall.sh`):** Menú interactivo CLI con diagrama ASCII de la matriz para elegir activación (**Remoto desde `tbee.tv`**, **Local siempre activo** o **Desactivado**), definir disposición (`filas x columnas`), ID de pantalla, modo mosaico vs espejo, compensación de bisel, orientación (`config.txt`) y sincronización sin alterar el funcionamiento normal cuando está apagado.
