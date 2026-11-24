@@ -155,8 +155,8 @@ if command -v raspi-config >/dev/null 2>&1; then
     fi
 fi
 
-# Neutralizar fondo, paneles y popups de montaje en todas las variantes (LXDE-pi, LXDE-pi-x, default)
-for PCDIR in "$TARGET_HOME/.config/pcmanfm/LXDE-pi" "$TARGET_HOME/.config/pcmanfm/LXDE-pi-x" "$TARGET_HOME/.config/pcmanfm/default"; do
+# Neutralizar fondo, paneles y popups de montaje en todas las variantes (LXDE-pi, LXDE-pi-x, rpd-x, default)
+for PCDIR in "$TARGET_HOME/.config/pcmanfm/LXDE-pi" "$TARGET_HOME/.config/pcmanfm/LXDE-pi-x" "$TARGET_HOME/.config/pcmanfm/rpd-x" "$TARGET_HOME/.config/pcmanfm/default"; do
     mkdir -p "$PCDIR"
     cat << 'EOF' > "$PCDIR/desktop-items-0.conf"
 [*]
@@ -180,9 +180,9 @@ autorun=0
 EOF
 done
 
-# Bloquear permanentemente popups del sistema (notificaciones, actualizaciones, asistente piwiz, bluetooth, polkit, USB)
+# Bloquear permanentemente popups y el gestor de escritorio pcmanfm ('Drawing desktop')
 mkdir -p "$TARGET_HOME/.config/autostart"
-for DESK in piwiz.desktop xfce4-notifyd.desktop notification-daemon.desktop lxqt-notificationd.desktop blueman.desktop nm-applet.desktop update-notifier.desktop package-update-indicator.desktop pk-update-icon.desktop lxpolkit.desktop polkit-gnome-authentication-agent-1.desktop xscreensaver.desktop org.gnome.SettingsDaemon.DiskUtilityNotify.desktop user-dirs-update-gtk.desktop; do
+for DESK in pcmanfm.desktop rpd-wallpaper.desktop piwiz.desktop xfce4-notifyd.desktop notification-daemon.desktop lxqt-notificationd.desktop blueman.desktop nm-applet.desktop update-notifier.desktop package-update-indicator.desktop pk-update-icon.desktop lxpolkit.desktop polkit-gnome-authentication-agent-1.desktop xscreensaver.desktop org.gnome.SettingsDaemon.DiskUtilityNotify.desktop user-dirs-update-gtk.desktop; do
     cat << 'EOF' > "$TARGET_HOME/.config/autostart/$DESK"
 [Desktop Entry]
 Hidden=true
@@ -190,12 +190,13 @@ EOF
 done
 systemctl --user mask xfce4-notifyd.service mako.service dunst.service 2>/dev/null || true
 
-# Configurar autostart sin panel ni salvapantallas para LXDE-pi, LXDE-pi-x y Openbox
-for AS_DIR in "$TARGET_HOME/.config/lxsession/LXDE-pi" "$TARGET_HOME/.config/lxsession/LXDE-pi-x" "$TARGET_HOME/.config/openbox"; do
+# Configurar autostart sin pcmanfm, sin panel y sin salvapantallas (LXDE-pi, LXDE-pi-x, rpd-x, Openbox)
+for AS_DIR in "$TARGET_HOME/.config/lxsession/LXDE-pi" "$TARGET_HOME/.config/lxsession/LXDE-pi-x" "$TARGET_HOME/.config/lxsession/rpd-x" "$TARGET_HOME/.config/openbox"; do
     mkdir -p "$AS_DIR"
     AS_FILE="$AS_DIR/autostart"
     touch "$AS_FILE"
-    sed -i '/lxpanel/d;/wf-panel-pi/d;/pcmanfm --desktop/d' "$AS_FILE" 2>/dev/null || true
+    sed -i '/lxpanel/d;/wf-panel-pi/d;/pcmanfm/d;/rpd-wallpaper/d' "$AS_FILE" 2>/dev/null || true
+    grep -q "#URP_CLEAN" "$AS_FILE" || sed -i '1i #URP_CLEAN' "$AS_FILE" 2>/dev/null || true
     grep -q "xset s off" "$AS_FILE" || echo "@xset s off" >> "$AS_FILE"
     grep -q "xset -dpms" "$AS_FILE" || echo "@xset -dpms" >> "$AS_FILE"
     grep -q "xset s noblank" "$AS_FILE" || echo "@xset s noblank" >> "$AS_FILE"
@@ -207,10 +208,22 @@ for AS_DIR in "$TARGET_HOME/.config/lxsession/LXDE-pi" "$TARGET_HOME/.config/lxs
     fi
 done
 
-# Configurar labwc (por si Wayland sigue activo) sin panel/notificaciones y con rotación comentada
+# Limpiar también autostart globales de pcmanfm/lwrespawn para evitar el cartel 'Drawing desktop'
+for SYS_AS in /etc/xdg/lxsession/*/autostart; do
+    if [ -f "$SYS_AS" ]; then
+        sudo sed -i '/pcmanfm --desktop/d;/lxpanel/d;/wf-panel-pi/d' "$SYS_AS" 2>/dev/null || true
+    fi
+done
+if [ -f /etc/xdg/labwc/autostart ]; then
+    sudo sed -i '/pcmanfm/d;/wf-panel-pi/d' /etc/xdg/labwc/autostart 2>/dev/null || true
+fi
+
+# Configurar labwc (por si Wayland sigue activo) sin lwrespawn/panel/notificaciones
 mkdir -p "$TARGET_HOME/.config/labwc"
 LABWC_AS="$TARGET_HOME/.config/labwc/autostart"
 touch "$LABWC_AS"
+grep -q "#URP_CLEAN" "$LABWC_AS" || echo "#URP_CLEAN" >> "$LABWC_AS"
+grep -q "lwrespawn" "$LABWC_AS" || echo "pkill -9 -f 'lwrespawn.*(pcmanfm|wf-panel)' 2>/dev/null || true" >> "$LABWC_AS"
 grep -q "pkill -9 mako" "$LABWC_AS" || echo "pkill -9 mako wf-panel-pi 2>/dev/null || true" >> "$LABWC_AS"
 if ! grep -q "wlr-randr" "$LABWC_AS"; then
     printf "# Rotacion vertical Wayland: descomentar 90 o 270

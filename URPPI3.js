@@ -1,6 +1,6 @@
 var URPActive = true;
 var URPType = 'URPPI3';
-var URPVersion = '2.3.2';
+var URPVersion = '2.3.3';
 var URPUpdated = false;
 var isArm = process.arch === 'arm' || process.arch === 'arm64';
 var isLinux = process.platform === 'linux';
@@ -56,13 +56,69 @@ var net = require('net');
 var _ = require('lodash');
 var async = require('async');
 
+var osMod = require('os');
 var hasOmxplayer = false;
 var hasMpv = false;
 var hasCurl = false;
+var hasNice = false;
+var hasIonice = false;
+var piModelStr = '';
+var totalRamMB = Math.round(osMod.totalmem() / (1024 * 1024));
+var isPi4Or5 = false;
+var isLowPowerPi = false;
+var bootGraceDone = false;
+setTimeout(function () {
+    bootGraceDone = true;
+    if (Array.isArray(schedule) && schedule.length > 0) {
+        checkSchedule();
+    }
+}, 12000);
+
 if (isArm || isLinux) {
     try { execSync('command -v omxplayer', { stdio: 'ignore' }); hasOmxplayer = true; } catch (e) {}
     try { execSync('command -v mpv', { stdio: 'ignore' }); hasMpv = true; } catch (e) {}
     try { execSync('command -v curl', { stdio: 'ignore' }); hasCurl = true; } catch (e) {}
+    try { execSync('command -v nice', { stdio: 'ignore' }); hasNice = true; } catch (e) {}
+    try { execSync('command -v ionice', { stdio: 'ignore' }); hasIonice = true; } catch (e) {}
+    try {
+        if (fs.existsSync('/proc/device-tree/model')) {
+            piModelStr = fs.readFileSync('/proc/device-tree/model', 'utf8').replace(/\0/g, '').trim();
+        }
+    } catch (e) {}
+    isPi4Or5 = /Pi 4|Pi 5|Pi 400|Compute Module 4|Compute Module 5/i.test(piModelStr);
+    isLowPowerPi = isArm && !isPi4Or5 && (totalRamMB <= 1536 || /Pi 3|Pi 2|Pi Zero/i.test(piModelStr));
+}
+
+function getTargetVideoDims() {
+    var isVert = isPortraitOrientation();
+    // En Pi 3B+/Zero 2W con mpv (Bookworm/Trixie sin omxplayer), 720p fastdecode garantiza fluidez total
+    var use720p = isLowPowerPi && !hasOmxplayer;
+    var longEdge = use720p ? 1280 : 1920;
+    var shortEdge = use720p ? 720 : 1080;
+    return {
+        width: isVert ? shortEdge : longEdge,
+        height: isVert ? longEdge : shortEdge,
+        use720p: use720p,
+        profile: 'main',
+        level: use720p ? '3.1' : '4.0',
+        crf: use720p ? '23' : '22',
+        maxRate: use720p ? '3000k' : '5500k',
+        bufSize: use720p ? '6000k' : '11000k',
+        threads: isLowPowerPi ? '1' : '2'
+    };
+}
+
+function spawnFfmpegLowPriority(ffArgs) {
+    var bin = 'ffmpeg';
+    var args = ffArgs;
+    if (isLinux && hasIonice && hasNice) {
+        bin = 'ionice';
+        args = ['-c', '3', 'nice', '-n', '19', 'ffmpeg'].concat(ffArgs);
+    } else if (isLinux && hasNice) {
+        bin = 'nice';
+        args = ['-n', '19', 'ffmpeg'].concat(ffArgs);
+    }
+    return spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'] });
 }
 
 // ==============================================================================
@@ -297,10 +353,35 @@ function startBlackCurtain() {
 function suppressDesktopPopups() {
     if (!isArm && !isLinux) return;
     var xEnv = "export DISPLAY=:0; export XAUTHORITY=\"" + getXauthPath() + "\"; ";
-    var cmd = xEnv + "pcmanfm --desktop-off 2>/dev/null; " +
+    // No invocar pcmanfm --desktop-off en bucle cada 20s porque dispara 'Drawing desktop' y consume CPU si lxsession lo reinicia
+    var cmd = xEnv + "pkill -9 -f 'lwrespawn.*(pcmanfm|wf-panel)' 2>/dev/null || true; " +
               "pkill -9 -x wf-panel-pi lxpanel mako dunst xfce4-notifyd notification-daemon lxqt-notificationd piwiz blueman-applet nm-applet zenity yad 2>/dev/null || true; " +
               xEnv + "xset s off -dpms s noblank 2>/dev/null || true";
     exec(cmd, function () {});
+}
+
+function writeCleanAutostartDir(dirPath, cleanContent) {
+    try {
+        ensureDir(dirPath);
+        var asPath = dirPath + '/autostart';
+        var needsWrite = true;
+        var extraLines = [];
+        if (fs.existsSync(asPath)) {
+            var cur = fs.readFileSync(asPath, 'utf8');
+            if (cur.indexOf('#URP_CLEAN') !== -1 && cur.indexOf('pcmanfm') === -1 && cur.indexOf('lxpanel') === -1 && cur.indexOf('wf-panel-pi') === -1) {
+                needsWrite = false;
+            } else {
+                var lines = cur.split(/\r?\n/);
+                for (var li = 0; li < lines.length; li++) {
+                    if (lines[li].indexOf('xrandr') !== -1) extraLines.push(lines[li]);
+                }
+            }
+        }
+        if (needsWrite) {
+            var finalStr = cleanContent + (extraLines.length > 0 ? extraLines.join('\n') + '\n' : '');
+            fs.writeFileSync(asPath, finalStr, 'utf8');
+        }
+    } catch (e) {}
 }
 
 function neutralizeDesktop() {
@@ -310,19 +391,58 @@ function neutralizeDesktop() {
         var pcmanDirs = [
             '/home/pi/.config/pcmanfm/LXDE-pi',
             homeBase + '/.config/pcmanfm/LXDE-pi',
-            homeBase + '/.config/pcmanfm/LXDE-pi-x'
+            homeBase + '/.config/pcmanfm/LXDE-pi-x',
+            homeBase + '/.config/pcmanfm/rpd-x',
+            homeBase + '/.config/pcmanfm/default'
         ];
         for (var p = 0; p < pcmanDirs.length; p++) {
-            if (fs.existsSync(pcmanDirs[p])) {
-                try {
-                    fs.writeFileSync(pcmanDirs[p] + '/desktop-items-0.conf',
-                        "[*]\nwallpaper_mode=color\nwallpaper=\ndesktop_bg=#000000\ndesktop_fg=#000000\ndesktop_shadow=#000000\nshow_documents=0\nshow_trash=0\nshow_mounts=0\n");
-                } catch (ce) {}
-            }
+            try {
+                ensureDir(pcmanDirs[p]);
+                fs.writeFileSync(pcmanDirs[p] + '/desktop-items-0.conf',
+                    "[*]\nwallpaper_mode=color\nwallpaper=\ndesktop_bg=#000000\ndesktop_fg=#000000\ndesktop_shadow=#000000\nshow_documents=0\nshow_trash=0\nshow_mounts=0\n");
+                fs.writeFileSync(pcmanDirs[p] + '/pcmanfm.conf',
+                    "[config]\nbm_open_method=0\n\n[volume]\nmount_on_startup=0\nmount_removable=0\nautorun=0\n");
+            } catch (ce) {}
         }
 
+        // Anular pcmanfm --desktop y paneles en TODOS los perfiles de sesion (LXDE-pi, LXDE-pi-x, rpd-x, openbox, labwc)
+        var cleanX11As = "#URP_CLEAN\n@xset s off\n@xset -dpms\n@xset s noblank\n@xhost +local:\n";
+        var lxDirs = [
+            homeBase + '/.config/lxsession/LXDE-pi',
+            homeBase + '/.config/lxsession/LXDE-pi-x',
+            homeBase + '/.config/lxsession/rpd-x',
+            homeBase + '/.config/openbox'
+        ];
+        for (var ld = 0; ld < lxDirs.length; ld++) {
+            writeCleanAutostartDir(lxDirs[ld], cleanX11As);
+        }
+
+        // Neutralizar labwc autostart para que tampoco dispare lwrespawn pcmanfm --desktop
+        try {
+            var labwcDir = homeBase + '/.config/labwc';
+            ensureDir(labwcDir);
+            var labwcAs = labwcDir + '/autostart';
+            if (!fs.existsSync(labwcAs) || fs.readFileSync(labwcAs, 'utf8').indexOf('#URP_CLEAN') === -1) {
+                fs.writeFileSync(labwcAs, "#URP_CLEAN\npkill -9 -f 'lwrespawn.*(pcmanfm|wf-panel)' 2>/dev/null || true\npkill -9 mako wf-panel-pi 2>/dev/null || true\n", 'utf8');
+            }
+        } catch (le) {}
+
+        // Ocultar autostart de pcmanfm/notificaciones en ~/.config/autostart
+        try {
+            var xdgAuto = homeBase + '/.config/autostart';
+            ensureDir(xdgAuto);
+            var hiddenDesks = ['pcmanfm.desktop', 'rpd-wallpaper.desktop', 'piwiz.desktop', 'xfce4-notifyd.desktop', 'notification-daemon.desktop', 'lxqt-notificationd.desktop', 'blueman.desktop', 'nm-applet.desktop', 'update-notifier.desktop', 'package-update-indicator.desktop', 'pk-update-icon.desktop'];
+            for (var hd = 0; hd < hiddenDesks.length; hd++) {
+                var dp = xdgAuto + '/' + hiddenDesks[hd];
+                if (!fs.existsSync(dp)) {
+                    fs.writeFileSync(dp, "[Desktop Entry]\nHidden=true\n", 'utf8');
+                }
+            }
+        } catch (ae) {}
+
         var xEnv = "export DISPLAY=:0; export XAUTHORITY=\"" + getXauthPath() + "\"; ";
-        var cmd = xEnv + "pcmanfm --desktop-off 2>/dev/null; " +
+        var cmd = xEnv + "pkill -9 -f 'lwrespawn.*(pcmanfm|wf-panel)' 2>/dev/null || true; " +
+                  "if pgrep -x pcmanfm >/dev/null 2>&1; then " + xEnv + "pcmanfm --desktop-off 2>/dev/null || true; fi; " +
                   "pkill -9 -x wf-panel-pi lxpanel mako dunst xfce4-notifyd notification-daemon lxqt-notificationd piwiz blueman-applet nm-applet zenity yad 2>/dev/null || true; " +
                   xEnv + "xsetroot -solid black 2>/dev/null; " +
                   xEnv + "xset s off -dpms s noblank 2>/dev/null; " +
@@ -556,10 +676,13 @@ function playCurrentIndex() {
         var mpvBaseArgs = [
             '--fs', '--no-osc', '--no-osd-bar', '--really-quiet',
             '--no-input-default-bindings', '--cursor-autohide=always', '--ontop',
-            '--hwdec=auto', '--keep-open=no',
+            '--hwdec=auto-copy', '--keep-open=no',
+            '--scale=bilinear', '--dscale=bilinear', '--cscale=bilinear',
+            '--correct-downscaling=no', '--linear-downscaling=no', '--sigmoid-upscaling=no',
+            '--deband=no', '--interpolation=no', '--tscale=nearest',
             '--cache=yes', '--demuxer-max-bytes=16M', '--demuxer-max-back-bytes=4M',
             '--hr-seek=no', '--framedrop=vo', '--sws-scaler=fast-bilinear',
-            '--vd-lavc-threads=2'
+            '--vd-lavc-threads=4'
         ];
         if (mpvRotateDeg > 0) {
             mpvBaseArgs.push('--video-rotate=' + mpvRotateDeg);
@@ -1101,6 +1224,10 @@ var activeRenderCallbacks = [];
 
 function processNextRender() {
     if (isRendering || renderQueue.length === 0) return;
+    if (!bootGraceDone) {
+        setTimeout(processNextRender, 3000);
+        return;
+    }
 
     var job = renderQueue.shift();
     isRendering = true;
@@ -1153,9 +1280,9 @@ function processNextRender() {
         try { fs.unlinkSync(tmpPath); } catch (e) {}
     }
 
-    var isVert = isPortraitOrientation();
-    var targetW = isVert ? 1080 : 1920;
-    var targetH = isVert ? 1920 : 1080;
+    var dims = getTargetVideoDims();
+    var targetW = dims.width;
+    var targetH = dims.height;
     var vf = 'scale=' + targetW + ':' + targetH + ':force_original_aspect_ratio=decrease,' +
              'scale=trunc(iw/2)*2:trunc(ih/2)*2,' +
              'pad=' + targetW + ':' + targetH + ':(' + targetW + '-iw)/2:(' + targetH + '-ih)/2:black,' +
@@ -1174,10 +1301,11 @@ function processNextRender() {
         '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
         '-vf', vf,
         '-c:v', 'libx264',
-        '-threads', '2',
+        '-threads', dims.threads,
         '-preset', 'ultrafast',
-        '-profile:v', 'main',
-        '-level', '4.0',
+        '-tune', 'fastdecode',
+        '-profile:v', dims.profile,
+        '-level', dims.level,
         '-pix_fmt', 'yuv420p',
         '-r', '25',
         '-g', '25',
@@ -1189,7 +1317,7 @@ function processNextRender() {
         tmpPath
     ];
 
-    console.log('[RENDER] Convirtiendo imagen a video MP4 (' + duration + 's): ' + path.basename(file) + ' -> ' + path.basename(outPath));
+    console.log('[RENDER] Convirtiendo imagen a video MP4 (' + duration + 's, ' + targetW + 'x' + targetH + '): ' + path.basename(file) + ' -> ' + path.basename(outPath));
 
     var stderrLog = '';
     var ffProc = null;
@@ -1205,7 +1333,7 @@ function processNextRender() {
     }, 120000);
 
     try {
-        ffProc = spawn('ffmpeg', ffArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
+        ffProc = spawnFfmpegLowPriority(ffArgs);
         if (ffProc.stderr) {
             ffProc.stderr.on('data', function (chunk) {
                 stderrLog += chunk.toString('utf8');
@@ -1360,9 +1488,10 @@ function getOptimizedVideoPath(srcPath) {
         if (!srcPath || !fs.existsSync(srcPath)) return null;
         var st = fs.statSync(srcPath);
         var ori = isPortraitOrientation() ? 'V' : 'H';
+        var dims = getTargetVideoDims();
         var baseName = path.basename(srcPath).replace(/\.[^/.]+$/, '');
         var safeBase = normalizeName(baseName).replace(/[^a-zA-Z0-9._-]/g, '_');
-        return optimizedBasePath + 'opt_' + safeBase + '_' + st.size + '_' + st.mtime.getTime() + '_' + ori + '.mp4';
+        return optimizedBasePath + 'opt_' + safeBase + '_' + st.size + '_' + st.mtime.getTime() + '_' + ori + '_' + dims.width + 'x' + dims.height + '.mp4';
     } catch (e) {
         return null;
     }
@@ -1388,13 +1517,19 @@ function needsPiVideoOptimization(info) {
     if (info.pixFmt && info.pixFmt !== 'yuv420p' && info.pixFmt !== 'yuvj420p') return { needed: true, reason: 'pix_fmt ' + info.pixFmt };
     if (info.profile && /(10|422|444)/i.test(info.profile)) return { needed: true, reason: 'profile ' + info.profile };
 
+    var dims = getTargetVideoDims();
     var w = info.width || 0;
     var h = info.height || 0;
     var maxDim = Math.max(w, h);
     var minDim = Math.min(w, h);
-    if (maxDim > 1920 || minDim > 1080) return { needed: true, reason: 'resolucion ' + w + 'x' + h };
-    if (info.fps && info.fps > 32) return { needed: true, reason: info.fps.toFixed(1) + 'fps' };
-    if (info.bitRate && info.bitRate > 8500000) return { needed: true, reason: (info.bitRate / 1000000).toFixed(1) + 'Mbps' };
+    var limitLong = dims.use720p ? 1280 : 1920;
+    var limitShort = dims.use720p ? 720 : 1080;
+    var maxFps = dims.use720p ? 28 : 32;
+    var maxBps = dims.use720p ? 4200000 : 8500000;
+
+    if (maxDim > limitLong || minDim > limitShort) return { needed: true, reason: 'resolucion ' + w + 'x' + h + ' -> ' + limitLong + 'p' };
+    if (info.fps && info.fps > maxFps) return { needed: true, reason: info.fps.toFixed(1) + 'fps' };
+    if (info.bitRate && info.bitRate > maxBps) return { needed: true, reason: (info.bitRate / 1000000).toFixed(1) + 'Mbps' };
     if (info.hasAudio && info.audioCodec && info.audioCodec !== 'aac' && info.audioCodec !== 'mp3') {
         return { needed: true, reason: 'audio ' + info.audioCodec };
     }
@@ -1403,7 +1538,7 @@ function needsPiVideoOptimization(info) {
 
 function processNextVideoOpt() {
     if (isOptimizingVideo || videoOptQueue.length === 0) return;
-    if (isRendering || isConcatenating) {
+    if (!bootGraceDone || isRendering || isConcatenating) {
         setTimeout(processNextVideoOpt, 3000);
         return;
     }
@@ -1444,9 +1579,9 @@ function processNextVideoOpt() {
         }
 
         ensureDir(optimizedBasePath);
-        var isVert = isPortraitOrientation();
-        var maxW = isVert ? 1080 : 1920;
-        var maxH = isVert ? 1920 : 1080;
+        var dims = getTargetVideoDims();
+        var maxW = dims.width;
+        var maxH = dims.height;
         var targetFps = (info.fps && info.fps > 0 && info.fps <= 25) ? Math.max(15, Math.round(info.fps)) : 25;
         var vf = 'scale=' + maxW + ':' + maxH + ':force_original_aspect_ratio=decrease,' +
                  'scale=trunc(iw/2)*2:trunc(ih/2)*2,setsar=1,format=yuv420p';
@@ -1461,17 +1596,18 @@ function processNextVideoOpt() {
             '-i', srcPath,
             '-vf', vf,
             '-c:v', 'libx264',
-            '-threads', '2',
+            '-threads', dims.threads,
             '-preset', 'veryfast',
-            '-profile:v', 'main',
-            '-level', '4.0',
+            '-tune', 'fastdecode',
+            '-profile:v', dims.profile,
+            '-level', dims.level,
             '-pix_fmt', 'yuv420p',
             '-r', String(targetFps),
             '-g', String(targetFps),
             '-bf', '0',
-            '-crf', '22',
-            '-maxrate', '5500k',
-            '-bufsize', '11000k'
+            '-crf', dims.crf,
+            '-maxrate', dims.maxRate,
+            '-bufsize', dims.bufSize
         ];
         if (info.hasAudio) {
             ffArgs.push('-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '128k');
@@ -1509,54 +1645,44 @@ function processNextVideoOpt() {
             }
         }, 1800000);
 
-        var launchFfmpeg = function (useNice) {
-            var bin = useNice ? 'nice' : 'ffmpeg';
-            var args = useNice ? ['-n', '15', 'ffmpeg'].concat(ffArgs) : ffArgs;
-            try {
-                ffProc = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'] });
-                if (ffProc.stderr) {
-                    ffProc.stderr.on('data', function (chunk) {
-                        stderrLog += chunk.toString('utf8');
-                        if (stderrLog.length > 2048) stderrLog = stderrLog.slice(-2048);
-                    });
-                }
-                ffProc.on('error', function (err) {
-                    if (useNice) {
-                        return launchFfmpeg(false);
-                    }
-                    clearTimeout(optTimeout);
-                    console.error('[OPT:VIDEO] Error iniciando ffmpeg:', err.message);
-                    failedOptMap[outPath] = true;
-                    finishOpt(false);
+        try {
+            ffProc = spawnFfmpegLowPriority(ffArgs);
+            if (ffProc.stderr) {
+                ffProc.stderr.on('data', function (chunk) {
+                    stderrLog += chunk.toString('utf8');
+                    if (stderrLog.length > 2048) stderrLog = stderrLog.slice(-2048);
                 });
-                ffProc.on('close', function (code) {
-                    clearTimeout(optTimeout);
-                    if (code !== 0 || !fs.existsSync(tmpPath) || fs.statSync(tmpPath).size <= 4096) {
-                        console.error('[OPT:VIDEO] Falló conversión (' + path.basename(srcPath) + ', code=' + code + '): ' + (stderrLog.trim() || 'sin detalle'));
-                        failedOptMap[outPath] = true;
-                        return finishOpt(false);
-                    }
-                    try {
-                        if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
-                        fs.renameSync(tmpPath, outPath);
-                        var basePrefix = 'opt_' + normalizeName(path.basename(srcPath).replace(/\.[^/.]+$/, '')).replace(/[^a-zA-Z0-9._-]/g, '_') + '_';
-                        cleanupOldOptimizedForBase(basePrefix, path.basename(outPath));
-                        console.log('[OPT:VIDEO] ¡Video fluido listo!: ' + path.basename(outPath) + ' (' + (fs.statSync(outPath).size / (1024 * 1024)).toFixed(2) + ' MB)');
-                        return finishOpt(true);
-                    } catch (e) {
-                        failedOptMap[outPath] = true;
-                        return finishOpt(false);
-                    }
-                });
-            } catch (e) {
-                if (useNice) return launchFfmpeg(false);
+            }
+            ffProc.on('error', function (err) {
                 clearTimeout(optTimeout);
+                console.error('[OPT:VIDEO] Error iniciando ffmpeg:', err.message);
                 failedOptMap[outPath] = true;
                 finishOpt(false);
-            }
-        };
-
-        launchFfmpeg(isLinux);
+            });
+            ffProc.on('close', function (code) {
+                clearTimeout(optTimeout);
+                if (code !== 0 || !fs.existsSync(tmpPath) || fs.statSync(tmpPath).size <= 4096) {
+                    console.error('[OPT:VIDEO] Falló conversión (' + path.basename(srcPath) + ', code=' + code + '): ' + (stderrLog.trim() || 'sin detalle'));
+                    failedOptMap[outPath] = true;
+                    return finishOpt(false);
+                }
+                try {
+                    if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
+                    fs.renameSync(tmpPath, outPath);
+                    var basePrefix = 'opt_' + normalizeName(path.basename(srcPath).replace(/\.[^/.]+$/, '')).replace(/[^a-zA-Z0-9._-]/g, '_') + '_';
+                    cleanupOldOptimizedForBase(basePrefix, path.basename(outPath));
+                    console.log('[OPT:VIDEO] ¡Video fluido listo!: ' + path.basename(outPath) + ' (' + (fs.statSync(outPath).size / (1024 * 1024)).toFixed(2) + ' MB)');
+                    return finishOpt(true);
+                } catch (e) {
+                    failedOptMap[outPath] = true;
+                    return finishOpt(false);
+                }
+            });
+        } catch (e) {
+            clearTimeout(optTimeout);
+            failedOptMap[outPath] = true;
+            finishOpt(false);
+        }
     });
 }
 
@@ -1670,7 +1796,8 @@ var activeSeamlessHash = '';
 var failedSeamlessHashes = {};
 
 function computeBlockHash(items) {
-    var parts = [isPortraitOrientation() ? 'V' : 'H'];
+    var dims = getTargetVideoDims();
+    var parts = [(isPortraitOrientation() ? 'V' : 'H') + '_' + dims.width + 'x' + dims.height];
     for (var i = 0; i < items.length; i++) {
         var fp = path.isAbsolute(items[i].file) ? items[i].file : path.resolve(contentBasePath, items[i].file);
         try {
@@ -1785,7 +1912,7 @@ function cleanupOldSeamless(idBlock, keepFileName) {
 }
 
 function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
-    if (isRendering || isConcatenating) return;
+    if (!bootGraceDone || isRendering || isConcatenating) return;
     if (failedSeamlessHashes[blockHash]) return;
     if (activeSeamlessHash === blockHash) return;
     if (fileExist(outPath)) {
@@ -1824,9 +1951,9 @@ function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
             return;
         }
 
-        var isVert = isPortraitOrientation();
-        var targetW = isVert ? 1080 : 1920;
-        var targetH = isVert ? 1920 : 1080;
+        var dims = getTargetVideoDims();
+        var targetW = dims.width;
+        var targetH = dims.height;
         var tmpPath = seamlessBasePath + 'temp_' + Date.now() + '_' + path.basename(outPath);
         var concatListPath = null;
         var ffArgs = [];
@@ -1836,7 +1963,7 @@ function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
                    (pi.pixFmt === 'yuv420p' || pi.pixFmt === 'yuvj420p') &&
                    pi.width === targetW &&
                    pi.height === targetH &&
-                   pi.fps >= 24 && pi.fps <= 26 &&
+                   pi.fps >= 23 && pi.fps <= 26 &&
                    pi.hasAudio &&
                    pi.audioCodec === 'aac' &&
                    pi.audioSampleRate === 44100 &&
@@ -1900,14 +2027,18 @@ function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
                 '-map', '[outv]',
                 '-map', '[outa]',
                 '-c:v', 'libx264',
-                '-threads', '2',
+                '-threads', dims.threads,
                 '-preset', 'ultrafast',
-                '-profile:v', 'main',
-                '-level', '4.0',
+                '-tune', 'fastdecode',
+                '-profile:v', dims.profile,
+                '-level', dims.level,
                 '-pix_fmt', 'yuv420p',
                 '-r', '25',
                 '-g', '25',
                 '-bf', '0',
+                '-crf', dims.crf,
+                '-maxrate', dims.maxRate,
+                '-bufsize', dims.bufSize,
                 '-c:a', 'aac',
                 '-b:a', '128k',
                 '-movflags', '+faststart',
@@ -1939,7 +2070,7 @@ function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
         }, 1800000);
 
         try {
-            ffProc = spawn('ffmpeg', ffArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
+            ffProc = spawnFfmpegLowPriority(ffArgs);
             if (ffProc.stderr) {
                 ffProc.stderr.on('data', function (chunk) {
                     stderrLog += chunk.toString('utf8');

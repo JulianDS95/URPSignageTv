@@ -22,7 +22,7 @@ Se conecta al servidor Manager (`tbee.tv`), sincroniza horarios y contenidos por
 
 | Archivo | Descripción |
 | :--- | :--- |
-| `URPPI3.js` | Cliente principal de cartelería digital (`v2.3.2`), servidor HTTP local (`:8090`) y motor OTA. |
+| `URPPI3.js` | Cliente principal de cartelería digital (`v2.3.3`), servidor HTTP local (`:8090`) y motor OTA. |
 | `install-urp.sh` | Instalador automático *zero-touch* para Raspberry Pi recién flasheada. |
 | `README.md` | Documentación completa de instalación, comandos, rotación e historial de mejoras. |
 
@@ -134,6 +134,12 @@ curl -fsSL "https://raw.githubusercontent.com/JulianDS95/URPSignageTv/main/URPPI
 ---
 
 ## Historial de mejoras por actualización
+
+### `v2.3.3` — Video fluido en Pi 3B+ (`mpv` ligero + 720p `fastdecode`) y fin del cartel "Drawing desktop"
+- **Eliminación definitiva del cartel `Drawing desktop` y alto consumo de CPU:** Neutraliza `pcmanfm --desktop`, `lwrespawn`, `lxpanel` y `wf-panel-pi` en todos los perfiles de Bookworm/Trixie (`rpd-x`, `LXDE-pi-x`, `LXDE-pi`, `labwc` y `~/.config/autostart`) y evita re-invocar `pcmanfm --desktop-off` cada 20 segundos.
+- **Reproducción fluida en Raspberry Pi 3B+ con `mpv`:** Cambia a `--hwdec=auto-copy`, shaders livianos de GPU (`--scale=bilinear --dscale=bilinear --cscale=bilinear --deband=no --interpolation=no`) y `--vd-lavc-threads=4`.
+- **Optimización adaptativa según modelo de Pi:** En Pi 3B+ / Zero 2W con `mpv` (≤1.5 GB RAM sin `omxplayer`), normaliza automáticamente a **`1280x720` (`720x1280` vertical) @25fps H.264 `-tune fastdecode` max 3 Mbps**; en Pi 4/5 mantiene **Full HD 1080p**.
+- **Cero tirones durante conversiones:** `ffmpeg` en segundo plano ahora espera 12s tras el arranque y corre con prioridad mínima de CPU y disco (`ionice -c 3 nice -n 19 -threads 1`).
 
 ### `v2.3.2` — Reproducción fluida universal de videos (Auto-normalización inteligente)
 - **Motor de optimización automática en segundo plano (`/home/pi/URP/optimized/`):** Inspecciona cada video con `ffprobe` (códec, perfil, `pix_fmt`, resolución, FPS, bitrate y audio). Si ya es MP4 H.264 8-bit ≤1080p ≤32fps ≤8.5 Mbps, lo reproduce directo sin gastar CPU. Si es pesado (4K, 60fps, HEVC/H.265, VP9, AV1, 10-bit, `>8.5 Mbps`, `.mov`/`.mkv`/`.webm`), lo transcodifica en segundo plano con prioridad baja (`nice -n 15`, `-threads 2`, H.264 Main L4.0 `yuv420p`, max `5.5 Mbps`, `+faststart`) sin bloquear la pantalla ni tocar `content/` (mantiene intacto el MD5 del FTP).
