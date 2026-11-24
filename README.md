@@ -22,9 +22,10 @@ Se conecta al servidor Manager (`tbee.tv`), sincroniza horarios y contenidos por
 
 | Archivo | Descripción |
 | :--- | :--- |
-| `URPPI3.js` | Cliente principal de cartelería digital (`v2.3.4`), servidor HTTP local (`:8090`) y motor OTA. |
+| `URPPI3.js` | Cliente principal de cartelería digital (`v2.4.0`), motor Video Wall por mosaico/espejo, servidor HTTP (`:8090`) y OTA. |
+| `urp-wall.sh` | Configurador ejecutable independiente (`urp-wall`) para activar Video Wall, elegir ID, disposición y orientación. |
 | `install-urp.sh` | Instalador automático *zero-touch* para Raspberry Pi recién flasheada. |
-| `README.md` | Documentación completa de instalación, comandos, rotación e historial de mejoras. |
+| `README.md` | Documentación completa de instalación, Video Wall, comandos, rotación e historial de mejoras. |
 
 ---
 
@@ -129,11 +130,74 @@ curl -fsSL "https://raw.githubusercontent.com/JulianDS95/URPSignageTv/main/URPPI
 - `GET /play` · `GET /stop` · `GET /pause` · `GET /resetContent`
 - `GET /deleteContents` · `GET /reboot` · `GET /shutdown`
 - `GET /schedule` · `GET /contents` · `GET /update`
+- `GET /wall` · `GET /wall/sync`
 - `GET /URPTemperature` · `GET /URPmemPercentUsed` · `GET /URPcpuUsage`
 
 ---
 
+## Modo Video Wall (Ejecutable independiente `urp-wall`)
+
+Por defecto (`wall.json` ausente o desactivado), la Raspberry Pi funciona **100% como `URPPI3` normal**.  
+Cuando quieras armar un Video Wall de 2, 3, 4 o más pantallas **sin modificar el servidor `tbee.tv`**:
+
+1. Ejecutá el configurador en cada Raspberry Pi:
+   ```bash
+   urp-wall
+   ```
+   *(Si instalaste antes de `v2.4.0`, descargalo primero una vez: `curl -fsSL "https://raw.githubusercontent.com/JulianDS95/URPSignageTv/main/urp-wall.sh?t=$(date +%s)" -o /home/pi/URP/urp-wall.sh && chmod +x /home/pi/URP/urp-wall.sh && sudo ln -sf /home/pi/URP/urp-wall.sh /usr/local/bin/urp-wall`.)*
+2. En el menú interactivo configurás:
+   - **Modo de activación:**
+     - **Controlado por servidor `tbee.tv` (Remoto):** activás y desactivás el Video Wall directamente desde la opción **Video Wall** del panel de `tbee.tv` (sin volver a entrar por SSH).
+     - **Siempre Activo (Local)** o **Desactivado (Modo Normal `URPPI3`)**.
+   - **Disposición de pantallas y Modo:** presets rápidos (`1x2`, `1x3`, `1x4`, `2x1`, `3x1`, `2x2`, `3x3` o personalizado) en modo **Mosaico (`tile`)** para partir la imagen/video entre pantallas o **Espejo (`mirror`)** sincronizado.
+   - **ID de pantalla (`1..N`):** muestra el mapa visual de la matriz e identifica automáticamente la fila/columna exacta que recorta esta Raspberry Pi.
+   - **Orientación física:** Horizontal (`0°`), Vertical `90°`, Vertical `270°` o `180°` (sincronizado con `config.txt`).
+   - **Compensación de bisel (`bezelPx`):** píxeles opcionales del marco entre pantallas vecinas.
+   - **Sincronización:** **NTP automático** (sin equipo Master extra, todas alineadas al reloj del sistema) o **Master/Slave por IP local** (si la red no tiene internet).
+3. **Subí un único video o imagen en `tbee.tv`:** asigná la misma campaña a todas las pantallas del wall; cada Raspberry Pi descarga el archivo original (manteniendo intacto el MD5 de `content/`), recorta su porción en `optimized/`/`seamless/` y sincroniza la reproducción vía IPC de `mpv`. *(Nota: si no configuraste `urp-wall` pero activás Video Wall en `tbee.tv`, la Pi entra automáticamente en modo Espejo sincronizado sin recorte.)*
+
+### Características y requisitos de los contenidos para Video Wall
+
+Para que todas las pantallas se mantengan perfectamente alineadas y sin deformaciones ni bandas negras inesperadas, tené en cuenta estas pautas al exportar y programar el contenido:
+
+1. **Misma duración total (obligatorio):**
+   - **Opción recomendada (1 archivo maestro):** Subí **un único video o imagen** y asignalo a todas las pantallas del Video Wall. Así todas reproducen exactamente la misma duración, cantidad de cuadros y loop sincronizado.
+   - **Si usás archivos distintos por pantalla (modo `mirror` o piezas separadas):** Todos los videos del mismo bloque horario deben durar **exactamente lo mismo** (idéntica duración en segundos/milisegundos) y tener los mismos FPS (ej. `25 fps`). Si un video dura 15s y el de al lado dura 16s, el loop se desfasará en cada repetición.
+   - **Múltiples elementos en un bloque:** Si un bloque combina varios videos o imágenes, todas las pantallas deben tener exactamente la misma lista, orden y duración por ítem para que el stream continuo (`seamless`) mida lo mismo en todas las Raspberry Pis.
+2. **Resolución y proporción del archivo según la matriz (modo Mosaico `tile`):**
+   - `URPPI3.js` recorta el archivo manteniendo la relación de aspecto real sin estirar ni deformar caras o logos. Diseñá el lienzo acorde a la disposición física de tus monitores:
+   | Disposición | Orientación de cada monitor | Resolución ideal del archivo | Alternativa liviana |
+   | :--- | :--- | :--- | :--- |
+   | **`2x2` o `3x3`** | Horizontales (`16:9`) | `3840x2160` (4K) | `1920x1080` (Full HD) |
+   | **`1x2`** | Horizontales (`16:9`) | `3840x1080` | `2560x720` |
+   | **`1x3`** | Horizontales (`16:9`) | `5760x1080` | `3840x720` |
+   | **`1x4`** | Horizontales (`16:9`) | `7680x1080` | `5120x720` |
+   | **`1x3`** | **Verticales 90°/270° (`9:16`)** | `3240x1920` | `1920x1080` *(encaja casi exacto)* |
+   | **`2x1`** | Horizontales apilados | `1920x2160` | `1280x1440` |
+   | **`3x1`** | Horizontales apilados | `1920x3240` | `1280x2160` |
+   | **Espejo (`mirror`)** | Cualquiera | `1920x1080` (H) o `1080x1920` (V) | `1280x720` (H) / `720x1280` (V) |
+3. **Formato técnico recomendado:**
+   - **Contenedor y códec:** MP4 (**H.264 / AVC**, perfil Main/High `yuv420p` 8-bit) a **25 fps** constantes (CBR o VBR ≤15 Mbps, *keyframe* cada 1 segundo / 25 cuadros).
+   - **Audio:** AAC estéreo `44.1 kHz` o sin pista de audio (en bloques mixtos conviene mismo formato en todos los clips).
+   - *(Aunque `URPPI3.js` convierte automáticamente formatos pesados como 4K, 60fps, HEVC, `.mov` o `.mkv`, subir H.264 a 25fps reduce el tiempo inicial de recorte en cada Pi.)*
+4. **Márgenes de bisel y alineación:**
+   - Si configuraste compensación de bisel (`bezelPx > 0` en `urp-wall`), evitá ubicar tipografías pequeñas o líneas finas justo en los bordes de corte entre pantallas vecinas.
+   - Al publicar una campaña nueva, esperá unos instantes mientras cada Raspberry termina el recorte en segundo plano (`/home/pi/URP/optimized/`); una vez generado el MP4 recortado, `mpv` ajusta la deriva automáticamente en el siguiente ciclo (`curl http://localhost:8090/wall` para verificar).
+5. **Requisitos de reloj, horarios en `tbee.tv` y red:**
+   - **Agenda individual en `tbee.tv` (entornos mixtos):** Cada televisor conserva su carga y agenda horaria propia en `tbee.tv`. Podés tener pantallas **independientes** (sin activar `urp-wall`, respetando sus propios horarios) conviviendo con un grupo en **Video Wall** (por ejemplo, TV 3 y TV 4 con `urp-wall` activo). En las pantallas del Video Wall simplemente replicá la misma agenda (mismos bloques horarios y orden de contenidos) en `tbee.tv`; la sincronización y los cambios de bloque cada 5s actuarán únicamente entre ellas.
+   - **Modo NTP (sin Master):** Todas las Pis deben tener acceso a internet (o a un servidor NTP local) para mantener sincronizado el reloj del sistema.
+   - **Modo Master/Slave LAN:** Todas las Pis deben estar en la misma red local con el puerto `8090` accesible hacia la IP del Master.
+
+---
+
 ## Historial de mejoras por actualización
+
+### `v2.4.0` — Video Wall autónomo + Control remoto `tbee.tv` + Configurador ejecutable (`urp-wall`)
+- **Ejecutable independiente `urp-wall` (`/home/pi/URP/urp-wall.sh`):** Menú interactivo CLI con diagrama ASCII de la matriz para elegir activación (**Remoto desde `tbee.tv`**, **Local siempre activo** o **Desactivado**), definir disposición (`filas x columnas`), ID de pantalla, modo mosaico vs espejo, compensación de bisel, orientación (`config.txt`) y sincronización sin alterar el funcionamiento normal cuando está apagado.
+- **Activación/desactivación remota desde `tbee.tv`:** `URPPI3.js` lee en vivo el campo `data.videoWall` del servidor y enciende o apaga el Video Wall automáticamente en cada pantalla (usando la matriz/ID guardada en `wall.json`, o modo espejo sincronizado si no hay `wall.json`).
+- **Motor de recorte automático por pantalla en `URPPI3.js`:** Recorta videos e imágenes en segundo plano (`optimized/` y `seamless/`) según fila, columna y bisel configurados en `wall.json`, manteniendo intacto el archivo original en `content/`.
+- **Sincronización de cuadros sin Master (NTP) y Master/Slave LAN:** Usa el socket IPC de `mpv` (`/tmp/mpv-urp.sock`) para corregir micro-derivas ajustando suavemente la velocidad (`0.97x / 1.03x`) sin pantallazos negros, más endpoints `GET /wall` y `GET /wall/sync`.
+- **Instalador y OTA ampliados:** `install-urp.sh` y el actualizador OTA sincronizan automáticamente `urp-wall.sh` e instalan el comando global `urp-wall`.
 
 ### `v2.3.4` — Corrección de conversión `ffmpeg` y estabilidad de `mpv` (Restore + 720p Pi 3B+)
 - **Corrección crítica de codificación `ffmpeg`:** Eliminado conflicto `-profile:v main -tune fastdecode` (que impedía inicializar `libx264` al convertir imágenes, videos optimizados y bloques `seamless`) y reemplazado `ionice` por `nice -n 15` con respaldo automático.

@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================================
-# Instalador Automático Zero-Touch - URP Digital Signage v2.2.0
-# Compatible con Raspberry Pi 3B+ (Buster/Legacy) y Raspberry Pi 4 / 5 (Bullseye/Bookworm)
+# Instalador Automático Zero-Touch - URP Digital Signage v2.4.0
+# Compatible con Raspberry Pi 3B+ (Buster/Legacy) y Raspberry Pi 4 / 5 (Bullseye/Bookworm/Trixie)
 # Uso desde GitHub público (sin tocar el servidor tbee.tv):
 #   curl -fsSL https://raw.githubusercontent.com/JulianDS95/URPSignageTv/main/install-urp.sh | bash
 # Uso desde GitHub PRIVADO (con Fine-Grained Token solo lectura "Contents: Read-only"):
@@ -37,7 +37,7 @@ else
 fi
 
 echo "=========================================================="
-echo "  Instalador Automático URP Digital Signage (v2.2.0)"
+echo "  Instalador Automático URP Digital Signage (v2.4.0)"
 echo "  Usuario detectado: $TARGET_USER ($TARGET_HOME)"
 echo "=========================================================="
 
@@ -141,6 +141,23 @@ fi
 node --check "$TMP_URP_JS"
 mv -f "$TMP_URP_JS" /home/pi/URP/URPPI3.js
 chmod +x /home/pi/URP/URPPI3.js
+
+# Descargar configurador independiente de Video Wall (ejecutable: urp-wall)
+if [ -n "${GITHUB_REPO:-}" ]; then
+    WALL_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/${GITHUB_BRANCH}/urp-wall.sh"
+    TMP_WALL_SH="/home/pi/URP/.urp-wall.tmp.sh"
+    rm -f "$TMP_WALL_SH"
+    if curl -fsSL "${CURL_AUTH_ARGS[@]}" -H "Cache-Control: no-cache" "${WALL_URL}${CACHE_BUST}" -o "$TMP_WALL_SH" 2>/dev/null; then
+        if bash -n "$TMP_WALL_SH" 2>/dev/null; then
+            mv -f "$TMP_WALL_SH" /home/pi/URP/urp-wall.sh
+            chmod +x /home/pi/URP/urp-wall.sh
+            sudo ln -sf /home/pi/URP/urp-wall.sh /usr/local/bin/urp-wall 2>/dev/null || true
+            echo "  -> Ejecutable Video Wall instalado: escribe 'urp-wall' para configurarlo."
+        else
+            rm -f "$TMP_WALL_SH"
+        fi
+    fi
+fi
 
 # 5. Configurar GPU, X11, Desktop Autologin y neutralizar fondo/salvapantallas
 echo "[5/7] Configurando GPU, Autologin gráfico, X11 y pantalla negra..."
@@ -269,9 +286,11 @@ pm2 save
 echo "=========================================================="
 echo "  ¡INSTALACIÓN COMPLETADA CON ÉXITO!"
 echo "  - Ver logs en vivo: pm2 logs URP"
+echo "  - Configurar Video Wall (opcional): urp-wall"
 echo "  - Notificaciones y popups del sistema desactivados."
 echo "  - Para pantalla vertical: sudo nano $CFG_FILE"
 echo "    y quitá el '#' de #display_hdmi_rotate=1 (o 3 para 270°)"
+echo "    (o ajustalo gráficamente desde 'urp-wall')"
 echo "  - Reiniciá una vez para aplicar Autologin, X11 y rotación:"
 echo "      sudo reboot"
 echo "=========================================================="
