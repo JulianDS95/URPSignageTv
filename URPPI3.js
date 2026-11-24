@@ -1,6 +1,6 @@
 var URPActive = true;
 var URPType = 'URPPI3';
-var URPVersion = '2.2.1';
+var URPVersion = '2.3.1';
 var URPUpdated = false;
 var isArm = process.arch === 'arm' || process.arch === 'arm64';
 var isLinux = process.platform === 'linux';
@@ -81,13 +81,205 @@ function ensureBlackCurtainAsset() {
     return curtainPath;
 }
 
+var osScreenRotated = false;
+var lastDisplayRotLog = '';
+
+function getXauthPath() {
+    var uid = (typeof process.getuid === 'function') ? process.getuid() : 1000;
+    var homeDir = process.env.HOME || '/home/pi';
+    var candidates = [
+        process.env.XAUTHORITY,
+        '/home/pi/.Xauthority',
+        homeDir + '/.Xauthority',
+        '/run/user/' + uid + '/gdm/Xauthority'
+    ];
+    for (var i = 0; i < candidates.length; i++) {
+        if (candidates[i] && fs.existsSync(candidates[i])) return candidates[i];
+    }
+    return '/home/pi/.Xauthority';
+}
+
+function getWaylandEnv() {
+    var uid = (typeof process.getuid === 'function') ? process.getuid() : 1000;
+    var runtimeDir = process.env.XDG_RUNTIME_DIR || ('/run/user/' + uid);
+    var waylandDisp = process.env.WAYLAND_DISPLAY || '';
+    if (!waylandDisp && fs.existsSync(runtimeDir)) {
+        try {
+            var entries = fs.readdirSync(runtimeDir);
+            for (var i = 0; i < entries.length; i++) {
+                if (/^wayland-[0-9]+$/.test(entries[i])) {
+                    waylandDisp = entries[i];
+                    break;
+                }
+            }
+        } catch (e) {}
+    }
+    return {
+        runtimeDir: runtimeDir,
+        waylandDisplay: waylandDisp
+    };
+}
+
+function getGuiEnv() {
+    var wl = getWaylandEnv();
+    var extra = {
+        DISPLAY: process.env.DISPLAY || ':0',
+        XAUTHORITY: getXauthPath(),
+        XDG_RUNTIME_DIR: wl.runtimeDir
+    };
+    if (wl.waylandDisplay) {
+        extra.WAYLAND_DISPLAY = wl.waylandDisplay;
+    }
+    return Object.assign({}, process.env, extra);
+}
+
+function readHdmiRotateFromConfig() {
+    var cfgPaths = ['/boot/firmware/config.txt', '/boot/config.txt'];
+    for (var i = 0; i < cfgPaths.length; i++) {
+        try {
+            if (!fs.existsSync(cfgPaths[i])) continue;
+            var raw = fs.readFileSync(cfgPaths[i], 'utf8');
+            var lines = raw.split(/\r?\n/);
+            var found = null;
+            for (var j = 0; j < lines.length; j++) {
+                var line = lines[j].trim();
+                if (!line || line.charAt(0) === '#') continue;
+                var m = line.match(/^display_hdmi_rotate\s*=\s*([0-3])/i);
+                if (m) found = parseInt(m[1], 10);
+            }
+            if (found !== null) return found;
+        } catch (e) {}
+    }
+    return null;
+}
+
+function isPortraitOrientation() {
+    if (URPdata && URPdata.vertical) return true;
+    var rot = readHdmiRotateFromConfig();
+    return (rot === 1 || rot === 3);
+}
+
+function getMpvVideoRotateDeg() {
+    var cfgRot = readHdmiRotateFromConfig();
+    if (!cfgRot || cfgRot === 0 || osScreenRotated) return 0;
+    if (cfgRot === 1) return 90;
+    if (cfgRot === 2) return 180;
+    if (cfgRot === 3) return 270;
+    return 0;
+}
+
+function buildDisplayRotationScript(cfgRot) {
+    var wl = getWaylandEnv();
+    var xrandrDir = (cfgRot === 1) ? 'right' : (cfgRot === 2 ? 'inverted' : 'left');
+    var wlrTrans = (cfgRot === 1) ? '90' : (cfgRot === 2 ? '180' : '270');
+
+    return "export DISPLAY=:0; export XAUTHORITY=\"" + getXauthPath() + "\"; " +
+           "export XDG_RUNTIME_DIR=\"" + wl.runtimeDir + "\"; " +
+           (wl.waylandDisplay ? "export WAYLAND_DISPLAY=\"" + wl.waylandDisplay + "\"; " : "") +
+           "OS_ROTATED=0; DID_CHANGE=0; BACKEND=none; " +
+           "OUT=$(xrandr --query 2>/dev/null | awk '/ connected/ && $1 !~ /^XWAYLAND/{print $1; exit}'); " +
+           "if [ -n \"$OUT\" ]; then " +
+           "  BACKEND=x11; " +
+           "  CUR=$(xrandr --query 2>/dev/null | awk -v o=\"$OUT\" '$1==o{print; exit}'); " +
+           "  RES=$(echo \"$CUR\" | grep -oE '[0-9]+x[0-9]+' | head -n1); " +
+           "  W=$(echo \"$RES\" | cut -dx -f1); H=$(echo \"$RES\" | cut -dx -f2); " +
+           "  ALREADY=0; " +
+           "  if [ \"" + cfgRot + "\" = \"2\" ]; then " +
+           "    echo \"$CUR\" | grep -qE ' inverted [(]' && ALREADY=1; " +
+           "  else " +
+           "    if [ -n \"$W\" ] && [ -n \"$H\" ] && [ \"$W\" -lt \"$H\" ] 2>/dev/null; then ALREADY=1; fi; " +
+           "    echo \"$CUR\" | grep -qE ' (right|left) [(]' && ALREADY=1; " +
+           "  fi; " +
+           "  if [ \"$ALREADY\" = \"0\" ]; then " +
+           "    if xrandr --output \"$OUT\" --rotate " + xrandrDir + " 2>/dev/null; then " +
+           "      DID_CHANGE=1; OS_ROTATED=1; " +
+           "    fi; " +
+           "  else " +
+           "    OS_ROTATED=1; " +
+           "  fi; " +
+           "fi; " +
+           "if [ \"$OS_ROTATED\" = \"0\" ] && command -v wlr-randr >/dev/null 2>&1; then " +
+           "  WOUT=$(wlr-randr 2>/dev/null | awk '/^HDMI|^DP|^DSI/{print $1; exit}'); " +
+           "  if [ -n \"$WOUT\" ]; then " +
+           "    BACKEND=wayland; " +
+           "    CUR_T=$(wlr-randr 2>/dev/null | awk -v o=\"$WOUT\" '$0 ~ \"^\"o{f=1;next} f && /Transform:/{print $2;exit}'); " +
+           "    if [ \"$CUR_T\" = \"" + wlrTrans + "\" ]; then " +
+           "      OS_ROTATED=1; " +
+           "    elif wlr-randr --output \"$WOUT\" --transform " + wlrTrans + " 2>/dev/null; then " +
+           "      DID_CHANGE=1; OS_ROTATED=1; " +
+           "    fi; " +
+           "  fi; " +
+           "fi; " +
+           "echo \"OS_ROTATED=$OS_ROTATED DID_CHANGE=$DID_CHANGE BACKEND=$BACKEND\"";
+}
+
+function handleDisplayRotationResult(cfgRot, stdout) {
+    var prevOsRot = osScreenRotated;
+    var isOsRot = Boolean(stdout && stdout.indexOf('OS_ROTATED=1') !== -1);
+    var didChange = Boolean(stdout && stdout.indexOf('DID_CHANGE=1') !== -1);
+    osScreenRotated = isOsRot;
+
+    var summary = 'cfgRot=' + cfgRot + ' osRotated=' + osScreenRotated + ' stdout=' + String(stdout || '').trim();
+    if (summary !== lastDisplayRotLog) {
+        lastDisplayRotLog = summary;
+        if (osScreenRotated) {
+            console.log('[DISPLAY] Rotación de sistema activa (display_hdmi_rotate=' + cfgRot + ').');
+        } else {
+            console.log('[DISPLAY] Sistema sin rotación HDMI nativa (display_hdmi_rotate=' + cfgRot + '). Usando rotación GPU por reproductor (--video-rotate=' + getMpvVideoRotateDeg() + ').');
+        }
+    }
+
+    if (didChange && curtainProc != null) {
+        try { process.kill(curtainProc.pid, 'SIGKILL'); } catch (e) {}
+        curtainProc = null;
+    }
+    if (prevOsRot !== osScreenRotated && isPlaying) {
+        setTimeout(function () { playCurrentIndex(); }, 200);
+    }
+    return didChange;
+}
+
+function refreshDisplayRotationSync() {
+    if (!isArm && !isLinux) return;
+    var cfgRot = readHdmiRotateFromConfig();
+    if (cfgRot === null || cfgRot === 0) {
+        osScreenRotated = false;
+        return;
+    }
+    try {
+        var out = execSync(buildDisplayRotationScript(cfgRot), { timeout: 3000, encoding: 'utf8' });
+        handleDisplayRotationResult(cfgRot, out);
+    } catch (e) {
+        osScreenRotated = false;
+    }
+}
+
+function applyDisplayRotationIfNeeded(callback) {
+    if (!isArm && !isLinux) {
+        if (callback) callback(false);
+        return;
+    }
+    var cfgRot = readHdmiRotateFromConfig();
+    if (cfgRot === null || cfgRot === 0) {
+        osScreenRotated = false;
+        if (callback) callback(false);
+        return;
+    }
+
+    exec(buildDisplayRotationScript(cfgRot), function (err, stdout) {
+        var didChange = handleDisplayRotationResult(cfgRot, stdout);
+        if (callback) callback(didChange);
+    });
+}
+refreshDisplayRotationSync();
+
 function startBlackCurtain() {
     if (!isArm && !isLinux) return;
     if (!URPActive || curtainProc != null) return;
     var curtainPath = ensureBlackCurtainAsset();
     if (!fs.existsSync(curtainPath)) return;
     try {
-        var env = Object.assign({}, process.env, { DISPLAY: ':0', XAUTHORITY: '/home/pi/.Xauthority' });
+        var env = Object.assign({}, process.env, { DISPLAY: ':0', XAUTHORITY: getXauthPath() });
         curtainProc = spawn('feh', ['-F', '-Z', '-x', '-Y', '-B', 'black', '-q', '--hide-pointer', curtainPath], { env: env });
         curtainProc.on('error', function () { curtainProc = null; });
         curtainProc.on('exit', function () {
@@ -101,31 +293,52 @@ function startBlackCurtain() {
     }
 }
 
+function suppressDesktopPopups() {
+    if (!isArm && !isLinux) return;
+    var xEnv = "export DISPLAY=:0; export XAUTHORITY=\"" + getXauthPath() + "\"; ";
+    var cmd = xEnv + "pcmanfm --desktop-off 2>/dev/null; " +
+              "pkill -9 -x wf-panel-pi lxpanel mako dunst xfce4-notifyd notification-daemon lxqt-notificationd piwiz blueman-applet nm-applet zenity yad 2>/dev/null || true; " +
+              xEnv + "xset s off -dpms s noblank 2>/dev/null || true";
+    exec(cmd, function () {});
+}
+
 function neutralizeDesktop() {
     if (!isArm && !isLinux) return;
     try {
-        // Persistir configuración de pcmanfm sin wallpaper ni íconos para futuros reinicios
-        var lxdeDir = '/home/pi/.config/pcmanfm/LXDE-pi';
-        if (fs.existsSync(lxdeDir)) {
-            try {
-                fs.writeFileSync(lxdeDir + '/desktop-items-0.conf',
-                    "[*]\nwallpaper_mode=color\nwallpaper=\ndesktop_bg=#000000\ndesktop_fg=#000000\ndesktop_shadow=#000000\nshow_documents=0\nshow_trash=0\nshow_mounts=0\n");
-            } catch (ce) {}
+        var homeBase = process.env.HOME || '/home/pi';
+        var pcmanDirs = [
+            '/home/pi/.config/pcmanfm/LXDE-pi',
+            homeBase + '/.config/pcmanfm/LXDE-pi',
+            homeBase + '/.config/pcmanfm/LXDE-pi-x'
+        ];
+        for (var p = 0; p < pcmanDirs.length; p++) {
+            if (fs.existsSync(pcmanDirs[p])) {
+                try {
+                    fs.writeFileSync(pcmanDirs[p] + '/desktop-items-0.conf',
+                        "[*]\nwallpaper_mode=color\nwallpaper=\ndesktop_bg=#000000\ndesktop_fg=#000000\ndesktop_shadow=#000000\nshow_documents=0\nshow_trash=0\nshow_mounts=0\n");
+                } catch (ce) {}
+            }
         }
 
-        var xEnv = "export DISPLAY=:0; export XAUTHORITY=/home/pi/.Xauthority; ";
+        var xEnv = "export DISPLAY=:0; export XAUTHORITY=\"" + getXauthPath() + "\"; ";
         var cmd = xEnv + "pcmanfm --desktop-off 2>/dev/null; " +
-                  xEnv + "pkill -9 lxpanel 2>/dev/null; " +
+                  "pkill -9 -x wf-panel-pi lxpanel mako dunst xfce4-notifyd notification-daemon lxqt-notificationd piwiz blueman-applet nm-applet zenity yad 2>/dev/null || true; " +
                   xEnv + "xsetroot -solid black 2>/dev/null; " +
                   xEnv + "xset s off -dpms s noblank 2>/dev/null; " +
                   xEnv + "pkill -9 feh 2>/dev/null; " +
                   xEnv + "unclutter -idle 0.1 -root 2>/dev/null &";
         exec(cmd, function () {
-            startBlackCurtain();
+            applyDisplayRotationIfNeeded(function () {
+                startBlackCurtain();
+            });
         });
     } catch (e) {}
 }
 neutralizeDesktop();
+setInterval(function () {
+    suppressDesktopPopups();
+    applyDisplayRotationIfNeeded();
+}, 20000);
 
 function killBackground() {
     if (procBackgroundImage != null) {
@@ -246,10 +459,8 @@ function playCurrentIndex() {
     var ext = path.extname(fullPath).toLowerCase();
     var isImage = (ext === '.jpg' || ext === '.jpeg' || ext === '.png' || ext === '.bmp');
 
-    var env = Object.assign({}, process.env, {
-        DISPLAY: ':0',
-        XAUTHORITY: '/home/pi/.Xauthority'
-    });
+    var env = getGuiEnv();
+    var mpvRotateDeg = getMpvVideoRotateDeg();
 
     var token = ++playbackToken;
 
@@ -281,28 +492,41 @@ function playCurrentIndex() {
     }
 
     // --------------------------------------------------------------------------
-    // CASO A: IMAGEN (respaldo feh/mpv mientras se convierte a MP4)
+    // CASO A: IMAGEN (respaldo mpv/feh mientras se convierte a MP4)
     // --------------------------------------------------------------------------
     if (isImage) {
         var duration = (item.duration && item.duration > 0) ? parseInt(item.duration, 10) : 10;
         if (isNaN(duration) || duration <= 0) duration = 10;
         console.log("[PLAYER:IMAGEN] Mostrando (" + duration + "s): " + path.basename(fullPath));
 
-        var fehArgs = ['-F', '-Z', '-x', '-Y', '-B', 'black', '-q', '--hide-pointer', fullPath];
-        try {
-            activeFehProcess = spawn('feh', fehArgs, { env: env });
-            activeFehProcess.on('error', function (err) {
-                console.error("[FEH ERROR]:", err.message);
+        if (mpvRotateDeg > 0 && hasMpv) {
+            try {
+                activeFehProcess = spawn('mpv', [
+                    '--fs', '--no-osc', '--no-osd-bar', '--really-quiet',
+                    '--no-input-default-bindings', '--cursor-autohide=always', '--ontop',
+                    '--image-display-duration=inf', '--video-rotate=' + mpvRotateDeg, fullPath
+                ], { env: env });
+                activeFehProcess.on('error', function () { activeFehProcess = null; });
+            } catch (e) {
                 activeFehProcess = null;
-                if (token === playbackToken && isPlaying && hasMpv) {
-                    try {
-                        activeFehProcess = spawn('mpv', ['--fs', '--no-osc', '--no-osd-bar', '--really-quiet', '--image-display-duration=inf', fullPath], { env: env });
-                    } catch (me) {}
-                }
-            });
-        } catch (e) {
-            console.error("[FEH EXCEPTION]", e.message);
-            activeFehProcess = null;
+            }
+        } else {
+            var fehArgs = ['-F', '-Z', '-x', '-Y', '-B', 'black', '-q', '--hide-pointer', fullPath];
+            try {
+                activeFehProcess = spawn('feh', fehArgs, { env: env });
+                activeFehProcess.on('error', function (err) {
+                    console.error("[FEH ERROR]:", err.message);
+                    activeFehProcess = null;
+                    if (token === playbackToken && isPlaying && hasMpv) {
+                        try {
+                            activeFehProcess = spawn('mpv', ['--fs', '--no-osc', '--no-osd-bar', '--really-quiet', '--image-display-duration=inf', fullPath], { env: env });
+                        } catch (me) {}
+                    }
+                });
+            } catch (e) {
+                console.error("[FEH EXCEPTION]", e.message);
+                activeFehProcess = null;
+            }
         }
 
         imageTimer = setTimeout(function () {
@@ -317,7 +541,7 @@ function playCurrentIndex() {
     // --------------------------------------------------------------------------
     // CASO B: VIDEO (omxplayer en RPi 3B+ legacy o mpv en RPi 3B+/4/5 Bookworm/Trixie)
     // --------------------------------------------------------------------------
-    console.log("[PLAYER:VIDEO] Reproduciendo: " + path.basename(fullPath));
+    console.log("[PLAYER:VIDEO] Reproduciendo: " + path.basename(fullPath) + (mpvRotateDeg > 0 ? " [rot=" + mpvRotateDeg + "°]" : ""));
 
     var playerBin = hasOmxplayer ? 'omxplayer' : (hasMpv ? 'mpv' : 'omxplayer');
     var playerArgs = [];
@@ -334,6 +558,9 @@ function playCurrentIndex() {
             '--no-input-default-bindings', '--cursor-autohide=always', '--ontop',
             '--hwdec=auto', '--keep-open=no'
         ];
+        if (mpvRotateDeg > 0) {
+            mpvBaseArgs.push('--video-rotate=' + mpvRotateDeg);
+        }
         var usedMpvPlaylist = false;
         if (currentPlaylist.length > 1 && currentMediaIndex === 0) {
             var mpvPlaylistPaths = [];
@@ -903,8 +1130,9 @@ function processNextRender() {
         try { fs.unlinkSync(tmpPath); } catch (e) {}
     }
 
-    var targetW = URPdata.vertical ? 1080 : 1920;
-    var targetH = URPdata.vertical ? 1920 : 1080;
+    var isVert = isPortraitOrientation();
+    var targetW = isVert ? 1080 : 1920;
+    var targetH = isVert ? 1920 : 1080;
     var vf = 'scale=' + targetW + ':' + targetH + ':force_original_aspect_ratio=decrease,' +
              'scale=trunc(iw/2)*2:trunc(ih/2)*2,' +
              'pad=' + targetW + ':' + targetH + ':(' + targetW + '-iw)/2:(' + targetH + '-ih)/2:black,' +
@@ -1157,7 +1385,7 @@ var activeSeamlessHash = '';
 var failedSeamlessHashes = {};
 
 function computeBlockHash(items) {
-    var parts = [URPdata.vertical ? 'V' : 'H'];
+    var parts = [isPortraitOrientation() ? 'V' : 'H'];
     for (var i = 0; i < items.length; i++) {
         var fp = path.isAbsolute(items[i].file) ? items[i].file : path.resolve(contentBasePath, items[i].file);
         try {
@@ -1260,8 +1488,9 @@ function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
             return;
         }
 
-        var targetW = URPdata.vertical ? 1080 : 1920;
-        var targetH = URPdata.vertical ? 1920 : 1080;
+        var isVert = isPortraitOrientation();
+        var targetW = isVert ? 1080 : 1920;
+        var targetH = isVert ? 1920 : 1080;
         var ffArgs = ['-nostdin', '-y', '-loglevel', 'error'];
         var filterParts = [];
         var concatInputs = '';
@@ -2220,6 +2449,140 @@ function checkURPVersion(remoteVersion, remoteMD5) {
     });
 }
 
+// ==============================================================================
+// 7B. AUTO-ACTUALIZACION REMOTA DESDE GITHUB (OTA SIN TOCAR EL SERVIDOR)
+// ==============================================================================
+var GITHUB_OTA_ENABLED = true;
+var GITHUB_OTA_REPO = 'JulianDS95/URPSignageTv';
+var GITHUB_OTA_BRANCH = 'main';
+var GITHUB_OTA_INTERVAL_MS = 300000; // Verifica cada 5 minutos
+var lastFailedGithubMd5 = '';
+
+function getGithubOtaToken() {
+    if (process.env.GITHUB_TOKEN && String(process.env.GITHUB_TOKEN).trim()) {
+        return String(process.env.GITHUB_TOKEN).trim();
+    }
+    var tokenFile = basePath + '.github_token';
+    try {
+        if (fs.existsSync(tokenFile)) {
+            var tok = fs.readFileSync(tokenFile, 'utf8').trim();
+            if (tok) return tok;
+        }
+    } catch (e) {}
+    return '';
+}
+
+function checkGithubOTA(branchOverride, manualCallback) {
+    if (typeof branchOverride === 'function') {
+        manualCallback = branchOverride;
+        branchOverride = null;
+    }
+    if (!GITHUB_OTA_ENABLED || !GITHUB_OTA_REPO || URPUpdated || isUpdatingCode) {
+        if (manualCallback) manualCallback({ updated: false, reason: 'busy_or_disabled' });
+        return;
+    }
+
+    var branch = branchOverride || GITHUB_OTA_BRANCH || 'main';
+    var targetPath = __filename || (basePath + URPType + '.js');
+    var localMd5 = getFileMD5(targetPath);
+    var ghUrl = 'https://raw.githubusercontent.com/' + GITHUB_OTA_REPO + '/' + branch + '/' + URPType + '.js?t=' + Date.now();
+    var token = getGithubOtaToken();
+
+    var headers = {
+        'User-Agent': 'URP-Signage-Client/' + URPVersion,
+        'Cache-Control': 'no-cache'
+    };
+    if (token) {
+        headers['Authorization'] = 'Bearer ' + token;
+    }
+
+    isUpdatingCode = true;
+    request({ url: ghUrl, headers: headers, encoding: null, timeout: 20000, followRedirect: true }, function (err, res, body) {
+        if (!err && res && res.statusCode === 404 && !branchOverride && branch === 'main') {
+            isUpdatingCode = false;
+            return checkGithubOTA('master', manualCallback);
+        }
+
+        if (err || !res || res.statusCode !== 200 || !body || body.length < 5000) {
+            isUpdatingCode = false;
+            if (manualCallback) manualCallback({ updated: false, reason: 'download_error', status: res ? res.statusCode : 'ERR' });
+            return;
+        }
+
+        var bodyStr = body.toString('utf8');
+        if (bodyStr.indexOf("var URPType = 'URPPI3'") === -1) {
+            isUpdatingCode = false;
+            if (manualCallback) manualCallback({ updated: false, reason: 'invalid_payload' });
+            return;
+        }
+
+        var downloadedMd5 = crypto.createHash('md5').update(body).digest('hex').toLowerCase();
+        if (localMd5 && downloadedMd5 === localMd5.toLowerCase()) {
+            isUpdatingCode = false;
+            if (manualCallback) manualCallback({ updated: false, reason: 'up_to_date', version: URPVersion });
+            return;
+        }
+
+        if (lastFailedGithubMd5 && downloadedMd5 === lastFailedGithubMd5) {
+            isUpdatingCode = false;
+            if (manualCallback) manualCallback({ updated: false, reason: 'previously_failed_syntax' });
+            return;
+        }
+
+        var verMatch = bodyStr.match(/var\s+URPVersion\s*=\s*['"]([^'"]+)['"]/);
+        var remoteVersion = verMatch ? verMatch[1] : URPVersion;
+        var tempNewPath = tempFolderPath + URPType + '.github.new.js';
+
+        console.log('[OTA:GITHUB] Nuevo código detectado en ' + GITHUB_OTA_REPO + '/' + branch + ' (v' + remoteVersion + ', md5=' + downloadedMd5.slice(0, 8) + '). Validando...');
+
+        try {
+            if (!fs.existsSync(tempFolderPath)) fs.mkdirSync(tempFolderPath);
+            fs.writeFileSync(tempNewPath, body);
+            execSync('node --check "' + tempNewPath + '"', { stdio: 'ignore' });
+        } catch (chkErr) {
+            console.error('[OTA:GITHUB] El archivo en GitHub tiene error de sintaxis. Se mantiene la versión actual.');
+            lastFailedGithubMd5 = downloadedMd5;
+            try { if (fs.existsSync(tempNewPath)) fs.unlinkSync(tempNewPath); } catch (e) {}
+            isUpdatingCode = false;
+            if (manualCallback) manualCallback({ updated: false, reason: 'syntax_error' });
+            return;
+        }
+
+        try {
+            if (fs.existsSync(targetPath)) {
+                try { fs.writeFileSync(targetPath + '.bak', fs.readFileSync(targetPath)); } catch (be) {}
+            }
+            try {
+                fs.renameSync(tempNewPath, targetPath);
+            } catch (re) {
+                fs.writeFileSync(targetPath, fs.readFileSync(tempNewPath));
+                fs.unlinkSync(tempNewPath);
+            }
+            try { fs.chmodSync(targetPath, '755'); } catch (ce) {}
+
+            URPUpdated = true;
+            isUpdatingCode = false;
+            console.log('[OTA:GITHUB] Actualización aplicada (v' + remoteVersion + '). Reiniciando reproductor...');
+            if (manualCallback) manualCallback({ updated: true, version: remoteVersion });
+
+            stopOmx(function () {
+                exec('pm2 restart URP 2>/dev/null || pm2 restart all 2>/dev/null || true', function () {
+                    setTimeout(function () { process.exit(0); }, 500);
+                });
+            });
+        } catch (applyErr) {
+            console.error('[OTA:GITHUB] Error aplicando actualización:', applyErr.message);
+            isUpdatingCode = false;
+            if (manualCallback) manualCallback({ updated: false, reason: 'write_error' });
+        }
+    });
+}
+
+if (GITHUB_OTA_ENABLED && (isArm || isLinux)) {
+    setTimeout(function () { checkGithubOTA(); }, 25000);
+    setInterval(function () { checkGithubOTA(); }, GITHUB_OTA_INTERVAL_MS);
+}
+
 function callWS() {
     getIpAddress(function () {
         getURPHardData(function () {
@@ -2560,6 +2923,11 @@ app.get('/URPmemPercentUsed', function (req, res) {
 });
 app.get('/URPcpuUsage', function (req, res) {
     res.json({ cpuUsage: cpuUsage });
+});
+app.get('/update', function (req, res) {
+    checkGithubOTA(function (result) {
+        res.json(result);
+    });
 });
 
 var server = http.createServer(app);

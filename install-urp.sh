@@ -64,6 +64,7 @@ fi
 
 sudo apt-get update --allow-releaseinfo-change -y || sudo apt-get update -y
 sudo apt-get install -y curl ffmpeg feh unclutter x11-xserver-utils
+sudo apt-get install -y wlr-randr 2>/dev/null || true
 
 # Instalar reproductor según generación de Raspberry Pi y disponibilidad en repositorios (Trixie/Bookworm usan mpv)
 if apt-cache show omxplayer >/dev/null 2>&1 && ! echo "$PI_MODEL" | grep -qiE "Pi 4|Pi 5|Pi 400|Compute Module 4"; then
@@ -118,13 +119,16 @@ if [ -n "${GITHUB_TOKEN:-}" ]; then
     echo "  -> Token GitHub detectado: usando autenticación para repositorio privado."
 fi
 
+CACHE_BUST=""
+case "$URP_SOURCE_URL" in *"?"*) ;; *) CACHE_BUST="?t=$(date +%s)" ;; esac
+
 TMP_URP_JS="/home/pi/URP/.URPPI3.tmp.js"
 rm -f "$TMP_URP_JS"
-if ! curl -fsSL "${CURL_AUTH_ARGS[@]}" -H "Cache-Control: no-cache" "$URP_SOURCE_URL" -o "$TMP_URP_JS"; then
+if ! curl -fsSL "${CURL_AUTH_ARGS[@]}" -H "Cache-Control: no-cache" "${URP_SOURCE_URL}${CACHE_BUST}" -o "$TMP_URP_JS"; then
     if [ -n "${GITHUB_REPO:-}" ] && [ "$GITHUB_BRANCH" = "main" ]; then
         URP_SOURCE_URL="https://raw.githubusercontent.com/${GITHUB_REPO}/master/URPPI3.js"
         echo "  -> Probando rama master: $URP_SOURCE_URL"
-        curl -fsSL "${CURL_AUTH_ARGS[@]}" -H "Cache-Control: no-cache" "$URP_SOURCE_URL" -o "$TMP_URP_JS"
+        curl -fsSL "${CURL_AUTH_ARGS[@]}" -H "Cache-Control: no-cache" "${URP_SOURCE_URL}${CACHE_BUST}" -o "$TMP_URP_JS"
     else
         echo "ERROR: No se pudo descargar URPPI3.js desde $URP_SOURCE_URL"
         if [ -z "${GITHUB_TOKEN:-}" ]; then
@@ -151,8 +155,10 @@ if command -v raspi-config >/dev/null 2>&1; then
     fi
 fi
 
-mkdir -p "$TARGET_HOME/.config/pcmanfm/LXDE-pi" "$TARGET_HOME/.config/lxsession/LXDE-pi"
-cat << 'EOF' > "$TARGET_HOME/.config/pcmanfm/LXDE-pi/desktop-items-0.conf"
+# Neutralizar fondo, paneles y popups de montaje en todas las variantes (LXDE-pi, LXDE-pi-x, default)
+for PCDIR in "$TARGET_HOME/.config/pcmanfm/LXDE-pi" "$TARGET_HOME/.config/pcmanfm/LXDE-pi-x" "$TARGET_HOME/.config/pcmanfm/default"; do
+    mkdir -p "$PCDIR"
+    cat << 'EOF' > "$PCDIR/desktop-items-0.conf"
 [*]
 wallpaper_mode=color
 wallpaper=
@@ -163,13 +169,72 @@ show_documents=0
 show_trash=0
 show_mounts=0
 EOF
+    cat << 'EOF' > "$PCDIR/pcmanfm.conf"
+[config]
+bm_open_method=0
+
+[volume]
+mount_on_startup=0
+mount_removable=0
+autorun=0
+EOF
+done
+
+# Bloquear permanentemente popups del sistema (notificaciones, actualizaciones, asistente piwiz, bluetooth, polkit, USB)
+mkdir -p "$TARGET_HOME/.config/autostart"
+for DESK in piwiz.desktop xfce4-notifyd.desktop notification-daemon.desktop lxqt-notificationd.desktop blueman.desktop nm-applet.desktop update-notifier.desktop package-update-indicator.desktop pk-update-icon.desktop lxpolkit.desktop polkit-gnome-authentication-agent-1.desktop xscreensaver.desktop org.gnome.SettingsDaemon.DiskUtilityNotify.desktop user-dirs-update-gtk.desktop; do
+    cat << 'EOF' > "$TARGET_HOME/.config/autostart/$DESK"
+[Desktop Entry]
+Hidden=true
+EOF
+done
+systemctl --user mask xfce4-notifyd.service mako.service dunst.service 2>/dev/null || true
+
+# Configurar autostart sin panel ni salvapantallas para LXDE-pi, LXDE-pi-x y Openbox
+for AS_DIR in "$TARGET_HOME/.config/lxsession/LXDE-pi" "$TARGET_HOME/.config/lxsession/LXDE-pi-x" "$TARGET_HOME/.config/openbox"; do
+    mkdir -p "$AS_DIR"
+    AS_FILE="$AS_DIR/autostart"
+    touch "$AS_FILE"
+    sed -i '/lxpanel/d;/wf-panel-pi/d;/pcmanfm --desktop/d' "$AS_FILE" 2>/dev/null || true
+    grep -q "xset s off" "$AS_FILE" || echo "@xset s off" >> "$AS_FILE"
+    grep -q "xset -dpms" "$AS_FILE" || echo "@xset -dpms" >> "$AS_FILE"
+    grep -q "xset s noblank" "$AS_FILE" || echo "@xset s noblank" >> "$AS_FILE"
+    grep -q "xhost +local:" "$AS_FILE" || echo "@xhost +local:" >> "$AS_FILE"
+    if ! grep -q "xrandr --output" "$AS_FILE"; then
+        printf "# Rotacion vertical URP (opcional si usas X11 manual: descomentar right=90deg o left=270deg)
+#@xrandr --output HDMI-1 --rotate right
+" >> "$AS_FILE"
+    fi
+done
+
+# Configurar labwc (por si Wayland sigue activo) sin panel/notificaciones y con rotación comentada
+mkdir -p "$TARGET_HOME/.config/labwc"
+LABWC_AS="$TARGET_HOME/.config/labwc/autostart"
+touch "$LABWC_AS"
+grep -q "pkill -9 mako" "$LABWC_AS" || echo "pkill -9 mako wf-panel-pi 2>/dev/null || true" >> "$LABWC_AS"
+if ! grep -q "wlr-randr" "$LABWC_AS"; then
+    printf "# Rotacion vertical Wayland: descomentar 90 o 270
+#wlr-randr --output HDMI-A-1 --transform 90 &
+" >> "$LABWC_AS"
+fi
 
 AUTOSTART="$TARGET_HOME/.config/lxsession/LXDE-pi/autostart"
-touch "$AUTOSTART"
-grep -q "xset s off" "$AUTOSTART" || echo "@xset s off" >> "$AUTOSTART"
-grep -q "xset -dpms" "$AUTOSTART" || echo "@xset -dpms" >> "$AUTOSTART"
-grep -q "xset s noblank" "$AUTOSTART" || echo "@xset s noblank" >> "$AUTOSTART"
 chown -R "$TARGET_USER:$TARGET_USER" "$TARGET_HOME/.config"
+
+# Dejar opción de rotación comentada y ocultar avisos OSD de firmware en config.txt
+CFG_FILE="/boot/config.txt"
+[ -f "/boot/firmware/config.txt" ] && CFG_FILE="/boot/firmware/config.txt"
+if [ -f "$CFG_FILE" ]; then
+    if ! grep -qE "^avoid_warnings=" "$CFG_FILE"; then
+        echo "avoid_warnings=1" | sudo tee -a "$CFG_FILE" >/dev/null
+    fi
+    if ! grep -qE "^#?s*display_hdmi_rotate=" "$CFG_FILE"; then
+        printf "
+# Rotacion vertical URP (descomentar 1=90deg o 3=270deg; URPPI3.js la aplica en Buster, Bookworm y Trixie)
+#display_hdmi_rotate=1
+" | sudo tee -a "$CFG_FILE" >/dev/null
+    fi
+fi
 
 # 6. Permitir reinicio y apagado remoto desde el Manager sin contraseña sudo
 echo "[6/7] Configurando permisos NOPASSWD para reinicio y apagado remoto..."
@@ -191,6 +256,9 @@ pm2 save
 echo "=========================================================="
 echo "  ¡INSTALACIÓN COMPLETADA CON ÉXITO!"
 echo "  - Ver logs en vivo: pm2 logs URP"
-echo "  - Reiniciá una vez para aplicar Autologin, X11 y GPU:"
+echo "  - Notificaciones y popups del sistema desactivados."
+echo "  - Para pantalla vertical: sudo nano $CFG_FILE"
+echo "    y quitá el '#' de #display_hdmi_rotate=1 (o 3 para 270°)"
+echo "  - Reiniciá una vez para aplicar Autologin, X11 y rotación:"
 echo "      sudo reboot"
 echo "=========================================================="
