@@ -1,20 +1,27 @@
-# URP Digital Signage — Cliente Raspberry Pi (`URPPI3.js`)
+# URP Digital Signage — Cliente Raspberry Pi (`URPPI3-v2.5.js`)
 
 Cliente autónomo de cartelería digital para **Raspberry Pi 3B+, 4 y 5**, compatible con **Raspberry Pi OS Buster, Bullseye, Bookworm y Trixie (Debian 10/11/12/13)**.  
-Se conecta al servidor Manager (`tbee.tv`), sincroniza horarios y contenidos por FTP reanudable, unifica videos e imágenes en reproducción continua **sin cortes ni pantalla negra (0 ms)** y se **auto-actualiza de forma remota desde este repositorio de GitHub**.
+Se conecta al servidor Manager (`tbee.tv`), sincroniza horarios y contenidos por FTP reanudable, unifica videos e imágenes en reproducción continua **sin cortes ni pantalla negra (0 ms)**, se supervisa en vivo desde el puerto `:8090` y se **auto-actualiza de forma remota desde este repositorio de GitHub**.
 
 ---
 
 ## ¿Qué hace esta aplicación?
 
 - **Reproducción continua sin cortes (`Seamless Loop`):** Concatena automáticamente los videos e imágenes de cada bloque horario en un único stream MP4 continuo (`/home/pi/URP/seamless/`), evitando flashes negros o destellos del escritorio entre archivos (con unión instantánea `-c copy` cuando los clips ya están estandarizados).
-- **Optimización automática de cualquier video subido:** Analiza cada video nuevo con `ffprobe`; si supera la capacidad óptima de la Raspberry (4K, 60fps, HEVC/H.265, VP9, AV1, 10-bit, `>8.5 Mbps`, contenedores `.mov`/`.mkv`/`.webm`, etc.), lo normaliza automáticamente en segundo plano con prioridad baja (`nice -n 15`) a **H.264 8-bit ≤1080p @25fps (`/home/pi/URP/optimized/`)** sin bloquear la reproducción ni alterar el archivo original de `content/`.
-- **Conversión automática de imágenes a video MP4:** Transforma `.jpg`, `.jpeg` y `.png` a H.264 (`1920x1080` o `1080x1920`) respetando la duración configurada en el Manager, en segundo plano y con escritura atómica (`temp_*`).
+- **Resolución 720p fluida automática en Raspberry Pi 3B+ (`1280x720 @ 24fps`):** En equipos con <=1.5 GB de RAM (`Pi 3B+` / `Zero 2W`), normaliza videos e imágenes a `1280x720` H.264 Baseline `≤2.2 Mbps` (y ajusta automáticamente HDMI/X11 a `1280x720`), reduciendo más de un 55% el uso de CPU/RAM; en Pi 4 y 5 mantiene `1920x1080`. También podés elegir manualmente `Automática / 720p / 1080p` desde el panel web `:8090`.
+- **Optimización automática de cualquier video subido:** Analiza cada video nuevo con `ffprobe` y lo normaliza en segundo plano con prioridad mínima (`nice -n 19`, pausa preventiva si la RAM >=86% o temperatura >=78 °C) en `/home/pi/URP/optimized/`, con padding exacto y pista AAC estéreo para garantizar unión `-c copy` sin re-codificar el bloque entero.
+- **Panel Web Local y Remoto (`:8090`):**
+  - Título dinámico sincronizado con el nombre asignado al reproductor en el Manager (`tbee.tv`).
+  - **Monitor Visual en Vivo** (`GET /api/preview.jpg`): muestra en tiempo real lo que se ve en pantalla (cada 2s/3s/5s) sin subir capturas al FTP, junto a la barra de progreso actual (`mpv` IPC) y botón **Reiniciar Reproductor**.
+  - **Resolución de conversión y Rotación directa:** permite cambiar entre `Automática / 720p / 1080p`, activar ajuste HDMI `1280x720` y rotar contenido/pantalla (`0° / 90° / 180° / 270°`) desde el panel principal.
+  - **Agenda Cargada:** lista todos los bloques horarios activos, horario de inicio, duración y estado (`Listo` / `Pendiente`) de cada video o imagen.
+  - **Configurador de Video Wall:** soporta IDs `1..999` y matrices hasta `32x32`.
+- **Hostname sincronizado desde el Manager:** actualiza automáticamente el hostname del sistema operativo (`hostnamectl`) y el nombre en Tailscale (`tailscale set --hostname`) tomando el nombre configurado en `tbee.tv`.
 - **Descarga FTP reanudable (`curl`):** Descarga archivos grandes con soporte de reanudación (`-C -`), monitoreo de velocidad en Mbps y verificación MD5 de bajo consumo de memoria (con respaldo automático en `JSFtp`).
-- **Motor dual por hardware:** Utiliza `omxplayer` en sistemas legacy (Buster/Bullseye) y `mpv` optimizado (`--hwdec=auto`, buffer RAM de 16 MB, `--framedrop=vo`, `--ontop`, playlist en ventana única) en sistemas modernos (Bookworm/Trixie y Pi 4/5).
+- **Motor dual por hardware / DRM:** Utiliza `omxplayer` en sistemas legacy (Buster/Bullseye) o `mpv` optimizado en X11/Wayland/DRM-KMS directo (`--hwdec=auto`, búfer RAM reducido en Pi 3B+, `--framedrop=vo`, `--ontop`).
 - **Cortina negra y modo kiosko limpio:** Desactiva fondo de escritorio, barras de tareas (`lxpanel`/`wf-panel-pi`), salvapantallas, cursor y **todos los popups/notificaciones del sistema**.
 - **Modo Offline resiliente:** Si se corta internet, continúa reproduciendo al instante la programación guardada localmente (`URPDB` / `URPDB.json` y contenido en disco).
-- **Auto-actualización remota desde GitHub (OTA):** Cada **5 minutos** verifica si hay una versión nueva de `URPPI3.js` en `JulianDS95/URPSignageTv`, valida sintaxis con `node --check`, crea respaldo (`.bak`) y reinicia el servicio automáticamente.
+- **Auto-actualización remota desde GitHub (OTA con rollback):** Cada **5 minutos** verifica si hay una versión nueva de `URPPI3-v2.5.js` en `JulianDS95/URPSignageTv`, valida sintaxis con `node --check`, crea respaldo (`.bak`) y aplica rollback automático ante cualquier fallo de arranque en los primeros 20 segundos.
 
 ---
 
@@ -22,10 +29,11 @@ Se conecta al servidor Manager (`tbee.tv`), sincroniza horarios y contenidos por
 
 | Archivo | Descripción |
 | :--- | :--- |
-| `URPPI3.js` | Cliente principal de cartelería digital (`v2.4.1`), motor Video Wall por mosaico/espejo, servidor HTTP (`:8090`) y OTA. |
-| `urp-wall.sh` | Configurador ejecutable independiente (`urp-wall`) para activar Video Wall, elegir ID, disposición y orientación. |
+| `URPPI3-v2.5.js` | **Base activa (`v2.5.0`):** Cliente principal, optimización 720p/1080p, panel web `:8090` con Monitor en Vivo, rotación, agenda, hostname automático, Video Wall sin límite y OTA con rollback. |
+| `URPPI3.js` | Versión legado estable (`v2.4.1`). |
+| `urp-wall.sh` | Configurador ejecutable independiente (`urp-wall`) para activar Video Wall, elegir ID (`1..999`), disposición (`hasta 32x32`) y orientación. |
 | `install-urp.sh` | Instalador automático *zero-touch* para Raspberry Pi recién flasheada. |
-| `README.md` | Documentación completa de instalación, Video Wall, comandos, rotación e historial de mejoras. |
+| `README.md` | Documentación completa de instalación, Tailscale, panel `:8090`, Video Wall, comandos e historial de mejoras. |
 
 ---
 
@@ -56,17 +64,35 @@ sudo reboot
 ### ¿Qué configura automáticamente `install-urp.sh`?
 1. Detecta modelo de Raspberry Pi (3B+, 4, 5), sistema operativo (Buster, Bullseye, Bookworm, Trixie) y usuario actual (crea enlace simbólico si no es `pi`).
 2. Aplica fix automático de repositorios archivados en Raspbian Buster EOL e instala `curl`, `ffmpeg`, `feh`, `unclutter`, `x11-xserver-utils`, `mpv`/`omxplayer`, `nodejs`, `npm` y `pm2`.
-3. Crea `/home/pi/URP/` (`content/`, `temp/`, `seamless/`, `web/`) e instala dependencias Node.js.
-4. Descarga `URPPI3.js`, valida su sintaxis con `node --check` y lo registra en **PM2** con arranque automático al encender.
+3. Crea `/home/pi/URP/` (`content/`, `temp/`, `seamless/`, `optimized/`, `web/`) e instala dependencias Node.js (sin `request`).
+4. Descarga `URPPI3-v2.5.js`, valida su sintaxis con `node --check` y lo registra en **PM2** con arranque automático al encender.
 5. Activa **autologin gráfico (B4)**, fuerza **X11 (W1)** en Bookworm/Trixie, desactiva salvapantallas/DPMS y deja **comentada** la opción de rotación en `config.txt`.
 6. **Bloquea popups y notificaciones** (`piwiz`, `xfce4-notifyd`, `notification-daemon`, `mako`, `dunst`, `update-notifier`, `blueman`, `nm-applet`, automontaje USB en `pcmanfm` y avisos OSD con `avoid_warnings=1`).
-7. Habilita permisos `NOPASSWD` en `/etc/sudoers.d/urp` para reinicio y apagado remoto desde el Manager.
+7. Habilita permisos `NOPASSWD` en `/etc/sudoers.d/urp` para reinicio, apagado, `hostnamectl` y `tailscale`.
 
 ---
 
-## Configurar orientación Vertical (90° o 270°)
+## Acceso remoto con Tailscale (Panel `:8090` y SSH desde cualquier red)
 
-El instalador ya deja la línea preparada y comentada en `config.txt`.
+Para instalar Tailscale y vincular la Raspberry Pi directamente con tu cuenta (reemplazando `tv1hjumbo` por el nombre del televisor/sucursal si lo hacés de forma manual):
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh && sudo tailscale up --hostname=tv1hjumbo
+```
+
+1. Al ejecutar el comando, la terminal mostrará una URL corta (`https://login.tailscale.com/a/...`).
+2. Abrí esa URL desde el navegador de tu celular o PC logueado en tu cuenta de Tailscale y aprobá el dispositivo (solo se hace una única vez).
+3. Luego, desde cualquier PC o celular conectado a tu misma red de Tailscale, abrí el panel de mantenimiento y vista en vivo ingresando:
+   ```
+   http://IP_TAILSCALE_DE_LA_PI:8090
+   ```
+   *(Ejemplo: `http://100.126.132.77:8090`. Una vez que el cliente `URPPI3-v2.5.js` se conecta a `tbee.tv`, sincroniza automáticamente el hostname del sistema y de Tailscale con el nombre asignado en el Manager.)*
+
+---
+
+## Configurar orientación Vertical (90° o 270°) o Resolución (720p / 1080p)
+
+Podés hacerlo directamente **sin entrar por SSH** desde el panel web `:8090` en la tarjeta **Resolución de Conversión y Rotación de Pantalla**, o manualmente editando `config.txt`:
 
 1. Abrí el archivo de configuración según tu versión de Raspberry Pi OS:
    - **Trixie / Bookworm:**
@@ -86,30 +112,30 @@ El instalador ya deja la línea preparada y comentada en `config.txt`.
 4. Activá también la opción **Vertical** en el panel de `tbee.tv` para este reproductor.
 5. Limpiá la caché de concatenación previa (solo si ya había videos cacheados en horizontal) y reiniciá:
    ```bash
-   rm -rf /home/pi/URP/seamless/* && sudo reboot
+   rm -rf /home/pi/URP/seamless/* /home/pi/URP/optimized/* && sudo reboot
    ```
 
-> **Nota para Trixie/Bookworm:** Aunque el kernel KMS moderno ignora `display_hdmi_rotate` en `config.txt`, `URPPI3.js` lee ese valor automáticamente y aplica la rotación vía `xrandr` / `wlr-randr` al iniciar, además de adaptar imágenes y videos `seamless` a `1080x1920`.
+> **Nota para Trixie/Bookworm:** Aunque el kernel KMS moderno ignora `display_hdmi_rotate` en `config.txt`, `URPPI3-v2.5.js` lee ese valor (o el elegido desde `:8090`) automáticamente y aplica la rotación vía `xrandr` / `wlr-randr` / `--video-rotate`, además de adaptar imágenes y videos a la resolución configurada (`720x1280` en 720p o `1080x1920` en 1080p).
 
 ---
 
 ## Actualización remota automática (OTA desde GitHub)
 
-Cada vez que subas una nueva versión de `URPPI3.js` a `JulianDS95/URPSignageTv`:
+Cada vez que subas una nueva versión de `URPPI3-v2.5.js` a `JulianDS95/URPSignageTv`:
 - Todas las Raspberry Pis activas verifican GitHub automáticamente a los **25 segundos** de encender y luego **cada 5 minutos**.
 - Si el hash MD5 del archivo en GitHub difiere del local:
   1. Verifica que sea un script válido de `URPPI3` y comprueba sintaxis con `node --check`.
   2. Si hay un error de sintaxis, **aborta la actualización** y sigue reproduciendo sin interrupciones.
-  3. Si es válido, guarda respaldo en `URPPI3.js.bak`, actualiza `URPPI3.js` y reinicia el servicio PM2 automáticamente.
+  3. Si es válido, guarda respaldo en `.bak`, actualiza el script y reinicia el servicio PM2 automáticamente con protección *rollback*.
 
-> **Si el repositorio está en modo privado** y querés que las Pis se actualicen solas cada 5 min sin intervención, guardá tu token de solo lectura en el equipo:
+> **Si el repositorio está en modo privado** y querés que las Pis se actualicen solas cada 5 min sin intervención, guardá tu token de solo lectura de GitHub en el equipo:
 > ```bash
 > echo "TU_TOKEN_SOLO_LECTURA" > /home/pi/URP/.github_token && chmod 600 /home/pi/URP/.github_token
 > ```
 
-### Actualizar manualmente una Pi que tiene una versión anterior a `v2.3.0`
+### Actualizar manualmente una Pi que tiene una versión anterior a `v2.5.0`
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/JulianDS95/URPSignageTv/main/URPPI3.js?t=$(date +%s)" -o /home/pi/URP/URPPI3.js && pm2 restart URP
+curl -fsSL "https://raw.githubusercontent.com/JulianDS95/URPSignageTv/main/URPPI3-v2.5.js?t=$(date +%s)" -o /home/pi/URP/URPPI3-v2.5.js && pm2 delete URP 2>/dev/null || true && DISPLAY=:0 XAUTHORITY=/home/pi/.Xauthority pm2 start /home/pi/URP/URPPI3-v2.5.js --name URP && pm2 save
 ```
 
 ---
@@ -118,6 +144,7 @@ curl -fsSL "https://raw.githubusercontent.com/JulianDS95/URPSignageTv/main/URPPI
 
 | Acción | Comando |
 | :--- | :--- |
+| Abrir panel web local / remoto | `http://IP_DE_LA_PI:8090` |
 | Ver logs en tiempo real | `pm2 logs URP` |
 | Ver estado del proceso | `pm2 status` |
 | Reiniciar reproductor | `pm2 restart URP` |
@@ -127,10 +154,12 @@ curl -fsSL "https://raw.githubusercontent.com/JulianDS95/URPSignageTv/main/URPPI
 | Reiniciar la Raspberry Pi | `sudo reboot` |
 
 ### Endpoints HTTP locales (Puerto `8090`)
-- `GET /play` · `GET /stop` · `GET /pause` · `GET /resetContent`
+- `GET /` (Panel web completo) · `GET /api/status` · `GET /api/preview.jpg`
+- `POST /api/display-settings` · `POST /api/wall`
+- `GET /restartPlayer` · `GET /resetContent` · `GET /gc`
 - `GET /deleteContents` · `GET /reboot` · `GET /shutdown`
 - `GET /schedule` · `GET /contents` · `GET /update`
-- `GET /wall` · `GET /wall/sync`
+- `GET /wall` · `GET /wall/sync` · `GET /cleanLogs` · `GET /uploadLogs`
 - `GET /URPTemperature` · `GET /URPmemPercentUsed` · `GET /URPcpuUsage`
 
 ---
@@ -140,7 +169,7 @@ curl -fsSL "https://raw.githubusercontent.com/JulianDS95/URPSignageTv/main/URPPI
 Por defecto (`wall.json` ausente o desactivado), la Raspberry Pi funciona **100% como `URPPI3` normal**.  
 Cuando quieras armar un Video Wall de 2, 3, 4 o más pantallas **sin modificar el servidor `tbee.tv`**:
 
-1. Ejecutá el configurador en cada Raspberry Pi:
+1. Ejecutá el configurador en cada Raspberry Pi (o entrá desde el panel web `:8090` → **Configurar Video Wall**):
    ```bash
    urp-wall
    ```
@@ -149,8 +178,8 @@ Cuando quieras armar un Video Wall de 2, 3, 4 o más pantallas **sin modificar e
    - **Modo de activación:**
      - **Controlado por servidor `tbee.tv` (Remoto):** activás y desactivás el Video Wall directamente desde la opción **Video Wall** del panel de `tbee.tv` (sin volver a entrar por SSH).
      - **Siempre Activo (Local)** o **Desactivado (Modo Normal `URPPI3`)**.
-   - **Disposición de pantallas y Modo:** presets rápidos (`1x2`, `1x3`, `1x4`, `2x1`, `3x1`, `2x2`, `3x3` o personalizado) en modo **Mosaico (`tile`)** para partir la imagen/video entre pantallas o **Espejo (`mirror`)** sincronizado.
-   - **ID de pantalla (`1..N`):** muestra el mapa visual de la matriz e identifica automáticamente la fila/columna exacta que recorta esta Raspberry Pi.
+   - **Disposición de pantallas y Modo:** presets rápidos (`1x2`, `1x3`, `1x4`, `1x5`, `1x6`, `2x1`, `2x2`, `2x3`, `3x3` o personalizado hasta `32x32`) en modo **Mosaico (`tile`)** para partir la imagen/video entre pantallas o **Espejo (`mirror`)** sincronizado.
+   - **ID de pantalla (`1..999`):** muestra el mapa visual de la matriz e identifica automáticamente la fila/columna exacta que recorta esta Raspberry Pi.
    - **Orientación física:** Horizontal (`0°`), Vertical `90°`, Vertical `270°` o `180°` (sincronizado con `config.txt`).
    - **Compensación de bisel (`bezelPx`):** píxeles opcionales del marco entre pantallas vecinas.
    - **Sincronización:** **NTP automático** (sin equipo Master extra, todas alineadas al reloj del sistema) o **Master/Slave por IP local** (si la red no tiene internet).
@@ -162,10 +191,10 @@ Para que todas las pantallas se mantengan perfectamente alineadas y sin deformac
 
 1. **Misma duración total (obligatorio):**
    - **Opción recomendada (1 archivo maestro):** Subí **un único video o imagen** y asignalo a todas las pantallas del Video Wall. Así todas reproducen exactamente la misma duración, cantidad de cuadros y loop sincronizado.
-   - **Si usás archivos distintos por pantalla (modo `mirror` o piezas separadas):** Todos los videos del mismo bloque horario deben durar **exactamente lo mismo** (idéntica duración en segundos/milisegundos) y tener los mismos FPS (ej. `25 fps`). Si un video dura 15s y el de al lado dura 16s, el loop se desfasará en cada repetición.
+   - **Si usás archivos distintos por pantalla (modo `mirror` o piezas separadas):** Todos los videos del mismo bloque horario deben durar **exactamente lo mismo** (idéntica duración en segundos/milisegundos) y tener los mismos FPS (ej. `24/25 fps`). Si un video dura 15s y el de al lado dura 16s, el loop se desfasará en cada repetición.
    - **Múltiples elementos en un bloque:** Si un bloque combina varios videos o imágenes, todas las pantallas deben tener exactamente la misma lista, orden y duración por ítem para que el stream continuo (`seamless`) mida lo mismo en todas las Raspberry Pis.
 2. **Resolución y proporción del archivo según la matriz (modo Mosaico `tile`):**
-   - `URPPI3.js` recorta el archivo manteniendo la relación de aspecto real sin estirar ni deformar caras o logos. Diseñá el lienzo acorde a la disposición física de tus monitores:
+   - `URPPI3-v2.5.js` recorta el archivo manteniendo la relación de aspecto real sin estirar ni deformar caras o logos. Diseñá el lienzo acorde a la disposición física de tus monitores:
    | Disposición | Orientación de cada monitor | Resolución ideal del archivo | Alternativa liviana |
    | :--- | :--- | :--- | :--- |
    | **`2x2` o `3x3`** | Horizontales (`16:9`) | `3840x2160` (4K) | `1920x1080` (Full HD) |
@@ -177,9 +206,9 @@ Para que todas las pantallas se mantengan perfectamente alineadas y sin deformac
    | **`3x1`** | Horizontales apilados | `1920x3240` | `1280x2160` |
    | **Espejo (`mirror`)** | Cualquiera | `1920x1080` (H) o `1080x1920` (V) | `1280x720` (H) / `720x1280` (V) |
 3. **Formato técnico recomendado:**
-   - **Contenedor y códec:** MP4 (**H.264 / AVC**, perfil Main/High `yuv420p` 8-bit) a **25 fps** constantes (CBR o VBR ≤15 Mbps, *keyframe* cada 1 segundo / 25 cuadros).
-   - **Audio:** AAC estéreo `44.1 kHz` o sin pista de audio (en bloques mixtos conviene mismo formato en todos los clips).
-   - *(Aunque `URPPI3.js` convierte automáticamente formatos pesados como 4K, 60fps, HEVC, `.mov` o `.mkv`, subir H.264 a 25fps reduce el tiempo inicial de recorte en cada Pi.)*
+   - **Contenedor y códec:** MP4 (**H.264 / AVC**, perfil Baseline/Main `yuv420p` 8-bit) a **24/25 fps** constantes (CBR o VBR ≤15 Mbps, *keyframe* cada 1 segundo).
+   - **Audio:** AAC estéreo `44.1 kHz` o sin pista de audio.
+   - *(Aunque `URPPI3-v2.5.js` convierte automáticamente formatos pesados como 4K, 60fps, HEVC, `.mov` o `.mkv`, subir H.264 a 24/25fps reduce el tiempo inicial de recorte en cada Pi.)*
 4. **Márgenes de bisel y alineación:**
    - Si configuraste compensación de bisel (`bezelPx > 0` en `urp-wall`), evitá ubicar tipografías pequeñas o líneas finas justo en los bordes de corte entre pantallas vecinas.
    - Al publicar una campaña nueva, esperá unos instantes mientras cada Raspberry termina el recorte en segundo plano (`/home/pi/URP/optimized/`); una vez generado el MP4 recortado, `mpv` ajusta la deriva automáticamente en el siguiente ciclo (`curl http://localhost:8090/wall` para verificar).
@@ -191,6 +220,21 @@ Para que todas las pantallas se mantengan perfectamente alineadas y sin deformac
 ---
 
 ## Historial de mejoras por actualización
+
+### `v2.5.0` — Panel Completo en Vivo (`:8090`), 720p Fluido Pi 3B+, Rotación/Agenda y Tailscale
+- **Controles directos en el panel principal `:8090`:**
+  - Selector de **Resolución de conversión** (`Automática / 1280x720 / 1920x1080` + ajuste automático de salida HDMI/X11 a `1280x720`).
+  - Selector de **Rotación de contenido / pantalla** (`0° / 90° / 180° / 270°`) operativo incluso sin Video Wall activo ni permisos de escritura sobre `config.txt`.
+  - Sección **Agenda Cargada** en vivo con bloques horarios, horario de inicio, bloque activo, duración y estado (`Listo` / `Pendiente`) de cada contenido.
+  - **Monitor Visual en Vivo** (`/api/preview.jpg`) sin subidas FTP + barra de progreso en vivo desde `mpv` IPC + botón **Reiniciar Reproductor** y título dinámico con el nombre del Manager.
+- **Reproducción fluida 720p y bajo uso de CPU/RAM en Pi 3B+:**
+  - Resolución objetivo `1280x720 @ 24fps` (H.264 Baseline L3.1 `≤2.2 Mbps`) por defecto en equipos <=1.5 GB RAM tanto para videos como imágenes (`_720p`).
+  - Padding exacto y pista de audio AAC estéreo `44.1 kHz` garantizados en `optimized/` (`_p3.mp4`) para que la unión `seamless` use **`-c copy` instantáneo (~0% CPU)** en vez de re-codificar bloques completos.
+  - Búfer reducido en `mpv` (`6M`/`1M`, 2 hilos), prioridad mínima (`nice -n 19`), `-preset ultrafast` y pausa preventiva de `ffmpeg` ante RAM >=86% o temperatura >=78 °C.
+- **Hostname automático y Tailscale:**
+  - Sincronización automática del hostname Linux y de Tailscale desde el nombre asignado en `tbee.tv`, más instalación de Tailscale integrada en `install-urp.sh` y guía directa sin tokens en este README.
+- **Video Wall sin límite de 3 pantallas y navegación mejorada:**
+  - Configurador CLI (`urp-wall.sh`) y web (`:8090`) ampliados a IDs `1..999`, matrices hasta `32x32`, botón *Volver atrás* en todos los submenús y rollback OTA automático (`.ota_pending`).
 
 ### `v2.4.1` — Reproducción de video ultra fluida (`mpv` X11/GPU + Baseline L3.1)
 - **Escalado GPU liviano y decodificación rápida en `mpv`:** Configurados `--scale=bilinear --cscale=bilinear --dscale=bilinear --dither-depth=no --deband=no --vd-lavc-fast --vd-lavc-skiploopfilter=nonref --audio-fallback-to-null=yes` sobre `--vo=gpu`, reduciendo drásticamente el uso de CPU/GPU al decodificar y escalar en Raspberry Pi 3B+, 4 y 5.

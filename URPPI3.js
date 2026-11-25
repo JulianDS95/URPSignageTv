@@ -231,7 +231,8 @@ var wallConfig = {
     masterIp: '',
     drmMode: false,
     resolutionMode: 'auto',
-    hdmi720p: true
+    hdmi720p: true,
+    orientationOverride: false
 };
 var wallConfigMtime = 0;
 var lastWallSignatureLogged = '';
@@ -243,7 +244,7 @@ function loadWallConfig() {
                 enabled: false, activationMode: 'server', mode: 'mirror', screenId: 1,
                 rows: 1, cols: 1, row: 0, col: 0, bezelPx: 0,
                 orientation: 0, syncMode: 'ntp', masterIp: '', drmMode: false,
-                resolutionMode: 'auto', hdmi720p: true
+                resolutionMode: 'auto', hdmi720p: true, orientationOverride: false
             };
             wallConfigMtime = 0;
             detectDisplaySession();
@@ -287,7 +288,8 @@ function loadWallConfig() {
             masterIp: String(parsed.masterIp || '').trim(),
             drmMode: Boolean(parsed.drmMode),
             resolutionMode: resMode,
-            hdmi720p: (parsed.hdmi720p === undefined) ? true : Boolean(parsed.hdmi720p)
+            hdmi720p: (parsed.hdmi720p === undefined) ? true : Boolean(parsed.hdmi720p),
+            orientationOverride: Boolean(parsed.orientationOverride)
         };
         wallConfigMtime = st.mtime.getTime();
         detectDisplaySession();
@@ -535,6 +537,9 @@ function getGuiEnv() {
 }
 
 function readHdmiRotateFromConfig() {
+    if (wallConfig && wallConfig.orientationOverride && typeof wallConfig.orientation === 'number' && wallConfig.orientation >= 0 && wallConfig.orientation <= 3) {
+        return wallConfig.orientation;
+    }
     var cfgPaths = ['/boot/firmware/config.txt', '/boot/config.txt'];
     for (var i = 0; i < cfgPaths.length; i++) {
         try {
@@ -551,7 +556,7 @@ function readHdmiRotateFromConfig() {
             if (found !== null) return found;
         } catch (e) {}
     }
-    if (isWallActive() && wallConfig.orientation >= 0 && wallConfig.orientation <= 3) {
+    if (wallConfig && typeof wallConfig.orientation === 'number' && wallConfig.orientation >= 0 && wallConfig.orientation <= 3) {
         return wallConfig.orientation;
     }
     return null;
@@ -574,8 +579,8 @@ function getMpvVideoRotateDeg() {
 
 function buildDisplayRotationScript(cfgRot) {
     var wl = getWaylandEnv();
-    var xrandrDir = (cfgRot === 1) ? 'right' : (cfgRot === 2 ? 'inverted' : 'left');
-    var wlrTrans = (cfgRot === 1) ? '90' : (cfgRot === 2 ? '180' : '270');
+    var xrandrDir = (cfgRot === 0) ? 'normal' : ((cfgRot === 1) ? 'right' : (cfgRot === 2 ? 'inverted' : 'left'));
+    var wlrTrans = (cfgRot === 0) ? 'normal' : ((cfgRot === 1) ? '90' : (cfgRot === 2 ? '180' : '270'));
 
     return "export DISPLAY=:0; export XAUTHORITY=\"" + getXauthPath() + "\"; " +
            "export XDG_RUNTIME_DIR=\"" + wl.runtimeDir + "\"; " +
@@ -588,7 +593,9 @@ function buildDisplayRotationScript(cfgRot) {
            "  RES=$(echo \"$CUR\" | grep -oE '[0-9]+x[0-9]+' | head -n1); " +
            "  W=$(echo \"$RES\" | cut -dx -f1); H=$(echo \"$RES\" | cut -dx -f2); " +
            "  ALREADY=0; " +
-           "  if [ \"" + cfgRot + "\" = \"2\" ]; then " +
+           "  if [ \"" + cfgRot + "\" = \"0\" ]; then " +
+           "    if ! echo \"$CUR\" | grep -qE ' (right|left|inverted) [(]' && [ -n \"$W\" ] && [ -n \"$H\" ] && [ \"$W\" -ge \"$H\" ] 2>/dev/null; then ALREADY=1; fi; " +
+           "  elif [ \"" + cfgRot + "\" = \"2\" ]; then " +
            "    echo \"$CUR\" | grep -qE ' inverted [(]' && ALREADY=1; " +
            "  else " +
            "    if [ -n \"$W\" ] && [ -n \"$H\" ] && [ \"$W\" -lt \"$H\" ] 2>/dev/null; then ALREADY=1; fi; " +
@@ -596,10 +603,10 @@ function buildDisplayRotationScript(cfgRot) {
            "  fi; " +
            "  if [ \"$ALREADY\" = \"0\" ]; then " +
            "    if xrandr --output \"$OUT\" --rotate " + xrandrDir + " 2>/dev/null; then " +
-           "      DID_CHANGE=1; OS_ROTATED=1; " +
+           "      DID_CHANGE=1; OS_ROTATED=" + (cfgRot === 0 ? "0" : "1") + "; " +
            "    fi; " +
            "  else " +
-           "    OS_ROTATED=1; " +
+           "    OS_ROTATED=" + (cfgRot === 0 ? "0" : "1") + "; " +
            "  fi; " +
            "fi; " +
            "if [ \"$OS_ROTATED\" = \"0\" ] && command -v wlr-randr >/dev/null 2>&1; then " +
@@ -608,9 +615,9 @@ function buildDisplayRotationScript(cfgRot) {
            "    BACKEND=wayland; " +
            "    CUR_T=$(wlr-randr 2>/dev/null | awk -v o=\"$WOUT\" '$0 ~ \"^\"o{f=1;next} f && /Transform:/{print $2;exit}'); " +
            "    if [ \"$CUR_T\" = \"" + wlrTrans + "\" ]; then " +
-           "      OS_ROTATED=1; " +
+           "      OS_ROTATED=" + (cfgRot === 0 ? "0" : "1") + "; " +
            "    elif wlr-randr --output \"$WOUT\" --transform " + wlrTrans + " 2>/dev/null; then " +
-           "      DID_CHANGE=1; OS_ROTATED=1; " +
+           "      DID_CHANGE=1; OS_ROTATED=" + (cfgRot === 0 ? "0" : "1") + "; " +
            "    fi; " +
            "  fi; " +
            "fi; " +
@@ -669,7 +676,12 @@ function applyDisplayRotationIfNeeded(callback) {
         return;
     }
     var cfgRot = readHdmiRotateFromConfig();
-    if (cfgRot === null || cfgRot === 0) {
+    if (cfgRot === null) {
+        osScreenRotated = false;
+        if (callback) callback(false);
+        return;
+    }
+    if (cfgRot === 0 && !osScreenRotated) {
         osScreenRotated = false;
         if (callback) callback(false);
         return;
@@ -4513,6 +4525,11 @@ function buildLocalDashboardHtml() {
         '.mcell small{font-size:9px;font-weight:400;color:#64748b} .mcell.active{background:#2563eb;border-color:#60a5fa;color:#fff} .mcell.active small{color:#dbeafe}' +
         '.warnBox{padding:9px 11px;border-radius:8px;background:#291d09;border:1px solid #b45309;color:#fde68a;font-size:12px;margin-top:8px;display:none;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}' +
         '.chkRow{display:flex;align-items:center;gap:8px;font-size:13px;color:#e2e8f0;padding-top:6px}' +
+        '.agendaBlk{background:#030712;border:1px solid #1f2937;border-radius:10px;padding:10px 12px;margin-top:8px}' +
+        '.agendaHead{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px;font-size:12px;font-weight:700;color:#e2e8f0}' +
+        '.agendaRow{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 0;border-top:1px solid #111827;font-size:12px;color:#cbd5e1;flex-wrap:wrap}' +
+        '.tag{display:inline-block;padding:2px 7px;border-radius:5px;font-size:10px;font-weight:700;background:#1e293b;color:#94a3b8}' +
+        '.tag.on{background:#065f46;color:#6ee7b7} .tag.wait{background:#78350f;color:#fde68a}' +
         '</style></head><body><div class="wrap">' +
         '<div class="top"><div><h1><span id="titleMain">URP Signage Monitor</span> <span id="ver"></span></h1><div class="sub" id="meta">Cargando...</div></div>' +
         '<div class="sub" id="conn"></div></div>' +
@@ -4535,6 +4552,25 @@ function buildLocalDashboardHtml() {
         '<button id="btnShutdown" class="b-red">Apagar Pi</button>' +
         '<button id="btnDelete" class="b-red">Borrar Contenidos</button>' +
         '</div>' +
+        '<div class="card"><div class="liveHead" style="margin-bottom:10px">' +
+        '<div class="k" style="margin:0">Resolución de Conversión y Rotación de Pantalla</div>' +
+        '<button type="button" id="btnSaveDisplay" class="b-green">Aplicar Pantalla / Conversión</button>' +
+        '</div>' +
+        '<div class="fgrid" style="margin-bottom:6px">' +
+        '<div><label class="lbl" for="mResMode">Resolución de conversión (videos e imágenes)</label><select id="mResMode">' +
+        '<option value="auto">Automática (720p en Pi 3 / 1080p en Pi 4-5)</option>' +
+        '<option value="720p">1280x720 (720p Fluido - Bajo CPU/RAM)</option>' +
+        '<option value="1080p">1920x1080 (Full HD 1080p)</option>' +
+        '</select></div>' +
+        '<div><label class="lbl" for="mOrient">Rotación de contenido / HDMI</label><select id="mOrient">' +
+        '<option value="0">0° Horizontal Normal</option>' +
+        '<option value="1">90° Vertical Derecha</option>' +
+        '<option value="2">180° Invertido</option>' +
+        '<option value="3">270° Vertical Izquierda</option>' +
+        '</select></div>' +
+        '</div>' +
+        '<label class="chkRow"><input type="checkbox" id="mHdmi720"> Ajustar salida HDMI/X11 a 1280x720 cuando el modo esté en 720p</label>' +
+        '</div>' +
         '<div class="card"><div class="liveHead">' +
         '<div><span class="k" style="margin-right:8px">Monitor Visual en Vivo</span><span id="liveBadge" class="liveBadge">PAUSADO</span><div class="sub" id="liveMeta" style="margin-top:2px">Activá Vista en Vivo para supervisar la pantalla desde cualquier ubicación (sin subir al FTP)</div></div>' +
         '<div class="btns" style="margin:0">' +
@@ -4545,7 +4581,7 @@ function buildLocalDashboardHtml() {
         '<div id="liveEmpty" class="sub" style="padding:18px;text-align:center;border:1px dashed #334155;border-radius:8px;margin-top:6px">Sin captura cargada todavía. Pulsá &ldquo;Capturar Ahora&rdquo; o &ldquo;Activar Vista en Vivo&rdquo;.</div>' +
         '<img id="shotImg" class="shot" style="display:none" alt="Vista previa pantalla">' +
         '</div>' +
-        '<div class="card"><div class="k">Colas y Agenda</div><div id="queues" class="sub" style="margin-top:4px">-</div></div>' +
+        '<div class="card"><div class="k">Agenda Cargada</div><div id="queues" class="sub" style="margin-top:4px">-</div><div id="agendaList" class="sub" style="margin-top:6px">Cargando agenda...</div></div>' +
         '<div class="card"><div class="k">Logs en vivo</div><pre id="logs">Cargando...</pre></div>' +
         '</div>' +
 
@@ -4630,11 +4666,74 @@ function buildLocalDashboardHtml() {
         '</div><script>' +
         'var lastStatus = null;' +
         'var wallLoaded = false;' +
+        'var displaySynced = false;' +
         'var liveActive = false;' +
         'var liveTimer = null;' +
         'var liveInFlight = false;' +
         'var nl = String.fromCharCode(10);' +
         'function byId(id){ return document.getElementById(id); }' +
+        'function pad2(n){ n = parseInt(n, 10) || 0; return (n < 10 ? "0" : "") + n; }' +
+        'function syncDisplayQuickForm(cfg, effOrient){' +
+        '  if (!cfg) return;' +
+        '  byId("mResMode").value = (cfg.resolutionMode === "720p" || cfg.resolutionMode === "1080p") ? cfg.resolutionMode : "auto";' +
+        '  var rotVal = (typeof effOrient === "number" && effOrient >= 0 && effOrient <= 3) ? effOrient : clampInt(cfg.orientation, 0, 3, 0);' +
+        '  byId("mOrient").value = String(rotVal);' +
+        '  byId("mHdmi720").checked = (cfg.hdmi720p !== false);' +
+        '}' +
+        'function renderAgenda(blocks){' +
+        '  var box = byId("agendaList");' +
+        '  if (!Array.isArray(blocks) || blocks.length === 0) {' +
+        '    box.innerHTML = "";' +
+        '    var emptyDiv = document.createElement("div");' +
+        '    emptyDiv.style.padding = "8px 0";' +
+        '    emptyDiv.textContent = "Sin bloques horarios cargados aún desde el Manager.";' +
+        '    box.appendChild(emptyDiv);' +
+        '    return;' +
+        '  }' +
+        '  box.innerHTML = "";' +
+        '  for (var i = 0; i < blocks.length; i++) {' +
+        '    var b = blocks[i];' +
+        '    var blkDiv = document.createElement("div");' +
+        '    blkDiv.className = "agendaBlk";' +
+        '    var hd = document.createElement("div");' +
+        '    hd.className = "agendaHead";' +
+        '    var title = document.createElement("span");' +
+        '    title.textContent = "Bloque #" + b.idScheduleBlock + " • Inicio " + pad2(b.startHour) + ":" + pad2(b.startMinute) + " (" + (b.items ? b.items.length : 0) + " items)";' +
+        '    hd.appendChild(title);' +
+        '    if (b.active) {' +
+        '      var ab = document.createElement("span");' +
+        '      ab.className = "tag on";' +
+        '      ab.textContent = "ACTIVO AHORA";' +
+        '      hd.appendChild(ab);' +
+        '    }' +
+        '    blkDiv.appendChild(hd);' +
+        '    var items = b.items || [];' +
+        '    for (var j = 0; j < items.length; j++) {' +
+        '      var it = items[j];' +
+        '      var row = document.createElement("div");' +
+        '      row.className = "agendaRow";' +
+        '      var left = document.createElement("span");' +
+        '      left.style.wordBreak = "break-all";' +
+        '      left.textContent = (j + 1) + ". " + (it.name || it.content || "-") + (it.name && it.content && it.name !== it.content ? (" (" + it.content + ")") : "");' +
+        '      var right = document.createElement("span");' +
+        '      right.style.display = "flex";' +
+        '      right.style.gap = "6px";' +
+        '      right.style.alignItems = "center";' +
+        '      var metaTag = document.createElement("span");' +
+        '      metaTag.className = "tag";' +
+        '      metaTag.textContent = (it.kind || "Media") + " • " + (it.duration || 10) + "s";' +
+        '      var stTag = document.createElement("span");' +
+        '      stTag.className = "tag " + (it.ready ? "on" : "wait");' +
+        '      stTag.textContent = it.ready ? "Listo" : "Pendiente";' +
+        '      right.appendChild(metaTag);' +
+        '      right.appendChild(stTag);' +
+        '      row.appendChild(left);' +
+        '      row.appendChild(right);' +
+        '      blkDiv.appendChild(row);' +
+        '    }' +
+        '    box.appendChild(blkDiv);' +
+        '  }' +
+        '}' +
         'function fmtSec(sec){' +
         '  var s = Math.max(0, Math.floor(sec || 0));' +
         '  var m = Math.floor(s / 60);' +
@@ -4804,9 +4903,31 @@ function buildLocalDashboardHtml() {
         '    byId("disk").textContent = s.freeSpace;' +
         '    byId("vw").textContent = s.wallActive ? (s.wallConfig.mode + " " + s.wallConfig.rows + "x" + s.wallConfig.cols + " #" + s.wallConfig.screenId + " (drift " + (s.wallSyncStatus.driftMs || 0) + "ms)") : ("Normal (" + (s.wallConfig.activationMode === "server" ? "remoto tbee.tv OFF" : "desactivado") + ")");' +
         '    byId("queues").textContent = "Bloque activo: " + s.blockPlaying + " | Bloques hoy: " + s.scheduleCount + " | Descargas FTP: " + s.queues.ftp + " | Imágenes: " + s.queues.render + " | Videos Opt: " + s.queues.videoOpt + " | Seamless activo: " + (s.queues.concatenating ? "Sí" : "No");' +
+        '    renderAgenda(s.scheduleSummary || []);' +
         '    byId("logs").textContent = (s.logs || []).join(nl) || "Sin logs";' +
         '    if (!wallLoaded && s.wallConfig) { syncToForm(s.wallConfig, s.serverVideoWallFlag); wallLoaded = true; }' +
+        '    if (!displaySynced && s.wallConfig) { syncDisplayQuickForm(s.wallConfig, s.effectiveOrientation); displaySynced = true; }' +
         '  }).catch(function(){});' +
+        '}' +
+        'function saveDisplaySettings(){' +
+        '  var payload = {' +
+        '    resolutionMode: byId("mResMode").value,' +
+        '    orientation: clampInt(byId("mOrient").value, 0, 3, 0),' +
+        '    hdmi720p: Boolean(byId("mHdmi720").checked)' +
+        '  };' +
+        '  fetch("/api/display-settings", {' +
+        '    method: "POST",' +
+        '    headers: { "Content-Type": "application/json" },' +
+        '    body: JSON.stringify(payload)' +
+        '  }).then(function(r){ return r.json(); }).then(function(res){' +
+        '    if (!res || !res.ok) { showMsg((res && res.error) ? res.error : "Error guardando pantalla", "err"); return; }' +
+        '    displaySynced = false;' +
+        '    wallLoaded = false;' +
+        '    var info = "Configuración aplicada: " + (res.targetResolution || payload.resolutionMode) + ", rotación " + (payload.orientation * 90) + "°.";' +
+        '    if (res.rotChanged) info += res.rotUpdated ? " (config.txt actualizado; rotación aplicada al reproductor)" : " (rotación aplicada en caliente por X11/mpv)";' +
+        '    showMsg(info, "ok");' +
+        '    refresh();' +
+        '  }).catch(function(e){ showMsg("Error guardando configuración: " + e.message, "err"); });' +
         '}' +
         'function act(u){' +
         '  fetch(u).then(function(r){ return r.text(); }).then(function(t){' +
@@ -4880,6 +5001,7 @@ function buildLocalDashboardHtml() {
         'byId("btnToggleLive").onclick = function(){ setLiveMode(!liveActive); };' +
         'byId("liveInt").onchange = function(){ if (liveActive) scheduleLiveNext(); };' +
         'byId("btnRestartPlayer").onclick = function(){ act("/restartPlayer"); };' +
+        'byId("btnSaveDisplay").onclick = saveDisplaySettings;' +
         'byId("btnUpdate").onclick = function(){ act("/update"); };' +
         'byId("btnGc").onclick = function(){ act("/gc"); };' +
         'byId("btnCleanLogs").onclick = function(){ act("/cleanLogs"); };' +
@@ -4908,10 +5030,53 @@ app.get('/', function (req, res) {
     res.status(200).type('html').send(buildLocalDashboardHtml());
 });
 
+function buildScheduleSummaryForStatus() {
+    var arr = Array.isArray(schedule) ? schedule : [];
+    if (arr.length === 0 && typeof schedule === 'object' && schedule !== null) {
+        arr = Object.keys(schedule).map(function (k) { return schedule[k]; });
+    }
+    var dimsNow = getTargetVideoDims();
+    var resTag = dimsNow.use720p ? '_720p' : '';
+    var wallTag = isWallTileActive() ? ('_' + getWallSignature()) : '';
+    return arr.map(function (blk) {
+        var bItems = Array.isArray(blk.contents) ? blk.contents : [];
+        return {
+            idScheduleBlock: blk.idScheduleBlock,
+            startHour: blk.startHour,
+            startMinute: blk.startMinute,
+            active: String(blk.idScheduleBlock) === String(blockPlaying),
+            items: bItems.map(function (it) {
+                var rawC = String(it.content || '');
+                var safeC = normalizeName(rawC);
+                var dur = parseInt(it.length, 10) || 10;
+                var imgItem = isImg(safeC) || isImg(rawC);
+                var ready = false;
+                if (imgItem) {
+                    var imgMp4 = contentBasePath + safeC.replace(/\.[^/.]+$/, '') + resTag + wallTag + '_' + dur + 's.mp4';
+                    ready = (fileExist(imgMp4) && fs.statSync(imgMp4).size > 4096) || fileExist(contentBasePath + safeC) || fileExist(contentBasePath + rawC);
+                } else if (safeC) {
+                    var rawPath = fileExist(contentBasePath + safeC) ? (contentBasePath + safeC) : (contentBasePath + rawC);
+                    var optP = getOptimizedVideoPath(rawPath);
+                    ready = Boolean((optP && fileExist(optP)) || fileExist(rawPath));
+                }
+                return {
+                    idContent: it.idContent || 0,
+                    name: String(it.name || safeC || rawC),
+                    content: rawC,
+                    duration: dur,
+                    kind: imgItem ? 'Imagen' : 'Video',
+                    ready: Boolean(ready)
+                };
+            })
+        };
+    });
+}
+
 app.get('/api/status', function (req, res) {
     loadWallConfig();
     var buildPayload = function (pl) {
         var dimsNow = getTargetVideoDims();
+        var effOrient = readHdmiRotateFromConfig();
         res.json({
             version: URPVersion,
             model: piModelStr,
@@ -4920,6 +5085,7 @@ app.get('/api/status', function (req, res) {
             totalRamMB: totalRamMB,
             displayBackend: useDrmDirect ? 'DRM/KMS' : (hasWaylandDisplay ? 'Wayland' : 'X11'),
             targetResolution: dimsNow.width + 'x' + dimsNow.height + (dimsNow.use720p ? ' (720p)' : ' (1080p)'),
+            effectiveOrientation: (effOrient !== null) ? effOrient : (wallConfig.orientation || 0),
             ip: URPdata.URPIpAddress || '',
             tailscaleIp: getTailscaleIp(),
             mac: macAdd,
@@ -4935,6 +5101,7 @@ app.get('/api/status', function (req, res) {
             filesPlaying: filesPlaying,
             player: pl,
             scheduleCount: Array.isArray(schedule) ? schedule.length : 0,
+            scheduleSummary: buildScheduleSummaryForStatus(),
             serverVideoWallFlag: Boolean(URPdata && URPdata.isVideoWall),
             wallActive: isWallActive(),
             wallConfig: wallConfig,
@@ -5082,6 +5249,61 @@ app.get('/wall', function (req, res) {
         masterState: wallMasterState
     });
 });
+app.post('/api/display-settings', function (req, res) {
+    readJsonBody(req, function (err, body) {
+        if (err || !body || typeof body !== 'object') {
+            return res.status(400).json({ ok: false, error: 'JSON inválido' });
+        }
+        try {
+            loadWallConfig();
+            var prevRot = wallConfig.orientation;
+            var orientation = [0, 1, 2, 3].indexOf(parseInt(body.orientation, 10)) !== -1 ? parseInt(body.orientation, 10) : wallConfig.orientation;
+            var resMode = (body.resolutionMode === '720p' || body.resolutionMode === '1080p' || body.resolutionMode === 'auto') ? body.resolutionMode : wallConfig.resolutionMode;
+            var hdmi720p = (body.hdmi720p === undefined) ? wallConfig.hdmi720p : Boolean(body.hdmi720p);
+            var rotChanged = (orientation !== prevRot);
+            var rotUpdated = false;
+            if (rotChanged) {
+                var rotRes = writeHdmiRotateToConfig(orientation);
+                rotUpdated = Boolean(rotRes && rotRes.ok);
+            }
+            var nextCfg = Object.assign({}, wallConfig, {
+                orientation: orientation,
+                resolutionMode: resMode,
+                hdmi720p: hdmi720p,
+                orientationOverride: rotChanged ? (!rotUpdated) : Boolean(wallConfig.orientationOverride),
+                updatedAt: new Date().toISOString()
+            });
+
+            ensureDir(basePath);
+            var tmpPath = wallConfigPath + '.tmp';
+            fs.writeFileSync(tmpPath, JSON.stringify(nextCfg, null, 2) + '\n', 'utf8');
+            fs.renameSync(tmpPath, wallConfigPath);
+            wallConfigMtime = 0;
+            loadWallConfig();
+            lastAppliedHdmiRes = '';
+            applyDisplayResolution720pIfNeeded(true);
+            applyDisplayRotationIfNeeded();
+
+            clearWallDerivedCaches();
+            blockPlaying = 0;
+            stopOmx(function () {
+                setTimeout(function () { checkSchedule(); }, 250);
+            });
+
+            var dimsNow = getTargetVideoDims();
+            res.json({
+                ok: true,
+                config: wallConfig,
+                targetResolution: dimsNow.width + 'x' + dimsNow.height + (dimsNow.use720p ? ' (720p)' : ' (1080p)'),
+                rotChanged: rotChanged,
+                rotUpdated: rotUpdated
+            });
+        } catch (saveErr) {
+            res.status(500).json({ ok: false, error: saveErr.message });
+        }
+    });
+});
+
 app.post('/api/wall', function (req, res) {
     readJsonBody(req, function (err, body) {
         if (err || !body || typeof body !== 'object') {
@@ -5098,6 +5320,12 @@ app.post('/api/wall', function (req, res) {
             var orientation = [0, 1, 2, 3].indexOf(parseInt(body.orientation, 10)) !== -1 ? parseInt(body.orientation, 10) : 0;
             var actMode = (body.activationMode === 'server' || body.activationMode === 'local') ? body.activationMode : 'local';
             var resMode = (body.resolutionMode === '720p' || body.resolutionMode === '1080p') ? body.resolutionMode : 'auto';
+            var rotChanged = (orientation !== prevRot);
+            var rotUpdated = false;
+            if (rotChanged) {
+                var rotRes = writeHdmiRotateToConfig(orientation);
+                rotUpdated = Boolean(rotRes && rotRes.ok);
+            }
             var nextCfg = {
                 enabled: (actMode === 'server') ? true : Boolean(body.enabled),
                 activationMode: actMode,
@@ -5114,6 +5342,7 @@ app.post('/api/wall', function (req, res) {
                 drmMode: Boolean(body.drmMode),
                 resolutionMode: resMode,
                 hdmi720p: (body.hdmi720p === undefined) ? true : Boolean(body.hdmi720p),
+                orientationOverride: rotChanged ? (!rotUpdated) : Boolean(wallConfig.orientationOverride),
                 updatedAt: new Date().toISOString()
             };
 
@@ -5125,13 +5354,7 @@ app.post('/api/wall', function (req, res) {
             loadWallConfig();
             lastAppliedHdmiRes = '';
             applyDisplayResolution720pIfNeeded(true);
-
-            var rotChanged = (orientation !== prevRot);
-            var rotUpdated = false;
-            if (rotChanged) {
-                var rotRes = writeHdmiRotateToConfig(orientation);
-                rotUpdated = Boolean(rotRes && rotRes.ok);
-            }
+            applyDisplayRotationIfNeeded();
 
             clearWallDerivedCaches();
             blockPlaying = 0;
