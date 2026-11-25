@@ -229,7 +229,9 @@ var wallConfig = {
     orientation: 0,
     syncMode: 'ntp',
     masterIp: '',
-    drmMode: false
+    drmMode: false,
+    resolutionMode: 'auto',
+    hdmi720p: true
 };
 var wallConfigMtime = 0;
 var lastWallSignatureLogged = '';
@@ -240,7 +242,8 @@ function loadWallConfig() {
             wallConfig = {
                 enabled: false, activationMode: 'server', mode: 'mirror', screenId: 1,
                 rows: 1, cols: 1, row: 0, col: 0, bezelPx: 0,
-                orientation: 0, syncMode: 'ntp', masterIp: '', drmMode: false
+                orientation: 0, syncMode: 'ntp', masterIp: '', drmMode: false,
+                resolutionMode: 'auto', hdmi720p: true
             };
             wallConfigMtime = 0;
             detectDisplaySession();
@@ -265,6 +268,9 @@ function loadWallConfig() {
         var actMode = (parsed.activationMode === 'server' || parsed.activationMode === 'local')
             ? parsed.activationMode
             : 'local';
+        var resMode = (parsed.resolutionMode === '720p' || parsed.resolutionMode === '1080p')
+            ? parsed.resolutionMode
+            : 'auto';
 
         wallConfig = {
             enabled: Boolean(parsed.enabled),
@@ -279,15 +285,17 @@ function loadWallConfig() {
             orientation: [0, 1, 2, 3].indexOf(parseInt(parsed.orientation, 10)) !== -1 ? parseInt(parsed.orientation, 10) : 0,
             syncMode: (parsed.syncMode === 'master') ? 'master' : 'ntp',
             masterIp: String(parsed.masterIp || '').trim(),
-            drmMode: Boolean(parsed.drmMode)
+            drmMode: Boolean(parsed.drmMode),
+            resolutionMode: resMode,
+            hdmi720p: (parsed.hdmi720p === undefined) ? true : Boolean(parsed.hdmi720p)
         };
         wallConfigMtime = st.mtime.getTime();
         detectDisplaySession();
 
-        var sig = wallConfig.activationMode + '_' + wallConfig.enabled + '_' + wallConfig.mode + '_' + wallConfig.rows + 'x' + wallConfig.cols + '_id' + wallConfig.screenId + '_' + wallConfig.syncMode + '_drm' + useDrmDirect;
+        var sig = wallConfig.activationMode + '_' + wallConfig.enabled + '_' + wallConfig.mode + '_' + wallConfig.rows + 'x' + wallConfig.cols + '_id' + wallConfig.screenId + '_' + wallConfig.syncMode + '_drm' + useDrmDirect + '_res' + wallConfig.resolutionMode;
         if (sig !== lastWallSignatureLogged) {
             lastWallSignatureLogged = sig;
-            console.log('[DISPLAY:SESION] Salida=' + (useDrmDirect ? 'DRM/KMS directo (sin X11)' : (hasWaylandDisplay ? 'Wayland' : 'X11')));
+            console.log('[DISPLAY:SESION] Salida=' + (useDrmDirect ? 'DRM/KMS directo (sin X11)' : (hasWaylandDisplay ? 'Wayland' : 'X11')) + ' | Render=' + (getTargetVideoDims().use720p ? '1280x720 (720p Fluido)' : '1920x1080 (1080p)'));
             if (wallConfig.activationMode === 'server' || wallConfig.enabled) {
                 console.log('[VIDEOWALL] Config -> control=' + wallConfig.activationMode + ', enabled=' + wallConfig.enabled + ', modo=' + wallConfig.mode + ', matriz=' + wallConfig.rows + 'x' + wallConfig.cols + ', pantalla #' + wallConfig.screenId + ' (f' + (wallConfig.row + 1) + ',c' + (wallConfig.col + 1) + '), bisel=' + wallConfig.bezelPx + 'px, sync=' + wallConfig.syncMode + (wallConfig.masterIp ? ('(' + wallConfig.masterIp + ')') : ''));
             }
@@ -331,25 +339,47 @@ detectDisplaySession();
 
 function getTargetVideoDims() {
     var isVert = isPortraitOrientation();
-    var use720p = isLowPowerPi && !hasOmxplayer;
+    var envRes = String(process.env.URP_RESOLUTION || '').trim().toLowerCase();
+    var cfgRes = (wallConfig && wallConfig.resolutionMode) ? String(wallConfig.resolutionMode).toLowerCase() : 'auto';
+    var effectiveMode = (envRes === '720p' || envRes === '1080p') ? envRes : cfgRes;
+    var use720p = (effectiveMode === '720p') ? true : ((effectiveMode === '1080p') ? false : isLowPowerPi);
     var longEdge = use720p ? 1280 : 1920;
     var shortEdge = use720p ? 720 : 1080;
     return {
         width: isVert ? shortEdge : longEdge,
         height: isVert ? longEdge : shortEdge,
         use720p: use720p,
+        mode: effectiveMode,
+        fps: use720p ? 24 : 25,
+        preset: (use720p || isLowPowerPi) ? 'ultrafast' : 'veryfast',
         profile: use720p ? 'baseline' : 'main',
         level: use720p ? '3.1' : '4.0',
-        crf: use720p ? '24' : '22',
-        maxRate: use720p ? '2500k' : '4200k',
-        bufSize: use720p ? '5000k' : '8400k',
+        crf: use720p ? '25' : '22',
+        maxRate: use720p ? '2200k' : '4200k',
+        bufSize: use720p ? '4400k' : '8400k',
         threads: isLowPowerPi ? '1' : '2'
     };
 }
 
+function getEncodingBackpressureReason() {
+    if (!isArm && !isLinux) return '';
+    try {
+        var totMem = osMod.totalmem();
+        var frMem = osMod.freemem();
+        var curMemPct = (totMem > 0) ? Math.round(((totMem - frMem) * 100) / totMem) : 0;
+        if (isLowPowerPi && curMemPct >= 86) {
+            return 'RAM alta (' + curMemPct + '%)';
+        }
+        if (temperature >= 78) {
+            return 'Temperatura alta (' + temperature + '°C)';
+        }
+    } catch (e) {}
+    return '';
+}
+
 function spawnFfmpegLowPriority(ffArgs) {
     if (isLinux && hasNice) {
-        return spawn('nice', ['-n', '15', 'ffmpeg'].concat(ffArgs), { stdio: ['ignore', 'ignore', 'pipe'] });
+        return spawn('nice', ['-n', '19', 'ffmpeg'].concat(ffArgs), { stdio: ['ignore', 'ignore', 'pipe'] });
     }
     return spawn('ffmpeg', ffArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
 }
@@ -651,6 +681,55 @@ function applyDisplayRotationIfNeeded(callback) {
 }
 refreshDisplayRotationSync();
 
+var lastAppliedHdmiRes = '';
+function applyDisplayResolution720pIfNeeded(forceCheck) {
+    if (!isArm && !isLinux) return;
+    if (useDrmDirect || (!hasX11Display && !hasWaylandDisplay)) return;
+    if (process.env.URP_HDMI_AUTO_720P === '0') return;
+    if (wallConfig && wallConfig.hdmi720p === false) return;
+    var dims = getTargetVideoDims();
+    if (!dims.use720p) return;
+    if (!forceCheck && lastAppliedHdmiRes === '1280x720') return;
+
+    var wl = getWaylandEnv();
+    var script = "export DISPLAY=:0; export XAUTHORITY=\"" + getXauthPath() + "\"; " +
+                 "export XDG_RUNTIME_DIR=\"" + wl.runtimeDir + "\"; " +
+                 (wl.waylandDisplay ? "export WAYLAND_DISPLAY=\"" + wl.waylandDisplay + "\"; " : "") +
+                 "APPLIED=0; " +
+                 "OUT=$(xrandr --query 2>/dev/null | awk '/ connected/ && $1 !~ /^XWAYLAND/{print $1; exit}'); " +
+                 "if [ -n \"$OUT\" ]; then " +
+                 "  XQ=$(xrandr --query 2>/dev/null); " +
+                 "  CUR_LINE=$(echo \"$XQ\" | awk -v o=\"$OUT\" '$1==o{print; exit}'); " +
+                 "  if echo \"$CUR_LINE\" | grep -qE '(1280x720|720x1280)'; then APPLIED=already; " +
+                 "  elif echo \"$XQ\" | awk -v o=\"$OUT\" '$1==o{f=1;next} f && /^[^ ]/{exit} f{print}' | grep -q '1280x720'; then " +
+                 "    if xrandr --output \"$OUT\" --mode 1280x720 2>/dev/null; then APPLIED=x11_720p; fi; " +
+                 "  fi; " +
+                 "fi; " +
+                 "if [ \"$APPLIED\" = \"0\" ] && command -v wlr-randr >/dev/null 2>&1; then " +
+                 "  WOUT=$(wlr-randr 2>/dev/null | awk '/^HDMI|^DP|^DSI/{print $1; exit}'); " +
+                 "  if [ -n \"$WOUT\" ]; then " +
+                 "    if wlr-randr 2>/dev/null | awk -v o=\"$WOUT\" '$0 ~ \"^\"o{f=1;next} f && /^[^ ]/{exit} f{print}' | grep -qE '1280x720.*current'; then APPLIED=already; " +
+                 "    elif wlr-randr --output \"$WOUT\" --mode 1280x720 2>/dev/null; then APPLIED=wayland_720p; fi; " +
+                 "  fi; " +
+                 "fi; " +
+                 "echo \"HDMI720=$APPLIED\"";
+
+    exec(script, { timeout: 4000 }, function (err, stdout) {
+        if (!err && stdout) {
+            if (stdout.indexOf('HDMI720=x11_720p') !== -1 || stdout.indexOf('HDMI720=wayland_720p') !== -1) {
+                lastAppliedHdmiRes = '1280x720';
+                console.log('[DISPLAY] Salida HDMI/X11 ajustada automáticamente a 1280x720 para máxima fluidez.');
+                if (curtainProc != null) {
+                    try { process.kill(curtainProc.pid, 'SIGKILL'); } catch (e) {}
+                    curtainProc = null;
+                }
+            } else if (stdout.indexOf('HDMI720=already') !== -1) {
+                lastAppliedHdmiRes = '1280x720';
+            }
+        }
+    });
+}
+
 function startBlackCurtain() {
     if (!isArm && !isLinux) return;
     if (useDrmDirect || !hasX11Display) return;
@@ -768,6 +847,7 @@ function neutralizeDesktop() {
                   xEnv + "pkill -9 feh 2>/dev/null; " +
                   xEnv + "unclutter -idle 0.1 -root 2>/dev/null &";
         exec(cmd, function () {
+            applyDisplayResolution720pIfNeeded(false);
             applyDisplayRotationIfNeeded(function () {
                 startBlackCurtain();
             });
@@ -778,6 +858,7 @@ neutralizeDesktop();
 setInterval(function () {
     detectDisplaySession();
     suppressDesktopPopups();
+    applyDisplayResolution720pIfNeeded(false);
     applyDisplayRotationIfNeeded();
 }, 20000);
 
@@ -1202,7 +1283,8 @@ function playCurrentIndex() {
     }
 
     // CASO B: VIDEO (omxplayer legacy o mpv X11/Wayland/DRM con IPC activo)
-    console.log("[PLAYER:VIDEO] Reproduciendo: " + path.basename(fullPath) + (useDrmDirect ? " [DRM]" : "") + (mpvRotateDeg > 0 ? " [rot=" + mpvRotateDeg + "°]" : ""));
+    var curDims = getTargetVideoDims();
+    console.log("[PLAYER:VIDEO] Reproduciendo: " + path.basename(fullPath) + (useDrmDirect ? " [DRM]" : "") + (curDims.use720p ? " [720p]" : "") + (mpvRotateDeg > 0 ? " [rot=" + mpvRotateDeg + "°]" : ""));
 
     var wallModeOn = isWallActive();
     var playerBin = ((wallModeOn || useDrmDirect) && hasMpv) ? 'mpv' : (hasOmxplayer ? 'omxplayer' : (hasMpv ? 'mpv' : 'omxplayer'));
@@ -1214,6 +1296,9 @@ function playCurrentIndex() {
         playerArgs.push(fullPath);
     } else {
         try { if (fs.existsSync(mpvIpcSocketPath)) fs.unlinkSync(mpvIpcSocketPath); } catch (se) {}
+        var maxDemuxBytes = isLowPowerPi ? '6M' : '16M';
+        var maxBackBytes = isLowPowerPi ? '1M' : '4M';
+        var lavcThreads = isLowPowerPi ? '2' : '4';
         var mpvBaseArgs = [
             '--fs', '--no-osc', '--no-osd-bar', '--really-quiet',
             '--no-input-default-bindings', '--cursor-autohide=always', '--ontop',
@@ -1221,8 +1306,9 @@ function playCurrentIndex() {
             '--scale=bilinear', '--cscale=bilinear', '--dscale=bilinear',
             '--dither-depth=no', '--deband=no',
             '--vd-lavc-fast', '--vd-lavc-skiploopfilter=nonref',
+            '--vd-lavc-threads=' + lavcThreads,
             '--audio-fallback-to-null=yes',
-            '--cache=yes', '--demuxer-max-bytes=16M', '--demuxer-max-back-bytes=4M',
+            '--cache=yes', '--demuxer-max-bytes=' + maxDemuxBytes, '--demuxer-max-back-bytes=' + maxBackBytes,
             '--framedrop=vo',
             '--input-ipc-server=' + mpvIpcSocketPath
         ];
@@ -1249,7 +1335,8 @@ function playCurrentIndex() {
                 }
             }
             if (mpvPlaylistPaths.length > 1 && mpvPlaylistPaths.length === currentPlaylist.length) {
-                playerArgs = mpvBaseArgs.concat(['--prefetch-playlist=yes', '--loop-playlist=inf'], mpvPlaylistPaths);
+                var plFlags = isLowPowerPi ? ['--loop-playlist=inf'] : ['--prefetch-playlist=yes', '--loop-playlist=inf'];
+                playerArgs = mpvBaseArgs.concat(plFlags, mpvPlaylistPaths);
                 startSeamlessTelemetry(mpvTelemetryList);
                 usedMpvPlaylist = true;
                 console.log("[PLAYER:MPV] Modo playlist continua en ventana única (" + mpvPlaylistPaths.length + " videos).");
@@ -1409,9 +1496,12 @@ function emergencyDiskPlayback() {
         convertExistingImages();
 
         var curWallSig = getWallSignature();
+        var curResTag = getTargetVideoDims().use720p ? '_720p' : '';
         var videoFiles = diskFiles.filter(function (f) {
             if (!isVideoFile(f) || f.indexOf('.part') !== -1 || f.indexOf('temp_') !== -1) return false;
             if (/_\d+s\.mp4$/i.test(f)) {
+                if (curResTag && f.indexOf(curResTag) === -1) return false;
+                if (!curResTag && f.indexOf('_720p') !== -1) return false;
                 if (isWallTileActive()) {
                     if (f.indexOf('_' + curWallSig + '_') === -1) return false;
                 } else {
@@ -1768,12 +1858,21 @@ var renderQueue = [];
 var activeRenderOutPath = '';
 var activeRenderCallbacks = [];
 
+var renderDeferCount = 0;
 function processNextRender() {
     if (isRendering || renderQueue.length === 0) return;
     if (!bootGraceDone) {
         setTimeout(processNextRender, 3000);
         return;
     }
+    var bpReason = getEncodingBackpressureReason();
+    if (bpReason && renderDeferCount < 6) {
+        renderDeferCount++;
+        console.log('[RENDER] Posponiendo conversión 12s por ' + bpReason + '...');
+        setTimeout(processNextRender, 12000);
+        return;
+    }
+    renderDeferCount = 0;
 
     var job = renderQueue.shift();
     isRendering = true;
@@ -1822,6 +1921,7 @@ function processNextRender() {
     var dims = getTargetVideoDims();
     var targetW = dims.width;
     var targetH = dims.height;
+    var targetFpsStr = String(dims.fps || 24);
     var wallCrop = isWallTileActive() ? (getWallCropFilter() + ',') : '';
     var vf = wallCrop +
              'scale=' + targetW + ':' + targetH + ':force_original_aspect_ratio=decrease,' +
@@ -1831,17 +1931,18 @@ function processNextRender() {
 
     var ffArgs = [
         '-nostdin', '-y', '-loglevel', 'error',
-        '-loop', '1', '-framerate', '25', '-t', String(duration), '-i', file,
+        '-loop', '1', '-framerate', targetFpsStr, '-t', String(duration), '-i', file,
         '-f', 'lavfi', '-t', String(duration), '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
         '-vf', vf,
         '-c:v', 'libx264', '-threads', dims.threads, '-preset', 'ultrafast',
         '-profile:v', dims.profile, '-level', dims.level, '-pix_fmt', 'yuv420p',
-        '-r', '25', '-vsync', 'cfr', '-g', '25', '-bf', '0',
-        '-c:a', 'aac', '-b:a', '128k', '-t', String(duration), '-movflags', '+faststart',
+        '-r', targetFpsStr, '-vsync', 'cfr', '-g', targetFpsStr, '-bf', '0',
+        '-video_track_timescale', '12800',
+        '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '128k', '-t', String(duration), '-movflags', '+faststart',
         tmpPath
     ];
 
-    console.log('[RENDER] Convirtiendo imagen a video MP4 (' + duration + 's, ' + targetW + 'x' + targetH + '): ' + path.basename(file) + ' -> ' + path.basename(outPath));
+    console.log('[RENDER] Convirtiendo imagen a video MP4 (' + duration + 's, ' + targetW + 'x' + targetH + ' @' + targetFpsStr + 'fps): ' + path.basename(file) + ' -> ' + path.basename(outPath));
 
     var stderrLog = '';
     var ffProc = null;
@@ -1961,15 +2062,17 @@ function convertExistingImages(callback) {
                     }
                 }
             }
+            var dimsImg = getTargetVideoDims();
+            var resTagImg = dimsImg.use720p ? '_720p' : '';
             var wallTag = isWallTileActive() ? ('_' + getWallSignature()) : '';
-            var expectedVideo = contentBasePath + baseNoExt + wallTag + '_' + defaultDuration + 's.mp4';
+            var expectedVideo = contentBasePath + baseNoExt + resTagImg + wallTag + '_' + defaultDuration + 's.mp4';
             if (fileExist(expectedVideo)) {
                 try {
                     if (fs.statSync(expectedVideo).size > 4096) return next();
                     fs.unlinkSync(expectedVideo);
                 } catch (e) {}
             }
-            imgToVideo(contentBasePath + imgFile, baseNoExt + wallTag + '_' + defaultDuration + 's', defaultDuration, function () {
+            imgToVideo(contentBasePath + imgFile, baseNoExt + resTagImg + wallTag + '_' + defaultDuration + 's', defaultDuration, function () {
                 next();
             });
         }, function () {
@@ -1988,6 +2091,7 @@ var isOptimizingVideo = false;
 var activeVideoOptOutPath = '';
 var noOptNeededMap = {};
 var failedOptMap = {};
+var optDeferCount = 0;
 
 function getOptimizedVideoPath(srcPath) {
     try {
@@ -1999,7 +2103,7 @@ function getOptimizedVideoPath(srcPath) {
         var wallSuffix = wallSig ? ('_' + wallSig) : '';
         var baseName = path.basename(srcPath).replace(/\.[^/.]+$/, '');
         var safeBase = normalizeName(baseName).replace(/[^a-zA-Z0-9._-]/g, '_');
-        return optimizedBasePath + 'opt_' + safeBase + '_' + st.size + '_' + st.mtime.getTime() + '_' + ori + '_' + dims.width + 'x' + dims.height + wallSuffix + '_p2.mp4';
+        return optimizedBasePath + 'opt_' + safeBase + '_' + st.size + '_' + st.mtime.getTime() + '_' + ori + '_' + dims.width + 'x' + dims.height + wallSuffix + '_p3.mp4';
     } catch (e) {
         return null;
     }
@@ -2036,12 +2140,12 @@ function needsPiVideoOptimization(info) {
     var limitLong = dims.use720p ? 1280 : 1920;
     var limitShort = dims.use720p ? 720 : 1080;
     var maxFps = 26;
-    var maxBps = dims.use720p ? 3200000 : 6000000;
+    var maxBps = dims.use720p ? 2500000 : 5000000;
 
     if (dims.use720p && info.profile && /high/i.test(info.profile)) {
-        return { needed: true, reason: 'perfil ' + info.profile + ' pesado para 3B+' };
+        return { needed: true, reason: 'perfil ' + info.profile + ' pesado para 720p' };
     }
-    if (maxDim > limitLong || minDim > limitShort) return { needed: true, reason: 'resolucion ' + w + 'x' + h + ' -> ' + limitLong + 'p' };
+    if (maxDim > limitLong || minDim > limitShort) return { needed: true, reason: 'resolucion ' + w + 'x' + h + ' -> ' + dims.width + 'x' + dims.height };
     if (info.fps && info.fps > maxFps) return { needed: true, reason: info.fps.toFixed(1) + 'fps' };
     if (info.bitRate && info.bitRate > maxBps) return { needed: true, reason: (info.bitRate / 1000000).toFixed(1) + 'Mbps' };
     if (info.hasAudio && info.audioCodec && info.audioCodec !== 'aac' && info.audioCodec !== 'mp3') {
@@ -2056,6 +2160,14 @@ function processNextVideoOpt() {
         setTimeout(processNextVideoOpt, 3000);
         return;
     }
+    var bpReason = getEncodingBackpressureReason();
+    if (bpReason && optDeferCount < 6) {
+        optDeferCount++;
+        console.log('[OPT:VIDEO] Posponiendo normalización 15s por ' + bpReason + '...');
+        setTimeout(processNextVideoOpt, 15000);
+        return;
+    }
+    optDeferCount = 0;
 
     var job = videoOptQueue.shift();
     var srcPath = job.srcPath;
@@ -2094,26 +2206,28 @@ function processNextVideoOpt() {
         var dims = getTargetVideoDims();
         var maxW = dims.width;
         var maxH = dims.height;
-        var targetFps = (info.fps && info.fps > 0 && info.fps <= 25) ? Math.max(15, Math.round(info.fps)) : 25;
-        var tileMode = isWallTileActive();
-        var wallCrop = tileMode ? (getWallCropFilter() + ',') : '';
-        var tilePad = tileMode ? ('pad=' + maxW + ':' + maxH + ':(' + maxW + '-iw)/2:(' + maxH + '-ih)/2:black,') : '';
+        var targetFps = dims.fps || (dims.use720p ? 24 : 25);
+        var wallCrop = isWallTileActive() ? (getWallCropFilter() + ',') : '';
+        var padFilter = 'pad=' + maxW + ':' + maxH + ':(' + maxW + '-iw)/2:(' + maxH + '-ih)/2:black,';
         var vf = wallCrop +
                  'scale=' + maxW + ':' + maxH + ':force_original_aspect_ratio=decrease,' +
-                 'scale=trunc(iw/2)*2:trunc(ih/2)*2,' + tilePad + 'setsar=1,format=yuv420p';
+                 'scale=trunc(iw/2)*2:trunc(ih/2)*2,' + padFilter + 'setsar=1,format=yuv420p';
 
         var tmpPath = optimizedBasePath + 'temp_' + Date.now() + '_' + path.basename(outPath);
         if (fs.existsSync(tmpPath)) {
             try { fs.unlinkSync(tmpPath); } catch (e) {}
         }
 
-        var ffArgs = [
-            '-nostdin', '-y', '-loglevel', 'error',
-            '-i', srcPath,
+        var ffArgs = ['-nostdin', '-y', '-loglevel', 'error', '-i', srcPath];
+        var durStr = (info.duration && info.duration > 0) ? info.duration.toFixed(3) : '15.000';
+        if (!info.hasAudio) {
+            ffArgs.push('-f', 'lavfi', '-t', durStr, '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100');
+        }
+        ffArgs.push(
             '-vf', vf,
             '-c:v', 'libx264',
             '-threads', dims.threads,
-            '-preset', 'veryfast',
+            '-preset', dims.preset || 'ultrafast',
             '-profile:v', dims.profile,
             '-level', dims.level,
             '-pix_fmt', 'yuv420p',
@@ -2121,18 +2235,19 @@ function processNextVideoOpt() {
             '-vsync', 'cfr',
             '-g', String(targetFps),
             '-bf', '0',
+            '-video_track_timescale', '12800',
             '-crf', dims.crf,
             '-maxrate', dims.maxRate,
             '-bufsize', dims.bufSize
-        ];
+        );
         if (info.hasAudio) {
-            ffArgs.push('-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '128k');
+            ffArgs.push('-map', '0:v:0', '-map', '0:a:0', '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '128k');
         } else {
-            ffArgs.push('-an');
+            ffArgs.push('-map', '0:v:0', '-map', '1:a:0', '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '128k', '-shortest');
         }
         ffArgs.push('-movflags', '+faststart', tmpPath);
 
-        console.log('[OPT:VIDEO] Normalizando video en segundo plano (' + check.reason + '): ' + path.basename(srcPath));
+        console.log('[OPT:VIDEO] Normalizando video a ' + maxW + 'x' + maxH + ' @' + targetFps + 'fps (' + check.reason + '): ' + path.basename(srcPath));
 
         var finished = false;
         var ffProc = null;
@@ -2262,6 +2377,7 @@ function garbageCollectUnusedMedia(forceEmergency, callback) {
         if (activeRenderOutPath) markKeep(activeRenderOutPath);
 
         var wallTagImg = isWallTileActive() ? ('_' + getWallSignature()) : '';
+        var resTagGc = getTargetVideoDims().use720p ? '_720p' : '';
         for (var b = 0; b < scheduleArr.length; b++) {
             var blk = scheduleArr[b];
             var blkItems = blk.contents || [];
@@ -2276,7 +2392,7 @@ function garbageCollectUnusedMedia(forceEmergency, callback) {
                 if (isImg(safeName) || isImg(itm.content)) {
                     var dur = parseInt(itm.length, 10);
                     if (isNaN(dur) || dur <= 0) dur = 10;
-                    var imgVid = safeName.replace(/\.[^/.]+$/, '') + wallTagImg + '_' + dur + 's.mp4';
+                    var imgVid = safeName.replace(/\.[^/.]+$/, '') + resTagGc + wallTagImg + '_' + dur + 's.mp4';
                     markKeep(path.join(contentBasePath, imgVid));
                     resolvedBlockItems.push({ file: imgVid, duration: dur });
                 } else {
@@ -2352,8 +2468,9 @@ function fileSerch(contentToSearch, nameToSearch, timeToSearch) {
 
     if (isImg(safeContent) || isImg(contentToSearch)) {
         var baseNoExt = safeContent.replace(/\.[^/.]+$/, "");
+        var resTagImg = getTargetVideoDims().use720p ? '_720p' : '';
         var wallTagImg = isWallTileActive() ? ('_' + getWallSignature()) : '';
-        var videoBase = baseNoExt + wallTagImg + '_' + duration + 's';
+        var videoBase = baseNoExt + resTagImg + wallTagImg + '_' + duration + 's';
         var videoName = videoBase + '.mp4';
         var videoPath = contentBasePath + videoName;
 
@@ -2579,6 +2696,7 @@ function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
         var dims = getTargetVideoDims();
         var targetW = dims.width;
         var targetH = dims.height;
+        var targetFps = dims.fps || (dims.use720p ? 24 : 25);
         var tmpPath = seamlessBasePath + 'temp_' + Date.now() + '_' + path.basename(outPath);
         var concatListPath = null;
         var ffArgs = [];
@@ -2587,7 +2705,7 @@ function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
             return pi.videoCodec === 'h264' &&
                    (pi.pixFmt === 'yuv420p' || pi.pixFmt === 'yuvj420p') &&
                    pi.width === targetW && pi.height === targetH &&
-                   pi.fps >= 23 && pi.fps <= 26 &&
+                   pi.fps >= 22 && pi.fps <= 26 &&
                    pi.hasAudio && pi.audioCodec === 'aac' &&
                    pi.audioSampleRate === 44100 && pi.audioChannels === 2;
         });
@@ -2632,7 +2750,7 @@ function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
                     '[' + vIdx + ':v]' + segCrop + 'scale=' + targetW + ':' + targetH + ':force_original_aspect_ratio=decrease,' +
                     'scale=trunc(iw/2)*2:trunc(ih/2)*2,' +
                     'pad=' + targetW + ':' + targetH + ':(' + targetW + '-iw)/2:(' + targetH + '-ih)/2:black,' +
-                    'setsar=1,fps=25,format=yuv420p[v' + i + ']'
+                    'setsar=1,fps=' + targetFps + ',format=yuv420p[v' + i + ']'
                 );
 
                 if (pi.hasAudio) {
@@ -2652,9 +2770,10 @@ function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
                 '-map', '[outv]', '-map', '[outa]',
                 '-c:v', 'libx264', '-threads', dims.threads, '-preset', 'ultrafast',
                 '-profile:v', dims.profile, '-level', dims.level, '-pix_fmt', 'yuv420p',
-                '-r', '25', '-vsync', 'cfr', '-g', '25', '-bf', '0',
+                '-r', String(targetFps), '-vsync', 'cfr', '-g', String(targetFps), '-bf', '0',
+                '-video_track_timescale', '12800',
                 '-crf', dims.crf, '-maxrate', dims.maxRate, '-bufsize', dims.bufSize,
-                '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
+                '-c:a', 'aac', '-ar', '44100', '-ac', '2', '-b:a', '128k', '-movflags', '+faststart',
                 tmpPath
             );
         }
@@ -3587,6 +3706,133 @@ function getTailscaleIp() {
     return '';
 }
 
+var lastAppliedHostname = '';
+var hostnameSyncBusy = false;
+function sanitizeHostname(rawStr) {
+    if (!rawStr) return '';
+    var s = String(rawStr);
+    if (typeof s.normalize === 'function') {
+        s = s.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+    }
+    s = s.toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '');
+    if (s.length > 63) {
+        s = s.slice(0, 63).replace(/-+$/g, '');
+    }
+    if (!/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(s)) return '';
+    return s;
+}
+
+function resolveManagerHostname(data) {
+    if (!data || typeof data !== 'object') return { hostname: '', label: '' };
+    var rawDisp = data.displayName || data.nombreDisplay || data.urpName || data.name || data.nombre || data.screenName || data.title || data.alias || data.display || '';
+    var rawStore = data.storeName || data.nombreSucursal || data.sucursal || data.branchName || data.localName || data.local || data.tienda || '';
+    var explicitHost = data.hostname || data.hostName || '';
+    var label = rawStore && rawDisp && String(rawDisp).toLowerCase().indexOf(String(rawStore).toLowerCase()) === -1
+        ? (rawStore + ' - ' + rawDisp)
+        : (rawDisp || rawStore || explicitHost || '');
+
+    var candidate = '';
+    if (explicitHost) {
+        candidate = sanitizeHostname(explicitHost);
+    } else if (rawStore && rawDisp) {
+        var normDisp = sanitizeHostname(rawDisp);
+        var normStore = sanitizeHostname(rawStore);
+        candidate = (normDisp.indexOf(normStore) === 0) ? normDisp : sanitizeHostname(normStore + '-' + normDisp);
+    } else if (rawDisp) {
+        candidate = sanitizeHostname(rawDisp);
+    } else if (rawStore && (data.idDisplay || data.idURP)) {
+        candidate = sanitizeHostname(rawStore + '-d' + (data.idDisplay || data.idURP));
+    }
+
+    if (!candidate && (data.idDisplay || data.idURP)) {
+        var parts = ['urp'];
+        if (data.idStore) parts.push('s' + parseInt(data.idStore, 10));
+        if (data.idDisplay) parts.push('d' + parseInt(data.idDisplay, 10));
+        else if (data.idURP) parts.push('u' + parseInt(data.idURP, 10));
+        candidate = sanitizeHostname(parts.join('-'));
+    }
+    return { hostname: candidate, label: String(label || candidate || '').trim() };
+}
+
+function syncSystemAndTailscaleHostname(targetHost) {
+    if (!isArm && !isLinux) return;
+    if (process.env.URP_AUTO_HOSTNAME === '0') return;
+    var cleanHost = sanitizeHostname(targetHost);
+    if (!cleanHost || hostnameSyncBusy) return;
+    var currentOsHost = '';
+    try { currentOsHost = sanitizeHostname(osMod.hostname()); } catch (e) {}
+    if (cleanHost === lastAppliedHostname && cleanHost === currentOsHost) return;
+
+    hostnameSyncBusy = true;
+    var cmd = '';
+    if (cleanHost !== currentOsHost) {
+        cmd += 'if command -v hostnamectl >/dev/null 2>&1; then sudo -n hostnamectl set-hostname "' + cleanHost + '" 2>/dev/null || hostnamectl set-hostname "' + cleanHost + '" 2>/dev/null || true; fi; ';
+    }
+    cmd += 'if command -v tailscale >/dev/null 2>&1; then sudo -n tailscale set --hostname="' + cleanHost + '" 2>/dev/null || tailscale set --hostname="' + cleanHost + '" 2>/dev/null || true; fi';
+
+    exec(cmd, { timeout: 8000 }, function () {
+        hostnameSyncBusy = false;
+        lastAppliedHostname = cleanHost;
+        console.log('[HOSTNAME] Sincronizado desde Manager -> ' + cleanHost + ' (Linux + Tailscale)');
+    });
+}
+
+var tailscaleEnrollBusy = false;
+var tailscaleEnrollAttempted = false;
+function readTailscaleAuthKey(mgrAuthKey) {
+    var candidates = [
+        mgrAuthKey,
+        process.env.TS_AUTHKEY,
+        process.env.URP_TS_AUTHKEY
+    ];
+    var keyFiles = [
+        basePath + '.tailscale_key',
+        '/boot/firmware/urp_tailscale_key.txt',
+        '/boot/urp_tailscale_key.txt'
+    ];
+    for (var f = 0; f < keyFiles.length; f++) {
+        try {
+            if (fs.existsSync(keyFiles[f])) {
+                candidates.push(fs.readFileSync(keyFiles[f], 'utf8'));
+            }
+        } catch (e) {}
+    }
+    for (var i = 0; i < candidates.length; i++) {
+        var k = String(candidates[i] || '').trim();
+        if (/^tskey-[a-zA-Z0-9_-]{12,}$/.test(k)) return k;
+    }
+    return '';
+}
+
+function ensureTailscaleEnrolled(targetHost, mgrAuthKey) {
+    if (!isArm && !isLinux) return;
+    if (tailscaleEnrollBusy || tailscaleEnrollAttempted) return;
+    if (getTailscaleIp()) return;
+    var authKey = readTailscaleAuthKey(mgrAuthKey);
+    if (!authKey) return;
+
+    tailscaleEnrollBusy = true;
+    tailscaleEnrollAttempted = true;
+    var cleanHost = sanitizeHostname(targetHost) || sanitizeHostname(osMod.hostname()) || 'urp-player';
+    console.log('[TAILSCALE] Intentando alta automática con hostname "' + cleanHost + '"...');
+
+    var cmd = 'if ! command -v tailscale >/dev/null 2>&1; then curl -fsSL https://tailscale.com/install.sh | sudo -n sh; fi && ' +
+              '(sudo -n systemctl enable --now tailscaled >/dev/null 2>&1 || true) && ' +
+              '(sudo -n tailscale up --auth-key="' + authKey + '" --hostname="' + cleanHost + '" --accept-dns=true || tailscale up --auth-key="' + authKey + '" --hostname="' + cleanHost + '" --accept-dns=true)';
+
+    exec(cmd, { timeout: 120000 }, function (err) {
+        tailscaleEnrollBusy = false;
+        var tsIp = getTailscaleIp();
+        if (tsIp) {
+            console.log('[TAILSCALE] Equipo dado de alta automáticamente! IP remota: ' + tsIp + ' (:' + URPPort + ')');
+        } else if (err) {
+            console.warn('[TAILSCALE] No se pudo completar alta automática:', err.message);
+        }
+    });
+}
+
 function execScreenshot(callback) {
     var outShot = basePath + 'screenshot.jpg';
     if (!isArm && !isLinux) {
@@ -3967,6 +4213,14 @@ function callWS() {
                         URPdata.autoRebootMinute = data.autoRebootMinute;
                         URPdata.vertical = (data.vertical == 1);
 
+                        var mgrHostInfo = resolveManagerHostname(data);
+                        if (mgrHostInfo.label) URPdata.managerName = mgrHostInfo.label;
+                        if (mgrHostInfo.hostname) {
+                            URPdata.managerHostname = mgrHostInfo.hostname;
+                            syncSystemAndTailscaleHostname(mgrHostInfo.hostname);
+                        }
+                        ensureTailscaleEnrolled(mgrHostInfo.hostname, data.tailscaleAuthKey || data.tsAuthKey || '');
+
                         if (data.cleanLogs == 1 || data.cleanLogs === '1') cleanLogs();
                         if (data.uploadLogs == 1 || data.uploadLogs === '1') uploadLogs();
                         if (data.screenshot == 1 || data.screenshot === '1') takeScreenshot();
@@ -4176,13 +4430,15 @@ function writeHdmiRotateToConfig(rot) {
 
 function clearWallDerivedCaches() {
     failedSeamlessHashes = {};
+    noOptNeededMap = {};
+    failedOptMap = {};
     clearDirectoryFiles(optimizedBasePath);
     clearDirectoryFiles(seamlessBasePath);
     try {
         if (fs.existsSync(contentBasePath)) {
             var cfiles = fs.readdirSync(contentBasePath);
             for (var i = 0; i < cfiles.length; i++) {
-                if (/_W[TM][^_]*_.*_\d+s\.mp4$/i.test(cfiles[i]) || /_WM_\d+s\.mp4$/i.test(cfiles[i])) {
+                if (/_W[TM][^_]*_.*_\d+s\.mp4$/i.test(cfiles[i]) || /_WM_\d+s\.mp4$/i.test(cfiles[i]) || /_720p.*_\d+s\.mp4$/i.test(cfiles[i])) {
                     try { fs.unlinkSync(path.join(contentBasePath, cfiles[i])); } catch (e) {}
                 }
             }
@@ -4258,7 +4514,7 @@ function buildLocalDashboardHtml() {
         '.warnBox{padding:9px 11px;border-radius:8px;background:#291d09;border:1px solid #b45309;color:#fde68a;font-size:12px;margin-top:8px;display:none;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}' +
         '.chkRow{display:flex;align-items:center;gap:8px;font-size:13px;color:#e2e8f0;padding-top:6px}' +
         '</style></head><body><div class="wrap">' +
-        '<div class="top"><div><h1>URP Signage Monitor <span id="ver"></span></h1><div class="sub" id="meta">Cargando...</div></div>' +
+        '<div class="top"><div><h1><span id="titleMain">URP Signage Monitor</span> <span id="ver"></span></h1><div class="sub" id="meta">Cargando...</div></div>' +
         '<div class="sub" id="conn"></div></div>' +
         '<div id="msgBox" class="msg"></div>' +
 
@@ -4342,7 +4598,14 @@ function buildLocalDashboardHtml() {
         '<option value="2">180° Invertido</option>' +
         '<option value="3">270° Vertical Izquierda</option>' +
         '</select></div>' +
-        '<div><label class="lbl" for="wSync">Sincronización</label><select id="wSync">' +
+        '<div><label class="lbl" for="wResMode">Resolución de Video / Imágenes</label><select id="wResMode">' +
+        '<option value="auto">Automática (720p en Pi 3 / 1080p en Pi 4-5)</option>' +
+        '<option value="720p">1280x720 (720p Fluido - Recomendado Pi 3B+)</option>' +
+        '<option value="1080p">1920x1080 (Full HD 1080p)</option>' +
+        '</select></div>' +
+        '</div>' +
+        '<div class="fgrid">' +
+        '<div><label class="lbl" for="wSync">Sincronización Video Wall</label><select id="wSync">' +
         '<option value="ntp">NTP automático (sin Master)</option>' +
         '<option value="master">Master LAN (esta Pi es reloj :8090)</option>' +
         '<option value="slave">Slave LAN (seguir IP de Master)</option>' +
@@ -4350,6 +4613,7 @@ function buildLocalDashboardHtml() {
         '<div id="wMasterWrap"><label class="lbl" for="wMasterIp">IP del Master LAN</label><input type="text" id="wMasterIp" placeholder="Ej: 192.168.1.50"></div>' +
         '</div>' +
 
+        '<label class="chkRow"><input type="checkbox" id="wHdmi720"> Ajustar salida HDMI/X11 a 1280x720 cuando el modo esté en 720p (baja CPU y RAM)</label>' +
         '<label class="chkRow"><input type="checkbox" id="wDrm"> Salida DRM/KMS directa (forzar mpv sin X11/Wayland)</label>' +
 
         '<div id="wWarn" class="warnBox"><span id="wWarnTxt"></span><button type="button" id="btnAutoExpand" class="b-amber">Ajustar matriz a 1&times;ID</button></div>' +
@@ -4444,6 +4708,8 @@ function buildLocalDashboardHtml() {
         '  else if (cfg.syncMode === "master") { byId("wSync").value = "master"; }' +
         '  else { byId("wSync").value = "ntp"; }' +
         '  byId("wMasterIp").value = cfg.masterIp || "";' +
+        '  byId("wResMode").value = (cfg.resolutionMode === "720p" || cfg.resolutionMode === "1080p") ? cfg.resolutionMode : "auto";' +
+        '  byId("wHdmi720").checked = (cfg.hdmi720p !== false);' +
         '  byId("wDrm").checked = Boolean(cfg.drmMode);' +
         '  byId("vwSub").textContent = "Control tbee.tv ahora: " + (serverFlag ? "ACTIVO" : "DESACTIVADO") + " | Soporta IDs 1..999 y matrices hasta 32x32";' +
         '  updateWallPreview();' +
@@ -4517,8 +4783,11 @@ function buildLocalDashboardHtml() {
         'function refresh(){' +
         '  fetch("/api/status").then(function(r){ return r.json(); }).then(function(s){' +
         '    lastStatus = s;' +
+        '    var displayTitle = s.managerName || s.hostname || "URP Signage Monitor";' +
+        '    byId("titleMain").textContent = displayTitle;' +
+        '    document.title = displayTitle + " • v" + s.version;' +
         '    byId("ver").textContent = "v" + s.version;' +
-        '    byId("meta").textContent = (s.model || "Linux") + " • IP " + (s.ip || "-") + (s.tailscaleIp ? (" • Tailscale " + s.tailscaleIp) : "") + " • " + s.displayBackend;' +
+        '    byId("meta").textContent = (s.model || "Linux") + " • Host " + (s.hostname || "-") + " • IP " + (s.ip || "-") + (s.tailscaleIp ? (" • Tailscale " + s.tailscaleIp) : "") + " • " + s.displayBackend + (s.targetResolution ? (" • " + s.targetResolution) : "");' +
         '    byId("conn").textContent = s.connection ? "tbee.tv ONLINE" : "MODO OFFLINE";' +
         '    var pl = s.player || {};' +
         '    var playingLabel = (pl.file || s.filesPlaying.join(", ") || "En espera");' +
@@ -4564,7 +4833,9 @@ function buildLocalDashboardHtml() {
         '    orientation: clampInt(byId("wOrient").value, 0, 3, 0),' +
         '    syncMode: (syncVal === "ntp") ? "ntp" : "master",' +
         '    masterIp: (syncVal === "slave") ? masterIp : "",' +
-        '    drmMode: Boolean(byId("wDrm").checked)' +
+        '    drmMode: Boolean(byId("wDrm").checked),' +
+        '    resolutionMode: byId("wResMode").value,' +
+        '    hdmi720p: Boolean(byId("wHdmi720").checked)' +
         '  };' +
         '  fetch("/api/wall", {' +
         '    method: "POST",' +
@@ -4640,11 +4911,15 @@ app.get('/', function (req, res) {
 app.get('/api/status', function (req, res) {
     loadWallConfig();
     var buildPayload = function (pl) {
+        var dimsNow = getTargetVideoDims();
         res.json({
             version: URPVersion,
             model: piModelStr,
+            hostname: osMod.hostname(),
+            managerName: URPdata.managerName || '',
             totalRamMB: totalRamMB,
             displayBackend: useDrmDirect ? 'DRM/KMS' : (hasWaylandDisplay ? 'Wayland' : 'X11'),
+            targetResolution: dimsNow.width + 'x' + dimsNow.height + (dimsNow.use720p ? ' (720p)' : ' (1080p)'),
             ip: URPdata.URPIpAddress || '',
             tailscaleIp: getTailscaleIp(),
             mac: macAdd,
@@ -4822,6 +5097,7 @@ app.post('/api/wall', function (req, res) {
             var effIdx = (screenId - 1) % total;
             var orientation = [0, 1, 2, 3].indexOf(parseInt(body.orientation, 10)) !== -1 ? parseInt(body.orientation, 10) : 0;
             var actMode = (body.activationMode === 'server' || body.activationMode === 'local') ? body.activationMode : 'local';
+            var resMode = (body.resolutionMode === '720p' || body.resolutionMode === '1080p') ? body.resolutionMode : 'auto';
             var nextCfg = {
                 enabled: (actMode === 'server') ? true : Boolean(body.enabled),
                 activationMode: actMode,
@@ -4836,6 +5112,8 @@ app.post('/api/wall', function (req, res) {
                 syncMode: (body.syncMode === 'master') ? 'master' : 'ntp',
                 masterIp: String(body.masterIp || '').trim(),
                 drmMode: Boolean(body.drmMode),
+                resolutionMode: resMode,
+                hdmi720p: (body.hdmi720p === undefined) ? true : Boolean(body.hdmi720p),
                 updatedAt: new Date().toISOString()
             };
 
@@ -4845,6 +5123,8 @@ app.post('/api/wall', function (req, res) {
             fs.renameSync(tmpPath, wallConfigPath);
             wallConfigMtime = 0;
             loadWallConfig();
+            lastAppliedHdmiRes = '';
+            applyDisplayResolution720pIfNeeded(true);
 
             var rotChanged = (orientation !== prevRot);
             var rotUpdated = false;
