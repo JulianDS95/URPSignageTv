@@ -1,6 +1,6 @@
 var URPActive = true;
 var URPType = 'URPPI3';
-var URPVersion = '2.5.0';
+var URPVersion = '2.5.5';
 var URPUpdated = false;
 var isArm = process.arch === 'arm' || process.arch === 'arm64';
 var isLinux = process.platform === 'linux';
@@ -38,6 +38,9 @@ var freeDiskMb = -1;
 var temperature = 0;
 var memPercentUsed = 0;
 var cpuUsage = 0;
+var throttleStatus = { raw: '0x0', ok: true, underVoltageNow: false, underVoltagePast: false, throttledNow: false, label: 'OK' };
+var isScreenPoweredOff = false;
+var manualScreenOffOverride = null;
 var blockPlaying = 0;
 var respuesta = false;
 var isRendering = false;
@@ -63,7 +66,7 @@ var async = require('async');
 // 0. BUFFER DE LOGS EN MEMORIA (para Panel Web Local :8090) + ROLLBACK OTA
 // ==============================================================================
 var recentLogs = [];
-var MAX_RECENT_LOGS = 80;
+var MAX_RECENT_LOGS = 200;
 function pushLogLine(levelTag, argsArr) {
     try {
         var msg = Array.prototype.slice.call(argsArr).map(function (a) {
@@ -164,9 +167,143 @@ setTimeout(function () {
     bootGraceDone = true;
     if (Array.isArray(schedule) && schedule.length > 0) {
         checkSchedule();
-        setTimeout(prebuildAllScheduleBlocks, 2500);
+        if (getTargetVideoDims().convertEnabled) {
+            setTimeout(prebuildAllScheduleBlocks, 2500);
+        }
     }
 }, 5000);
+
+var mpvCaps = {
+    probed: false,
+    glChecked: false,
+    hwdecs: [],
+    vos: [],
+    gpuContexts: [],
+    options: {},
+    glRenderer: '',
+    isSoftwareGl: false
+};
+var mpvSafeFallback = false;
+var activeMpvDriverInfo = '';
+
+function mpvHasOption(name) {
+    return Boolean(mpvCaps && mpvCaps.options && mpvCaps.options[name]);
+}
+function mpvHasVo(name) {
+    return Boolean(mpvCaps && Array.isArray(mpvCaps.vos) && mpvCaps.vos.indexOf(name) !== -1);
+}
+function mpvHasGpuCtx(name) {
+    return Boolean(mpvCaps && Array.isArray(mpvCaps.gpuContexts) && mpvCaps.gpuContexts.indexOf(name) !== -1);
+}
+function mpvFilterHwdecs(candidates) {
+    if (!mpvCaps || !Array.isArray(mpvCaps.hwdecs) || mpvCaps.hwdecs.length === 0) return [];
+    var out = [];
+    for (var i = 0; i < candidates.length; i++) {
+        if (mpvCaps.hwdecs.indexOf(candidates[i]) !== -1 && out.indexOf(candidates[i]) === -1) {
+            out.push(candidates[i]);
+        }
+    }
+    return out;
+}
+
+function detectMpvCapabilities() {
+    if (!isArm && !isLinux) return;
+    if (!hasMpv) return;
+    if (!mpvCaps.probed) {
+        mpvCaps.probed = true;
+        try {
+            var hwOut = execSync('mpv --hwdec=help 2>/dev/null || true', { timeout: 2500, encoding: 'utf8' });
+            var hwLines = String(hwOut || '').split(/\r?\n/);
+            for (var hi = 0; hi < hwLines.length; hi++) {
+                var hm = /^\s+([a-z0-9_-]+)/i.exec(hwLines[hi]);
+                if (hm && hm[1] && hm[1] !== 'no' && mpvCaps.hwdecs.indexOf(hm[1]) === -1) {
+                    mpvCaps.hwdecs.push(hm[1]);
+                }
+            }
+        } catch (e) {}
+        try {
+            var voOut = execSync('mpv --vo=help 2>/dev/null || true', { timeout: 2500, encoding: 'utf8' });
+            var voLines = String(voOut || '').split(/\r?\n/);
+            for (var vi = 0; vi < voLines.length; vi++) {
+                var vm = /^\s+([a-z0-9_-]+)/i.exec(voLines[vi]);
+                if (vm && vm[1] && mpvCaps.vos.indexOf(vm[1]) === -1) {
+                    mpvCaps.vos.push(vm[1]);
+                }
+            }
+        } catch (e) {}
+        try {
+            var gcOut = execSync('mpv --gpu-context=help 2>/dev/null || true', { timeout: 2500, encoding: 'utf8' });
+            var gcLines = String(gcOut || '').split(/\r?\n/);
+            for (var gi = 0; gi < gcLines.length; gi++) {
+                var gm = /^\s+([a-z0-9_-]+)/i.exec(gcLines[gi]);
+                if (gm && gm[1] && gm[1] !== 'auto' && mpvCaps.gpuContexts.indexOf(gm[1]) === -1) {
+                    mpvCaps.gpuContexts.push(gm[1]);
+                }
+            }
+        } catch (e) {}
+        try {
+            var optOut = execSync('mpv --list-options 2>/dev/null || true', { timeout: 3000, encoding: 'utf8' });
+            var optLines = String(optOut || '').split(/\r?\n/);
+            for (var oi = 0; oi < optLines.length; oi++) {
+                var om = /^\s+--([a-z0-9-]+)/i.exec(optLines[oi]);
+                if (om && om[1]) mpvCaps.options[om[1]] = true;
+            }
+        } catch (e) {}
+    }
+    if (hasX11Display && !mpvCaps.glChecked) {
+        mpvCaps.glChecked = true;
+        try {
+            var glEnv = Object.assign({}, process.env, { DISPLAY: process.env.DISPLAY || ':0', XAUTHORITY: getXauthPath() });
+            var glOut = execSync('glxinfo -B 2>/dev/null || true', { env: glEnv, timeout: 2500, encoding: 'utf8' });
+            var rm = /OpenGL renderer string:\s*(.+)/i.exec(String(glOut || ''));
+            if (!rm) {
+                var es2Out = execSync('es2_info 2>/dev/null || true', { env: glEnv, timeout: 2500, encoding: 'utf8' });
+                rm = /GL_RENDERER\s*[:=]\s*(.+)/i.exec(String(es2Out || ''));
+            }
+            if (rm && rm[1]) {
+                mpvCaps.glRenderer = rm[1].trim();
+                mpvCaps.isSoftwareGl = /llvmpipe|softpipe|swrast/i.test(mpvCaps.glRenderer);
+            } else {
+                var hasRenderNode = false;
+                try {
+                    if (fs.existsSync('/dev/dri')) {
+                        var driList = fs.readdirSync('/dev/dri');
+                        for (var di = 0; di < driList.length; di++) {
+                            if (/^renderD\d+/.test(driList[di])) { hasRenderNode = true; break; }
+                        }
+                    }
+                } catch (de) {}
+                var hasVcKmod = false;
+                try {
+                    var lsmodOut = execSync('lsmod 2>/dev/null || true', { timeout: 1500, encoding: 'utf8' });
+                    hasVcKmod = /^(vc4|v3d)\b/m.test(String(lsmodOut || ''));
+                } catch (ke) {}
+                var xorgFbdev = false;
+                var xLogs = ['/var/log/Xorg.0.log', (process.env.HOME || '/home/pi') + '/.local/share/xorg/Xorg.0.log'];
+                for (var xi = 0; xi < xLogs.length; xi++) {
+                    try {
+                        if (fs.existsSync(xLogs[xi])) {
+                            var xtxt = fs.readFileSync(xLogs[xi], 'utf8');
+                            if (/FBDEV\(0\)|glamor initialization failed|Failed to initialize glamor|not DRI2 capable|llvmpipe|swrast/i.test(xtxt)) {
+                                xorgFbdev = true;
+                                break;
+                            }
+                        }
+                    } catch (xe) {}
+                }
+                if (!hasRenderNode || !hasVcKmod || xorgFbdev || isLowPowerPi) {
+                    mpvCaps.isSoftwareGl = true;
+                    mpvCaps.glRenderer = xorgFbdev ? 'Xorg-FBDEV (sin glamor)' : (!hasRenderNode ? 'Sin nodo /dev/dri/renderD*' : 'X11 Ligero (OpenGL no confirmado)');
+                }
+            }
+            if (mpvCaps.isSoftwareGl) {
+                console.warn('[DISPLAY:GPU] Modo X11 ligero activo (' + mpvCaps.glRenderer + '). Se evita OpenGL por software para mantener CPU baja.');
+            } else if (mpvCaps.glRenderer) {
+                console.log('[DISPLAY:GPU] Aceleración OpenGL detectada: ' + mpvCaps.glRenderer);
+            }
+        } catch (e) {}
+    }
+}
 
 function detectDisplaySession() {
     if (!isArm && !isLinux) return;
@@ -191,8 +328,10 @@ function detectDisplaySession() {
             }
         }
     } catch (e) {}
-    var forceDrm = (process.env.URP_DRM_MODE === '1') || Boolean(wallConfig && wallConfig.drmMode);
-    useDrmDirect = hasMpv && (forceDrm || (!hasX11Display && !hasWaylandDisplay));
+    detectMpvCapabilities();
+    var outMode = (wallConfig && wallConfig.videoOutputMode) ? wallConfig.videoOutputMode : 'auto';
+    var forceDrm = (process.env.URP_DRM_MODE === '1') || Boolean(wallConfig && (wallConfig.drmMode || outMode === 'drm'));
+    useDrmDirect = hasMpv && ((forceDrm && !hasX11Display && !hasWaylandDisplay) || (!hasX11Display && !hasWaylandDisplay));
 }
 
 if (isArm || isLinux) {
@@ -232,10 +371,31 @@ var wallConfig = {
     drmMode: false,
     resolutionMode: 'auto',
     hdmi720p: true,
-    orientationOverride: false
+    orientationOverride: false,
+    videoOutputMode: 'auto',
+    audioVolume: 100,
+    audioMuted: false,
+    audioOutput: 'auto',
+    screenScheduleEnabled: false,
+    screenOnTime: '08:00',
+    screenOffTime: '22:00',
+    showStandbyScreen: true,
+    remoteConfigVersion: 0,
+    panelPinHash: ''
 };
 var wallConfigMtime = 0;
 var lastWallSignatureLogged = '';
+
+function sanitizeTimeHHMM(val, fallback) {
+    var s = String(val || '').trim();
+    return /^([01]\d|2[0-3]):([0-5]\d)$/.test(s) ? s : fallback;
+}
+
+function getWallConfigPublic() {
+    var copy = Object.assign({}, wallConfig);
+    delete copy.panelPinHash;
+    return copy;
+}
 
 function loadWallConfig() {
     try {
@@ -244,7 +404,11 @@ function loadWallConfig() {
                 enabled: false, activationMode: 'server', mode: 'mirror', screenId: 1,
                 rows: 1, cols: 1, row: 0, col: 0, bezelPx: 0,
                 orientation: 0, syncMode: 'ntp', masterIp: '', drmMode: false,
-                resolutionMode: 'auto', hdmi720p: true, orientationOverride: false
+                resolutionMode: 'auto', hdmi720p: true, orientationOverride: false,
+                videoOutputMode: 'auto',
+                audioVolume: 100, audioMuted: false, audioOutput: 'auto',
+                screenScheduleEnabled: false, screenOnTime: '08:00', screenOffTime: '22:00',
+                showStandbyScreen: true, remoteConfigVersion: 0, panelPinHash: ''
             };
             wallConfigMtime = 0;
             detectDisplaySession();
@@ -269,9 +433,17 @@ function loadWallConfig() {
         var actMode = (parsed.activationMode === 'server' || parsed.activationMode === 'local')
             ? parsed.activationMode
             : 'local';
-        var resMode = (parsed.resolutionMode === '720p' || parsed.resolutionMode === '1080p')
+        var resMode = (parsed.resolutionMode === '720p' || parsed.resolutionMode === '1080p' || parsed.resolutionMode === 'direct')
             ? parsed.resolutionMode
             : 'auto';
+
+        var voMode = (parsed.videoOutputMode === 'x11_light' || parsed.videoOutputMode === 'gpu_egl' || parsed.videoOutputMode === 'drm')
+            ? parsed.videoOutputMode
+            : (parsed.drmMode ? 'drm' : 'auto');
+        var audVol = (typeof parsed.audioVolume === 'number' && !isNaN(parsed.audioVolume))
+            ? Math.max(0, Math.min(100, Math.round(parsed.audioVolume)))
+            : 100;
+        var audOut = (parsed.audioOutput === 'hdmi' || parsed.audioOutput === 'jack') ? parsed.audioOutput : 'auto';
 
         wallConfig = {
             enabled: Boolean(parsed.enabled),
@@ -286,10 +458,20 @@ function loadWallConfig() {
             orientation: [0, 1, 2, 3].indexOf(parseInt(parsed.orientation, 10)) !== -1 ? parseInt(parsed.orientation, 10) : 0,
             syncMode: (parsed.syncMode === 'master') ? 'master' : 'ntp',
             masterIp: String(parsed.masterIp || '').trim(),
-            drmMode: Boolean(parsed.drmMode),
+            drmMode: Boolean(parsed.drmMode || voMode === 'drm'),
             resolutionMode: resMode,
             hdmi720p: (parsed.hdmi720p === undefined) ? true : Boolean(parsed.hdmi720p),
-            orientationOverride: Boolean(parsed.orientationOverride)
+            orientationOverride: Boolean(parsed.orientationOverride),
+            videoOutputMode: voMode,
+            audioVolume: audVol,
+            audioMuted: Boolean(parsed.audioMuted),
+            audioOutput: audOut,
+            screenScheduleEnabled: Boolean(parsed.screenScheduleEnabled),
+            screenOnTime: sanitizeTimeHHMM(parsed.screenOnTime, '08:00'),
+            screenOffTime: sanitizeTimeHHMM(parsed.screenOffTime, '22:00'),
+            showStandbyScreen: (parsed.showStandbyScreen === undefined) ? true : Boolean(parsed.showStandbyScreen),
+            remoteConfigVersion: Math.max(0, parseInt(parsed.remoteConfigVersion, 10) || 0),
+            panelPinHash: (typeof parsed.panelPinHash === 'string' && parsed.panelPinHash.indexOf(':') > 0) ? parsed.panelPinHash : ''
         };
         wallConfigMtime = st.mtime.getTime();
         detectDisplaySession();
@@ -297,7 +479,9 @@ function loadWallConfig() {
         var sig = wallConfig.activationMode + '_' + wallConfig.enabled + '_' + wallConfig.mode + '_' + wallConfig.rows + 'x' + wallConfig.cols + '_id' + wallConfig.screenId + '_' + wallConfig.syncMode + '_drm' + useDrmDirect + '_res' + wallConfig.resolutionMode;
         if (sig !== lastWallSignatureLogged) {
             lastWallSignatureLogged = sig;
-            console.log('[DISPLAY:SESION] Salida=' + (useDrmDirect ? 'DRM/KMS directo (sin X11)' : (hasWaylandDisplay ? 'Wayland' : 'X11')) + ' | Render=' + (getTargetVideoDims().use720p ? '1280x720 (720p Fluido)' : '1920x1080 (1080p)'));
+            var dimsLog = getTargetVideoDims();
+            var modeDesc = (dimsLog.mode === 'direct' && !isWallTileActive()) ? ('Directo sin ffmpeg (HDMI ' + (dimsLog.use720p ? '720p' : 'nativo') + ')') : ((dimsLog.mode === 'auto' ? 'Inteligente ' : 'Forzado ') + dimsLog.width + 'x' + dimsLog.height);
+            console.log('[DISPLAY:SESION] Salida=' + (useDrmDirect ? 'DRM/KMS directo (sin X11)' : (hasWaylandDisplay ? 'Wayland' : 'X11')) + ' | Modo=' + modeDesc);
             if (wallConfig.activationMode === 'server' || wallConfig.enabled) {
                 console.log('[VIDEOWALL] Config -> control=' + wallConfig.activationMode + ', enabled=' + wallConfig.enabled + ', modo=' + wallConfig.mode + ', matriz=' + wallConfig.rows + 'x' + wallConfig.cols + ', pantalla #' + wallConfig.screenId + ' (f' + (wallConfig.row + 1) + ',c' + (wallConfig.col + 1) + '), bisel=' + wallConfig.bezelPx + 'px, sync=' + wallConfig.syncMode + (wallConfig.masterIp ? ('(' + wallConfig.masterIp + ')') : ''));
             }
@@ -343,7 +527,10 @@ function getTargetVideoDims() {
     var isVert = isPortraitOrientation();
     var envRes = String(process.env.URP_RESOLUTION || '').trim().toLowerCase();
     var cfgRes = (wallConfig && wallConfig.resolutionMode) ? String(wallConfig.resolutionMode).toLowerCase() : 'auto';
-    var effectiveMode = (envRes === '720p' || envRes === '1080p') ? envRes : cfgRes;
+    var effectiveMode = (envRes === 'auto' || envRes === 'direct' || envRes === '720p' || envRes === '1080p') ? envRes : cfgRes;
+    if (effectiveMode !== '720p' && effectiveMode !== '1080p' && effectiveMode !== 'direct') effectiveMode = 'auto';
+    var wallTileOn = (typeof isWallTileActive === 'function') ? isWallTileActive() : false;
+    var convertEnabled = (effectiveMode !== 'direct') || wallTileOn;
     var use720p = (effectiveMode === '720p') ? true : ((effectiveMode === '1080p') ? false : isLowPowerPi);
     var longEdge = use720p ? 1280 : 1920;
     var shortEdge = use720p ? 720 : 1080;
@@ -351,6 +538,7 @@ function getTargetVideoDims() {
         width: isVert ? shortEdge : longEdge,
         height: isVert ? longEdge : shortEdge,
         use720p: use720p,
+        convertEnabled: convertEnabled,
         mode: effectiveMode,
         fps: use720p ? 24 : 25,
         preset: (use720p || isLowPowerPi) ? 'ultrafast' : 'veryfast',
@@ -369,11 +557,14 @@ function getEncodingBackpressureReason() {
         var totMem = osMod.totalmem();
         var frMem = osMod.freemem();
         var curMemPct = (totMem > 0) ? Math.round(((totMem - frMem) * 100) / totMem) : 0;
-        if (isLowPowerPi && curMemPct >= 86) {
+        if (isLowPowerPi && curMemPct >= 75) {
             return 'RAM alta (' + curMemPct + '%)';
         }
-        if (temperature >= 78) {
+        if (temperature >= 72) {
             return 'Temperatura alta (' + temperature + '°C)';
+        }
+        if (isLowPowerPi && cpuUsage >= 70) {
+            return 'CPU ocupada (' + cpuUsage + '%)';
         }
     } catch (e) {}
     return '';
@@ -488,6 +679,221 @@ function ensureBlackCurtainAsset() {
     } catch (e) {}
     return curtainPath;
 }
+
+// ==============================================================================
+// 1A. SEGURIDAD PIN (:8090), AUDIO/VOLUMEN, AHORRO HDMI Y STANDBY OFFLINE
+// ==============================================================================
+var authSessions = {};
+var authFailures = {};
+var AUTH_SESSION_TTL_MS = 24 * 3600 * 1000;
+
+function getPanelAuthConfig() {
+    var envPin = String(process.env.URP_PANEL_PIN || '').trim();
+    if (envPin.length > 0) {
+        return { enabled: true, envManaged: true };
+    }
+    var storedHash = (wallConfig && wallConfig.panelPinHash) ? String(wallConfig.panelPinHash) : '';
+    return { enabled: storedHash.indexOf(':') > 0, envManaged: false };
+}
+
+function hashPinScrypt(pinStr) {
+    var salt = crypto.randomBytes(16).toString('hex');
+    var derived = crypto.scryptSync(String(pinStr), salt, 32).toString('hex');
+    return salt + ':' + derived;
+}
+
+function verifyPinScrypt(pinStr, storedHash) {
+    try {
+        var parts = String(storedHash || '').split(':');
+        if (parts.length !== 2 || !parts[0] || !parts[1]) return false;
+        var expectedBuf = Buffer.from(parts[1], 'hex');
+        var actualBuf = crypto.scryptSync(String(pinStr), parts[0], 32);
+        if (expectedBuf.length !== actualBuf.length) return false;
+        return crypto.timingSafeEqual(expectedBuf, actualBuf);
+    } catch (e) {
+        return false;
+    }
+}
+
+function verifyPanelPin(candidatePin) {
+    var cand = String(candidatePin || '');
+    if (!cand) return false;
+    var envPin = String(process.env.URP_PANEL_PIN || '').trim();
+    if (envPin.length > 0) {
+        var hA = crypto.createHash('sha256').update(cand).digest();
+        var hB = crypto.createHash('sha256').update(envPin).digest();
+        return crypto.timingSafeEqual(hA, hB);
+    }
+    return verifyPinScrypt(cand, wallConfig && wallConfig.panelPinHash);
+}
+
+function issueAuthToken() {
+    var now = Date.now();
+    var keys = Object.keys(authSessions);
+    for (var i = 0; i < keys.length; i++) {
+        if (authSessions[keys[i]] < now) delete authSessions[keys[i]];
+    }
+    var tok = crypto.randomBytes(32).toString('hex');
+    authSessions[tok] = now + AUTH_SESSION_TTL_MS;
+    return tok;
+}
+
+function isRequestAuthenticated(req) {
+    if (!getPanelAuthConfig().enabled) return true;
+    var authHdr = String((req.headers && req.headers.authorization) || '');
+    if (authHdr.indexOf('Bearer ') !== 0) return false;
+    var tok = authHdr.slice(7).trim();
+    if (!tok || !authSessions[tok]) return false;
+    if (authSessions[tok] < Date.now()) {
+        delete authSessions[tok];
+        return false;
+    }
+    return true;
+}
+
+function requirePanelAuth(req, res, next) {
+    if (isRequestAuthenticated(req)) return next();
+    res.status(401).json({ ok: false, authRequired: true, error: 'PIN requerido para acceder al panel' });
+}
+
+function saveWallConfigPartial(patchObj) {
+    loadWallConfig();
+    var nextCfg = Object.assign({}, wallConfig, patchObj, { updatedAt: new Date().toISOString() });
+    ensureDir(basePath);
+    var tmpPath = wallConfigPath + '.tmp';
+    fs.writeFileSync(tmpPath, JSON.stringify(nextCfg, null, 2) + '\n', 'utf8');
+    fs.renameSync(tmpPath, wallConfigPath);
+    wallConfigMtime = 0;
+    return loadWallConfig();
+}
+
+function applyAudioSettings(callback) {
+    loadWallConfig();
+    var vol = Math.max(0, Math.min(100, parseInt(wallConfig.audioVolume, 10)));
+    if (isNaN(vol)) vol = 100;
+    var muted = Boolean(wallConfig.audioMuted);
+    var outMode = (wallConfig.audioOutput === 'hdmi' || wallConfig.audioOutput === 'jack') ? wallConfig.audioOutput : 'auto';
+
+    if (isPlaying && activePlayerProcess && activePlayerBin === 'mpv' && fs.existsSync(mpvIpcSocketPath)) {
+        mpvIpcRequest([
+            ['set_property', 'mute', muted],
+            ['set_property', 'volume', vol]
+        ], function () {});
+    }
+
+    if (!isArm && !isLinux) {
+        if (typeof callback === 'function') callback();
+        return;
+    }
+
+    var routeNum = (outMode === 'hdmi') ? 2 : ((outMode === 'jack') ? 1 : 0);
+    var muteFlag = muted ? 'mute' : 'unmute';
+    var cmds = [
+        'amixer sset Master ' + vol + '% ' + muteFlag + ' >/dev/null 2>&1 || amixer sset PCM ' + vol + '% ' + muteFlag + ' >/dev/null 2>&1 || true'
+    ];
+    if (outMode !== 'auto') {
+        cmds.push('amixer cset numid=3 ' + routeNum + ' >/dev/null 2>&1 || true');
+    }
+    cmds.push('if command -v wpctl >/dev/null 2>&1; then wpctl set-volume @DEFAULT_AUDIO_SINK@ ' + (vol / 100).toFixed(2) + ' >/dev/null 2>&1 || true; wpctl set-mute @DEFAULT_AUDIO_SINK@ ' + (muted ? '1' : '0') + ' >/dev/null 2>&1 || true; fi');
+
+    exec(cmds.join('; '), { env: getGuiEnv(), timeout: 3000 }, function () {
+        if (typeof callback === 'function') callback();
+    });
+}
+
+function isWithinScreenOffWindow() {
+    if (manualScreenOffOverride !== null) {
+        return Boolean(manualScreenOffOverride);
+    }
+    if (!wallConfig || !wallConfig.screenScheduleEnabled) return false;
+    var onParts = sanitizeTimeHHMM(wallConfig.screenOnTime, '08:00').split(':');
+    var offParts = sanitizeTimeHHMM(wallConfig.screenOffTime, '22:00').split(':');
+    var onMin = (parseInt(onParts[0], 10) * 60) + parseInt(onParts[1], 10);
+    var offMin = (parseInt(offParts[0], 10) * 60) + parseInt(offParts[1], 10);
+    if (onMin === offMin) return false;
+    var now = new Date();
+    var curMin = (now.getHours() * 60) + now.getMinutes();
+    if (onMin < offMin) {
+        return (curMin < onMin || curMin >= offMin);
+    }
+    return (curMin >= offMin && curMin < onMin);
+}
+
+function applyScreenPowerState(turnOn, callback) {
+    var shouldOff = !turnOn;
+    var changed = (isScreenPoweredOff !== shouldOff);
+    isScreenPoweredOff = shouldOff;
+
+    if (!isArm && !isLinux) {
+        if (typeof callback === 'function') callback(changed);
+        return;
+    }
+
+    var env = getGuiEnv();
+    var cmd = '';
+    if (turnOn) {
+        cmd = '(/usr/bin/vcgencmd display_power 1 || /opt/vc/bin/vcgencmd display_power 1 || true) >/dev/null 2>&1; ' +
+              'if command -v xrandr >/dev/null 2>&1; then OUT=$(xrandr --query 2>/dev/null | awk "/ connected/{print \$1; exit}"); [ -n "$OUT" ] && xrandr --output "$OUT" --auto >/dev/null 2>&1 || true; fi; ' +
+              'if command -v wlr-randr >/dev/null 2>&1; then WOUT=$(wlr-randr 2>/dev/null | awk "/^HDMI|^DP|^DSI/{print \$1; exit}"); [ -n "$WOUT" ] && wlr-randr --output "$WOUT" --on >/dev/null 2>&1 || true; fi; ' +
+              'if command -v cec-client >/dev/null 2>&1; then echo "on 0" | cec-client -s -d 1 >/dev/null 2>&1 || true; fi';
+    } else {
+        cmd = '(/usr/bin/vcgencmd display_power 0 || /opt/vc/bin/vcgencmd display_power 0 || true) >/dev/null 2>&1; ' +
+              'if command -v xrandr >/dev/null 2>&1; then OUT=$(xrandr --query 2>/dev/null | awk "/ connected/{print \$1; exit}"); [ -n "$OUT" ] && xrandr --output "$OUT" --off >/dev/null 2>&1 || true; fi; ' +
+              'if command -v wlr-randr >/dev/null 2>&1; then WOUT=$(wlr-randr 2>/dev/null | awk "/^HDMI|^DP|^DSI/{print \$1; exit}"); [ -n "$WOUT" ] && wlr-randr --output "$WOUT" --off >/dev/null 2>&1 || true; fi; ' +
+              'if command -v cec-client >/dev/null 2>&1; then echo "standby 0" | cec-client -s -d 1 >/dev/null 2>&1 || true; fi';
+    }
+
+    exec(cmd, { env: env, timeout: 6000 }, function () {
+        if (changed) {
+            console.log('[POWER] Pantalla HDMI ' + (turnOn ? 'ENCENDIDA' : 'APAGADA (ahorro de energía)') + '.');
+        }
+        if (shouldOff && isPlaying) {
+            stopOmx(function () {
+                if (typeof callback === 'function') callback(changed);
+            });
+            return;
+        }
+        if (turnOn && changed && !isPlaying) {
+            setTimeout(function () { checkSchedule(); }, 400);
+        }
+        if (typeof callback === 'function') callback(changed);
+    });
+}
+
+function syncScreenPowerSchedule() {
+    var shouldOff = isWithinScreenOffWindow();
+    if (shouldOff !== isScreenPoweredOff) {
+        applyScreenPowerState(!shouldOff);
+    }
+    return shouldOff;
+}
+
+var standbyFallbackImagePath = basePath + 'standby_urp.png';
+var standbyAssetGenerating = false;
+function ensureStandbyScreenAsset() {
+    if (!isArm && !isLinux) return;
+    if (fs.existsSync(standbyFallbackImagePath) || standbyAssetGenerating) return;
+    standbyAssetGenerating = true;
+    var tmpPath = basePath + '.standby_urp.tmp.png';
+    var ffArgs = [
+        '-nostdin', '-y', '-loglevel', 'error',
+        '-f', 'lavfi', '-i', 'color=c=#090d16:s=1280x720:d=1',
+        '-vf', "drawbox=x=140:y=220:w=1000:h=280:color=#111827@0.95:t=fill,drawbox=x=140:y=220:w=1000:h=280:color=#2563eb@0.7:t=2,drawtext=text='URP Digital Signage v" + URPVersion + "':fontcolor=white:fontsize=42:x=(w-text_w)/2:y=290,drawtext=text='Esperando programacion de tbee.tv (Panel web puerto 8090)':fontcolor=#94a3b8:fontsize=24:x=(w-text_w)/2:y=375",
+        '-frames:v', '1', tmpPath
+    ];
+    var p = spawn('ffmpeg', ffArgs, { stdio: 'ignore' });
+    p.on('close', function (code) {
+        standbyAssetGenerating = false;
+        if (code === 0 && fs.existsSync(tmpPath) && fs.statSync(tmpPath).size > 512) {
+            try { fs.renameSync(tmpPath, standbyFallbackImagePath); } catch (e) {}
+        } else {
+            try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
+            try { fs.writeFileSync(standbyFallbackImagePath, Buffer.from(BLACK_CURTAIN_PNG_B64, 'base64')); } catch (e2) {}
+        }
+    });
+    p.on('error', function () { standbyAssetGenerating = false; });
+}
+setTimeout(ensureStandbyScreenAsset, 4000);
 
 var osScreenRotated = false;
 var lastDisplayRotLog = '';
@@ -669,7 +1075,8 @@ function refreshDisplayRotationSync() {
     }
 }
 
-function applyDisplayRotationIfNeeded(callback) {
+var lastAppliedRot = null;
+function applyDisplayRotationIfNeeded(callback, forceCheck) {
     if (!isArm && !isLinux || useDrmDirect) {
         osScreenRotated = false;
         if (callback) callback(false);
@@ -682,12 +1089,18 @@ function applyDisplayRotationIfNeeded(callback) {
         return;
     }
     if (cfgRot === 0 && !osScreenRotated) {
+        lastAppliedRot = 0;
         osScreenRotated = false;
+        if (callback) callback(false);
+        return;
+    }
+    if (!forceCheck && lastAppliedRot === cfgRot && (osScreenRotated || cfgRot === 0)) {
         if (callback) callback(false);
         return;
     }
     exec(buildDisplayRotationScript(cfgRot), function (err, stdout) {
         var didChange = handleDisplayRotationResult(cfgRot, stdout);
+        if (!err) lastAppliedRot = cfgRot;
         if (callback) callback(didChange);
     });
 }
@@ -871,8 +1284,8 @@ setInterval(function () {
     detectDisplaySession();
     suppressDesktopPopups();
     applyDisplayResolution720pIfNeeded(false);
-    applyDisplayRotationIfNeeded();
-}, 20000);
+    applyDisplayRotationIfNeeded(null, false);
+}, 60000);
 
 function killBackground() {
     if (procBackgroundImage != null) {
@@ -882,11 +1295,13 @@ function killBackground() {
 }
 
 var setBackground = function (callback) {
-    if ((isArm || isLinux) && !isPlaying && !useDrmDirect && hasX11Display) {
+    if ((isArm || isLinux) && !isPlaying && !isScreenPoweredOff && !useDrmDirect && hasX11Display) {
         var bgPath = basePath + 'background.png';
-        if (procBackgroundImage == null && fs.existsSync(bgPath)) {
+        var fallbackStandby = (wallConfig && wallConfig.showStandbyScreen !== false && fs.existsSync(standbyFallbackImagePath)) ? standbyFallbackImagePath : '';
+        var chosenBg = fs.existsSync(bgPath) ? bgPath : fallbackStandby;
+        if (procBackgroundImage == null && chosenBg) {
             try {
-                procBackgroundImage = spawn('feh', ['-x', '-q', '-F', bgPath], {
+                procBackgroundImage = spawn('feh', ['-x', '-q', '-F', chosenBg], {
                     env: Object.assign({}, process.env, { DISPLAY: ':0', XAUTHORITY: getXauthPath() })
                 });
                 procBackgroundImage.on('error', function () { procBackgroundImage = null; });
@@ -928,8 +1343,8 @@ var mpvIpcSocketPath = '/tmp/mpv-urp.sock';
 var wallSyncTimer = null;
 var wallSyncBusy = false;
 var lastWallSeekAt = 0;
-var wallMasterState = { timePos: 0, duration: 0, ts: 0, file: '' };
-var wallSyncStatus = { active: false, mode: '', driftMs: 0, speed: 1, targetPos: 0, curPos: 0, lastSyncAt: 0, lastError: '' };
+var wallMasterState = { timePos: 0, duration: 0, playlistPos: 0, ts: 0, file: '' };
+var wallSyncStatus = { active: false, mode: '', driftMs: 0, speed: 1, targetPos: 0, curPos: 0, playlistPos: 0, lastSyncAt: 0, lastError: '' };
 var watchdogLastPos = -1;
 var watchdogStallCount = 0;
 var watchdogBusy = false;
@@ -1073,7 +1488,7 @@ function applyWallTargetDrift(curPos, duration, targetPos) {
     }
 }
 
-function startWallSync(currentFile) {
+function startWallSync(currentFile, isPlaylistMode) {
     stopWallSync();
     if (!isWallActive()) return;
     wallSyncStatus.active = true;
@@ -1081,10 +1496,15 @@ function startWallSync(currentFile) {
     wallSyncStatus.speed = 1;
 
     wallSyncTimer = setInterval(function () {
-        if (!isPlaying || !isWallActive() || currentPlaylist.length !== 1 || wallSyncBusy) return;
+        if (!isPlaying || !isWallActive() || wallSyncBusy) return;
+        if (!isPlaylistMode && currentPlaylist.length !== 1) return;
         wallSyncBusy = true;
 
-        mpvIpcRequest([['get_property', 'time-pos'], ['get_property', 'duration']], function (err, res) {
+        mpvIpcRequest([
+            ['get_property', 'time-pos'],
+            ['get_property', 'duration'],
+            ['get_property', 'playlist-pos']
+        ], function (err, res) {
             if (err || !res || !res[1] || !res[2] || res[1].error !== 'success' || res[2].error !== 'success') {
                 wallSyncBusy = false;
                 if (err) wallSyncStatus.lastError = err.message;
@@ -1092,6 +1512,9 @@ function startWallSync(currentFile) {
             }
             var curPos = parseFloat(res[1].data);
             var duration = parseFloat(res[2].data);
+            var curPlPos = (res[3] && res[3].error === 'success' && typeof res[3].data === 'number') ? res[3].data : 0;
+            wallSyncStatus.playlistPos = curPlPos;
+
             if (isNaN(curPos) || isNaN(duration) || duration <= 1.5) {
                 wallSyncBusy = false;
                 return;
@@ -1101,6 +1524,7 @@ function startWallSync(currentFile) {
                 wallMasterState = {
                     timePos: curPos,
                     duration: duration,
+                    playlistPos: curPlPos,
                     ts: Date.now(),
                     file: path.basename(currentFile || '')
                 };
@@ -1129,6 +1553,11 @@ function startWallSync(currentFile) {
                         wallSyncStatus.lastError = rErr ? rErr.message : 'master_unavailable';
                         return;
                     }
+                    if (isPlaylistMode && typeof body.playlistPos === 'number' && body.playlistPos !== curPlPos) {
+                        console.log('[VIDEOWALL:SYNC] Alineando ítem de playlist #' + curPlPos + ' -> #' + body.playlistPos);
+                        mpvIpcRequest([['set_property', 'playlist-pos', body.playlistPos]], function () {});
+                        return;
+                    }
                     var rtt = Date.now() - reqStart;
                     if (body.duration && Math.abs(body.duration - duration) > 1.5) {
                         wallSyncStatus.lastError = 'transitioning_block';
@@ -1138,6 +1567,35 @@ function startWallSync(currentFile) {
                     applyWallTargetDrift(curPos, duration, targetPos);
                 });
                 return;
+            }
+
+            if (isPlaylistMode && currentPlaylist.length > 1) {
+                var totalCycleSec = 0;
+                var offsets = [];
+                for (var pi = 0; pi < currentPlaylist.length; pi++) {
+                    var itemDur = Math.max(1, parseInt(currentPlaylist[pi].duration, 10) || 10);
+                    offsets.push({ start: totalCycleSec, dur: itemDur });
+                    totalCycleSec += itemDur;
+                }
+                if (totalCycleSec > 2) {
+                    var cyclePos = (Date.now() / 1000) % totalCycleSec;
+                    var wantIdx = 0;
+                    for (var wi = 0; wi < offsets.length; wi++) {
+                        if (cyclePos >= offsets[wi].start && cyclePos < (offsets[wi].start + offsets[wi].dur)) {
+                            wantIdx = wi;
+                            break;
+                        }
+                    }
+                    if (wantIdx !== curPlPos) {
+                        mpvIpcRequest([['set_property', 'playlist-pos', wantIdx]], function () {});
+                        wallSyncBusy = false;
+                        return;
+                    }
+                    var targetInItem = (cyclePos - offsets[wantIdx].start) % duration;
+                    applyWallTargetDrift(curPos, duration, targetInItem);
+                    wallSyncBusy = false;
+                    return;
+                }
             }
 
             var targetPosNtp = ((Date.now() / 1000) % duration);
@@ -1299,38 +1757,117 @@ function playCurrentIndex() {
     console.log("[PLAYER:VIDEO] Reproduciendo: " + path.basename(fullPath) + (useDrmDirect ? " [DRM]" : "") + (curDims.use720p ? " [720p]" : "") + (mpvRotateDeg > 0 ? " [rot=" + mpvRotateDeg + "°]" : ""));
 
     var wallModeOn = isWallActive();
-    var playerBin = ((wallModeOn || useDrmDirect) && hasMpv) ? 'mpv' : (hasOmxplayer ? 'omxplayer' : (hasMpv ? 'mpv' : 'omxplayer'));
+    var playerBin = ((wallModeOn || useDrmDirect || (currentPlaylist.length > 1 && hasMpv)) && hasMpv) ? 'mpv' : (hasOmxplayer ? 'omxplayer' : (hasMpv ? 'mpv' : 'omxplayer'));
     var playerArgs = [];
+    var usedMpvPlaylist = false;
+    var cfgVol = (wallConfig && typeof wallConfig.audioVolume === 'number') ? Math.max(0, Math.min(100, wallConfig.audioVolume)) : 100;
+    var cfgMuted = Boolean(wallConfig && wallConfig.audioMuted);
+    var cfgAudioOut = (wallConfig && wallConfig.audioOutput) ? wallConfig.audioOutput : 'auto';
 
     if (playerBin === 'omxplayer') {
         playerArgs = ['-b', '--no-osd', '--layer', '10000', '--no-keys'];
+        if (cfgAudioOut === 'hdmi') playerArgs.push('--adev', 'hdmi');
+        else if (cfgAudioOut === 'jack') playerArgs.push('--adev', 'local');
+        if (cfgMuted || cfgVol === 0) {
+            playerArgs.push('--vol', '-6000');
+        } else if (cfgVol < 100) {
+            var omxMb = Math.round(2000 * (Math.log(cfgVol / 100) / Math.LN10));
+            playerArgs.push('--vol', String(omxMb));
+        }
+        if (mpvRotateDeg > 0) playerArgs.push('--orientation', String(mpvRotateDeg));
         if (currentPlaylist.length === 1) playerArgs.push('--loop');
         playerArgs.push(fullPath);
+        activeMpvDriverInfo = 'omxplayer (Hardware VideoCore)';
     } else {
         try { if (fs.existsSync(mpvIpcSocketPath)) fs.unlinkSync(mpvIpcSocketPath); } catch (se) {}
         var maxDemuxBytes = isLowPowerPi ? '6M' : '16M';
         var maxBackBytes = isLowPowerPi ? '1M' : '4M';
-        var lavcThreads = isLowPowerPi ? '2' : '4';
+        var voSetting = (wallConfig && wallConfig.videoOutputMode) ? wallConfig.videoOutputMode : 'auto';
         var mpvBaseArgs = [
             '--fs', '--no-osc', '--no-osd-bar', '--really-quiet',
             '--no-input-default-bindings', '--cursor-autohide=always', '--ontop',
-            '--hwdec=auto', '--keep-open=no',
+            '--keep-open=no',
             '--scale=bilinear', '--cscale=bilinear', '--dscale=bilinear',
             '--dither-depth=no', '--deband=no',
-            '--vd-lavc-fast', '--vd-lavc-skiploopfilter=nonref',
-            '--vd-lavc-threads=' + lavcThreads,
             '--audio-fallback-to-null=yes',
+            '--volume=' + cfgVol,
+            '--mute=' + (cfgMuted ? 'yes' : 'no'),
             '--cache=yes', '--demuxer-max-bytes=' + maxDemuxBytes, '--demuxer-max-back-bytes=' + maxBackBytes,
             '--framedrop=vo',
             '--input-ipc-server=' + mpvIpcSocketPath
         ];
-        if (useDrmDirect) {
-            mpvBaseArgs.push('--vo=gpu,drm', '--gpu-context=drm');
+        if (mpvHasOption('audio-display')) {
+            mpvBaseArgs.push('--audio-display=no');
         }
+        if (mpvHasOption('vd-lavc-threads')) {
+            mpvBaseArgs.push('--vd-lavc-threads=' + (isLowPowerPi ? '2' : '4'));
+        }
+
+        var chosenVoLabel = 'default';
+        var chosenHwList = [];
+        if (mpvSafeFallback) {
+            if (hasX11Display && mpvHasVo('x11')) {
+                mpvBaseArgs.push('--vo=x11');
+                chosenVoLabel = 'x11-safe';
+            }
+            if (isLowPowerPi && mpvHasOption('sws-scaler')) mpvBaseArgs.push('--sws-scaler=fast-bilinear');
+            chosenHwList = mpvFilterHwdecs(['v4l2m2m-copy', 'mmal-copy', 'auto']);
+        } else if (useDrmDirect) {
+            if (mpvHasVo('gpu') && mpvHasGpuCtx('drm')) {
+                mpvBaseArgs.push(mpvHasVo('drm') ? '--vo=gpu,drm' : '--vo=gpu', '--gpu-context=drm');
+                chosenVoLabel = 'drm-gpu';
+            } else if (mpvHasVo('drm')) {
+                mpvBaseArgs.push('--vo=drm');
+                chosenVoLabel = 'drm';
+            }
+            if (isLowPowerPi && mpvRotateDeg === 0 && mpvHasOption('gpu-dumb-mode')) {
+                mpvBaseArgs.push('--gpu-dumb-mode=yes');
+            }
+            chosenHwList = mpvFilterHwdecs(['drm', 'v4l2m2m', 'mmal', 'drm-copy', 'v4l2m2m-copy', 'auto-safe', 'auto']);
+        } else if (voSetting === 'x11_light' || (voSetting === 'auto' && hasX11Display && mpvCaps.isSoftwareGl)) {
+            var xVos = [];
+            if (mpvHasVo('xv')) xVos.push('xv');
+            if (mpvHasVo('x11')) xVos.push('x11');
+            if (xVos.length > 0) {
+                mpvBaseArgs.push('--vo=' + xVos.join(','));
+                chosenVoLabel = xVos.join(',');
+            }
+            if (isLowPowerPi && mpvHasOption('sws-scaler')) {
+                mpvBaseArgs.push('--sws-scaler=fast-bilinear');
+            }
+            if (isLowPowerPi && mpvHasOption('vd-lavc-skiploopfilter')) {
+                mpvBaseArgs.push('--vd-lavc-skiploopfilter=nonref');
+            }
+            chosenHwList = mpvFilterHwdecs(['v4l2m2m-copy', 'mmal-copy', 'drm-copy', 'auto-copy', 'auto']);
+        } else {
+            if (mpvHasVo('gpu')) {
+                mpvBaseArgs.push('--vo=gpu');
+                chosenVoLabel = 'gpu';
+            }
+            if (hasWaylandDisplay && mpvHasGpuCtx('waylandegl')) {
+                mpvBaseArgs.push('--gpu-context=waylandegl');
+                chosenVoLabel = 'waylandegl';
+            } else if (hasX11Display && mpvHasGpuCtx('x11egl')) {
+                mpvBaseArgs.push('--gpu-context=x11egl');
+                chosenVoLabel = 'x11egl';
+            }
+            if (isLowPowerPi) {
+                if (mpvHasOption('opengl-es')) mpvBaseArgs.push('--opengl-es=yes');
+                if (mpvRotateDeg === 0 && mpvHasOption('gpu-dumb-mode')) mpvBaseArgs.push('--gpu-dumb-mode=yes');
+            }
+            chosenHwList = mpvFilterHwdecs(['drm', 'drm-copy', 'v4l2m2m-copy', 'mmal-copy', 'auto-copy', 'auto-safe', 'auto']);
+        }
+
+        if (chosenHwList.length > 0) {
+            mpvBaseArgs.push('--hwdec=' + chosenHwList.join(','));
+        } else {
+            mpvBaseArgs.push('--hwdec=auto');
+        }
+        activeMpvDriverInfo = 'mpv (vo:' + chosenVoLabel + ' | hw:' + (chosenHwList.length > 0 ? chosenHwList[0] : 'auto') + ')';
+
         if (mpvRotateDeg > 0) {
             mpvBaseArgs.push('--video-rotate=' + mpvRotateDeg);
         }
-        var usedMpvPlaylist = false;
         if (currentPlaylist.length > 1 && currentMediaIndex === 0) {
             var mpvPlaylistPaths = [];
             var mpvTelemetryList = [];
@@ -1351,7 +1888,7 @@ function playCurrentIndex() {
                 playerArgs = mpvBaseArgs.concat(plFlags, mpvPlaylistPaths);
                 startSeamlessTelemetry(mpvTelemetryList);
                 usedMpvPlaylist = true;
-                console.log("[PLAYER:MPV] Modo playlist continua en ventana única (" + mpvPlaylistPaths.length + " videos).");
+                console.log("[PLAYER:MPV] Modo playlist continua en ventana única (" + mpvPlaylistPaths.length + " videos | " + activeMpvDriverInfo + ").");
             }
         }
         if (!usedMpvPlaylist) {
@@ -1372,8 +1909,8 @@ function playCurrentIndex() {
         var mediaProc = spawn(playerBin, playerArgs, { env: env, stdio: ['ignore', 'ignore', 'pipe'] });
         activePlayerProcess = mediaProc;
         activePlayerBin = playerBin;
-        if (wallModeOn && playerBin === 'mpv' && currentPlaylist.length === 1) {
-            startWallSync(fullPath);
+        if (wallModeOn && playerBin === 'mpv' && (currentPlaylist.length === 1 || usedMpvPlaylist)) {
+            startWallSync(fullPath, usedMpvPlaylist);
         }
         if (mediaProc.stderr) {
             mediaProc.stderr.on('data', function (chunk) {
@@ -1391,6 +1928,13 @@ function playCurrentIndex() {
             var minExpectedMs = (!item.duration || item.duration >= 3) ? 1000 : 250;
             if (code !== 0 && playerStderr.trim()) {
                 console.error("[" + playerBin.toUpperCase() + " EXIT code=" + code + "]: " + playerStderr.trim());
+            }
+            if (playerBin === 'mpv' && code !== 0 && elapsed < 1500 && !mpvSafeFallback) {
+                mpvSafeFallback = true;
+                console.warn("[PLAYER:MPV] Driver de video no soportado en esta Pi; activando fallback seguro X11...");
+                return setTimeout(function () {
+                    if (token === playbackToken && isPlaying) playCurrentIndex();
+                }, 300);
             }
             var isConvertedOrSeamless = (/_\d+s\.mp4$/i.test(fullPath) || fullPath.indexOf(seamlessBasePath) === 0 || fullPath.indexOf(optimizedBasePath) === 0);
             if (isConvertedOrSeamless && (code !== 0 || elapsed < minExpectedMs)) {
@@ -1505,13 +2049,17 @@ function emergencyDiskPlayback() {
         if (!fs.existsSync(contentBasePath)) return;
 
         var diskFiles = fs.readdirSync(contentBasePath);
-        convertExistingImages();
+        var dimsDisk = getTargetVideoDims();
+        if (dimsDisk.convertEnabled) {
+            convertExistingImages();
+        }
 
         var curWallSig = getWallSignature();
-        var curResTag = getTargetVideoDims().use720p ? '_720p' : '';
+        var curResTag = dimsDisk.use720p ? '_720p' : '';
         var videoFiles = diskFiles.filter(function (f) {
             if (!isVideoFile(f) || f.indexOf('.part') !== -1 || f.indexOf('temp_') !== -1) return false;
             if (/_\d+s\.mp4$/i.test(f)) {
+                if (!dimsDisk.convertEnabled) return false;
                 if (curResTag && f.indexOf(curResTag) === -1) return false;
                 if (!curResTag && f.indexOf('_720p') !== -1) return false;
                 if (isWallTileActive()) {
@@ -1537,20 +2085,22 @@ function emergencyDiskPlayback() {
 
         if (videoFiles.length > 0) {
             var resolvedDiskVideos = [];
-            console.log('[STARTUP] ¡' + videoFiles.length + ' video(s) encontrados en disco! Iniciando reproducción continua:');
+            console.log('[STARTUP] ¡' + videoFiles.length + ' video(s) encontrados en disco! Iniciando reproducción directa:');
             for (var p = 0; p < videoFiles.length; p++) {
                 var rawDiskPath = path.join(contentBasePath, videoFiles[p]);
-                var optDiskPath = getOptimizedVideoPath(rawDiskPath);
-                if (optDiskPath && fs.existsSync(optDiskPath)) {
-                    try {
-                        if (fs.statSync(optDiskPath).size > 4096) {
-                            resolvedDiskVideos.push(optDiskPath);
-                            continue;
-                        }
-                    } catch (oe) {}
-                }
-                if (!/_\d+s\.mp4$/i.test(videoFiles[p])) {
-                    scheduleVideoOptimization(rawDiskPath);
+                if (dimsDisk.convertEnabled) {
+                    var optDiskPath = getOptimizedVideoPath(rawDiskPath);
+                    if (optDiskPath && fs.existsSync(optDiskPath)) {
+                        try {
+                            if (fs.statSync(optDiskPath).size > 4096) {
+                                resolvedDiskVideos.push(optDiskPath);
+                                continue;
+                            }
+                        } catch (oe) {}
+                    }
+                    if (!/_\d+s\.mp4$/i.test(videoFiles[p])) {
+                        scheduleVideoOptimization(rawDiskPath);
+                    }
                 }
                 resolvedDiskVideos.push(videoFiles[p]);
             }
@@ -1939,11 +2489,11 @@ function processNextRender() {
              'scale=' + targetW + ':' + targetH + ':force_original_aspect_ratio=decrease,' +
              'scale=trunc(iw/2)*2:trunc(ih/2)*2,' +
              'pad=' + targetW + ':' + targetH + ':(' + targetW + '-iw)/2:(' + targetH + '-ih)/2:black,' +
-             'setsar=1,format=yuv420p';
+             'setsar=1,format=yuv420p,loop=loop=-1:size=1:start=0,fps=' + targetFpsStr;
 
     var ffArgs = [
         '-nostdin', '-y', '-loglevel', 'error',
-        '-loop', '1', '-framerate', targetFpsStr, '-t', String(duration), '-i', file,
+        '-i', file,
         '-f', 'lavfi', '-t', String(duration), '-i', 'anullsrc=channel_layout=stereo:sample_rate=44100',
         '-vf', vf,
         '-c:v', 'libx264', '-threads', dims.threads, '-preset', 'ultrafast',
@@ -2012,6 +2562,10 @@ function processNextRender() {
 }
 
 function imgToVideo(file, name, time, callback) {
+    if (!getTargetVideoDims().convertEnabled) {
+        if (typeof callback === 'function') callback(false);
+        return;
+    }
     var duration = parseInt(time, 10);
     if (isNaN(duration) || duration <= 0) duration = 10;
     var safeName = normalizeName(name);
@@ -2048,7 +2602,7 @@ function imgToVideo(file, name, time, callback) {
 }
 
 function convertExistingImages(callback) {
-    if (!fs.existsSync(contentBasePath)) {
+    if (!getTargetVideoDims().convertEnabled || !fs.existsSync(contentBasePath)) {
         if (callback) callback();
         return;
     }
@@ -2149,14 +2703,12 @@ function needsPiVideoOptimization(info) {
     var h = info.height || 0;
     var maxDim = Math.max(w, h);
     var minDim = Math.min(w, h);
-    var limitLong = dims.use720p ? 1280 : 1920;
-    var limitShort = dims.use720p ? 720 : 1080;
-    var maxFps = 26;
-    var maxBps = dims.use720p ? 2500000 : 5000000;
+    var force720Limit = (dims.mode === '720p');
+    var limitLong = force720Limit ? 1280 : 1920;
+    var limitShort = force720Limit ? 720 : 1080;
+    var maxFps = 31;
+    var maxBps = force720Limit ? 5000000 : 10000000;
 
-    if (dims.use720p && info.profile && /high/i.test(info.profile)) {
-        return { needed: true, reason: 'perfil ' + info.profile + ' pesado para 720p' };
-    }
     if (maxDim > limitLong || minDim > limitShort) return { needed: true, reason: 'resolucion ' + w + 'x' + h + ' -> ' + dims.width + 'x' + dims.height };
     if (info.fps && info.fps > maxFps) return { needed: true, reason: info.fps.toFixed(1) + 'fps' };
     if (info.bitRate && info.bitRate > maxBps) return { needed: true, reason: (info.bitRate / 1000000).toFixed(1) + 'Mbps' };
@@ -2173,10 +2725,10 @@ function processNextVideoOpt() {
         return;
     }
     var bpReason = getEncodingBackpressureReason();
-    if (bpReason && optDeferCount < 6) {
+    if (bpReason && optDeferCount < 8) {
         optDeferCount++;
-        console.log('[OPT:VIDEO] Posponiendo normalización 15s por ' + bpReason + '...');
-        setTimeout(processNextVideoOpt, 15000);
+        console.log('[OPT:VIDEO] Posponiendo normalización 20s por ' + bpReason + '...');
+        setTimeout(processNextVideoOpt, 20000);
         return;
     }
     optDeferCount = 0;
@@ -2332,6 +2884,7 @@ function processNextVideoOpt() {
 }
 
 function scheduleVideoOptimization(srcPath) {
+    if (!getTargetVideoDims().convertEnabled) return;
     if (!isArm && !isLinux) return;
     if (!srcPath || !fs.existsSync(srcPath)) return;
     if (!isVideoFile(srcPath) || /_\d+s\.mp4$/i.test(srcPath)) return;
@@ -2388,8 +2941,9 @@ function garbageCollectUnusedMedia(forceEmergency, callback) {
         if (activeVideoOptOutPath) markKeep(activeVideoOptOutPath);
         if (activeRenderOutPath) markKeep(activeRenderOutPath);
 
+        var dimsGc = getTargetVideoDims();
         var wallTagImg = isWallTileActive() ? ('_' + getWallSignature()) : '';
-        var resTagGc = getTargetVideoDims().use720p ? '_720p' : '';
+        var resTagGc = dimsGc.use720p ? '_720p' : '';
         for (var b = 0; b < scheduleArr.length; b++) {
             var blk = scheduleArr[b];
             var blkItems = blk.contents || [];
@@ -2400,6 +2954,8 @@ function garbageCollectUnusedMedia(forceEmergency, callback) {
                 if (!safeName) continue;
                 markKeep(path.join(contentBasePath, safeName));
                 markKeep(path.join(contentBasePath, itm.content));
+
+                if (!dimsGc.convertEnabled) continue;
 
                 if (isImg(safeName) || isImg(itm.content)) {
                     var dur = parseInt(itm.length, 10);
@@ -2417,7 +2973,7 @@ function garbageCollectUnusedMedia(forceEmergency, callback) {
                     });
                 }
             }
-            if (resolvedBlockItems.length > 1) {
+            if (dimsGc.convertEnabled && resolvedBlockItems.length > 1) {
                 var bHash = computeBlockHash(resolvedBlockItems);
                 markKeep(path.join(seamlessBasePath, 'block_' + blk.idScheduleBlock + '_' + bHash + '.mp4'));
             }
@@ -2477,10 +3033,20 @@ function fileSerch(contentToSearch, nameToSearch, timeToSearch) {
     var safeContent = normalizeName(contentToSearch);
     var duration = parseInt(timeToSearch, 10);
     if (isNaN(duration) || duration <= 0) duration = 10;
+    var dimsSearch = getTargetVideoDims();
 
     if (isImg(safeContent) || isImg(contentToSearch)) {
+        var imgSource = fileExist(contentBasePath + safeContent) ? (contentBasePath + safeContent) :
+                        (fileExist(contentBasePath + contentToSearch) ? (contentBasePath + contentToSearch) : null);
+
+        if (!dimsSearch.convertEnabled) {
+            if (imgSource) return path.basename(imgSource);
+            if (!ftpWorking && respuesta) checkContentsFTP();
+            return false;
+        }
+
         var baseNoExt = safeContent.replace(/\.[^/.]+$/, "");
-        var resTagImg = getTargetVideoDims().use720p ? '_720p' : '';
+        var resTagImg = dimsSearch.use720p ? '_720p' : '';
         var wallTagImg = isWallTileActive() ? ('_' + getWallSignature()) : '';
         var videoBase = baseNoExt + resTagImg + wallTagImg + '_' + duration + 's';
         var videoName = videoBase + '.mp4';
@@ -2492,9 +3058,6 @@ function fileSerch(contentToSearch, nameToSearch, timeToSearch) {
                 fs.unlinkSync(videoPath);
             } catch (e) {}
         }
-
-        var imgSource = fileExist(contentBasePath + safeContent) ? (contentBasePath + safeContent) :
-                        (fileExist(contentBasePath + contentToSearch) ? (contentBasePath + contentToSearch) : null);
 
         if (imgSource) {
             imgToVideo(imgSource, videoBase, duration);
@@ -2517,7 +3080,7 @@ function fileSerch(contentToSearch, nameToSearch, timeToSearch) {
         }
     }
 
-    if (isVideoFile(targetPath) && (isArm || isLinux)) {
+    if (dimsSearch.convertEnabled && isVideoFile(targetPath) && (isArm || isLinux)) {
         var optPath = getOptimizedVideoPath(targetPath);
         if (optPath && fileExist(optPath)) {
             try {
@@ -2627,6 +3190,7 @@ function cleanupOldSeamless(idBlock, keepFileName) {
 }
 
 function prebuildAllScheduleBlocks() {
+    if (!getTargetVideoDims().convertEnabled) return;
     if (!bootGraceDone || isRendering || isOptimizingVideo || isConcatenating) return;
     var scheduleArr = Array.isArray(schedule) ? schedule : [];
     for (var b = 0; b < scheduleArr.length; b++) {
@@ -2666,6 +3230,7 @@ function prebuildAllScheduleBlocks() {
 }
 
 function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
+    if (!getTargetVideoDims().convertEnabled) return;
     if (!bootGraceDone || isRendering || isConcatenating) return;
     if (failedSeamlessHashes[blockHash]) return;
     if (activeSeamlessHash === blockHash) return;
@@ -2713,11 +3278,13 @@ function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
         var concatListPath = null;
         var ffArgs = [];
 
+        var firstFps = probed[0] ? (probed[0].fps || 24) : 24;
         var canFastCopy = probed.every(function (pi) {
             return pi.videoCodec === 'h264' &&
                    (pi.pixFmt === 'yuv420p' || pi.pixFmt === 'yuvj420p') &&
                    pi.width === targetW && pi.height === targetH &&
-                   pi.fps >= 22 && pi.fps <= 26 &&
+                   pi.fps >= 20 && pi.fps <= 31 &&
+                   Math.abs(pi.fps - firstFps) <= 1.2 &&
                    pi.hasAudio && pi.audioCodec === 'aac' &&
                    pi.audioSampleRate === 44100 && pi.audioChannels === 2;
         });
@@ -2739,6 +3306,14 @@ function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
                 canFastCopy = false;
                 concatListPath = null;
             }
+        }
+
+        if (!canFastCopy && isLowPowerPi && !isWallTileActive()) {
+            console.log('[SEAMLESS] Omitiendo recodificación pesada en Pi 3B+ para bloque ' + idBlock + '; mpv reproducirá la lista nativa sin sobrecargar CPU.');
+            failedSeamlessHashes[blockHash] = true;
+            isConcatenating = false;
+            activeSeamlessHash = '';
+            return;
         }
 
         if (!canFastCopy) {
@@ -2917,11 +3492,12 @@ function playContent(idBlock) {
     }
 
     var effectivePlaylist = filesToPlay;
+    var dimsPlay = getTargetVideoDims();
     var allItemsAreVideos = filesToPlay.length > 1 && filesToPlay.every(function (it) {
         return isVideoFile(it.file);
     });
 
-    if (allItemsAreVideos) {
+    if (dimsPlay.convertEnabled && allItemsAreVideos) {
         var blockHash = computeBlockHash(filesToPlay);
         var seamlessPath = seamlessBasePath + 'block_' + idBlock + '_' + blockHash + '.mp4';
         if (fileExist(seamlessPath)) {
@@ -3004,6 +3580,9 @@ function playOmx() {
 
 function checkSchedule() {
     loadWallConfig();
+    if (syncScreenPowerSchedule()) {
+        return;
+    }
     playOmx();
 }
 
@@ -3039,6 +3618,7 @@ function startWallScheduleWatcher() {
 }
 
 function waitToStart() {
+    applyAudioSettings();
     checkTime();
     if (refreshIntervalId != null) clearInterval(refreshIntervalId);
     refreshIntervalId = setInterval(checkTime, 60000);
@@ -3061,6 +3641,34 @@ function readProcStatCpu() {
     } catch (e) {
         return null;
     }
+}
+
+function parseThrottleHex(rawStr) {
+    var m = /throttled=(0x[0-9a-f]+)/i.exec(String(rawStr || ''));
+    var hexStr = m ? m[1] : String(rawStr || '').trim();
+    var val = parseInt(hexStr, 16);
+    if (isNaN(val)) {
+        return { raw: '0x0', ok: true, underVoltageNow: false, underVoltagePast: false, throttledNow: false, label: 'OK' };
+    }
+    var uvNow = Boolean(val & 0x1);
+    var capNow = Boolean(val & 0x2);
+    var thNow = Boolean(val & 0x4);
+    var uvPast = Boolean(val & 0x10000);
+    var thPast = Boolean(val & 0x40000);
+    var labels = [];
+    if (uvNow) labels.push('Bajo voltaje AHORA');
+    else if (uvPast) labels.push('Bajo voltaje previo');
+    if (thNow) labels.push('Throttling térmico');
+    else if (thPast) labels.push('Throttling previo');
+    if (capNow) labels.push('Frecuencia limitada');
+    return {
+        raw: hexStr,
+        ok: (!uvNow && !thNow && !capNow),
+        underVoltageNow: uvNow,
+        underVoltagePast: uvPast,
+        throttledNow: thNow,
+        label: labels.length > 0 ? labels.join(' • ') : 'OK (Voltaje estable)'
+    };
 }
 
 function getURPHardData(callback) {
@@ -3089,7 +3697,7 @@ function getURPHardData(callback) {
         }
 
         if (isArm || isLinux) {
-            var pending = 2;
+            var pending = 3;
             var doneOne = function () {
                 pending--;
                 if (pending <= 0 && typeof callback === 'function') {
@@ -3119,10 +3727,17 @@ function getURPHardData(callback) {
                         freeDiskMb = Math.round(availKb / 1024);
                         var availGb = availKb / (1024 * 1024);
                         URPFreeSpace = availGb >= 1 ? (availGb.toFixed(1) + ' GB') : (freeDiskMb + ' MB');
-                        if (freeDiskMb < 500 && (Date.now() - lastGcAt) > 600000) {
+                        if (freeDiskMb < 600 && (Date.now() - lastGcAt) > 300000) {
                             garbageCollectUnusedMedia(true);
                         }
                     }
+                }
+                doneOne();
+            });
+
+            exec("/usr/bin/vcgencmd get_throttled 2>/dev/null || /opt/vc/bin/vcgencmd get_throttled 2>/dev/null || true", function (err, stdout) {
+                if (!err && stdout && String(stdout).trim()) {
+                    throttleStatus = parseThrottleHex(stdout);
                 }
                 doneOne();
             });
@@ -3326,21 +3941,27 @@ function handleDownloadedFile(content, tempPartPath, callback) {
             } catch (e2) {}
         }
 
-        if (isImg(content.content)) {
-            var imgDuration = parseInt(content.length, 10);
-            if (isNaN(imgDuration) || imgDuration <= 0) imgDuration = 10;
-            var baseImgName = normalizeName(content.content).replace(/\.[^/.]+$/, "");
-            var wallTagDl = isWallTileActive() ? ('_' + getWallSignature()) : '';
-            imgToVideo(content.contentPath, baseImgName + wallTagDl + '_' + imgDuration + 's', imgDuration);
-        } else if (isVideoFile(content.contentPath)) {
-            scheduleVideoOptimization(content.contentPath);
+        var dimsDl = getTargetVideoDims();
+        if (dimsDl.convertEnabled) {
+            if (isImg(content.content)) {
+                var imgDuration = parseInt(content.length, 10);
+                if (isNaN(imgDuration) || imgDuration <= 0) imgDuration = 10;
+                var baseImgName = normalizeName(content.content).replace(/\.[^/.]+$/, "");
+                var resTagDl = dimsDl.use720p ? '_720p' : '';
+                var wallTagDl = isWallTileActive() ? ('_' + getWallSignature()) : '';
+                imgToVideo(content.contentPath, baseImgName + resTagDl + wallTagDl + '_' + imgDuration + 's', imgDuration);
+            } else if (isVideoFile(content.contentPath)) {
+                scheduleVideoOptimization(content.contentPath);
+            }
         }
 
         var qIdx = getIndex(FTPcontents, content);
         if (qIdx !== -1) FTPcontents.splice(qIdx, 1);
 
         checkSchedule();
-        setTimeout(prebuildAllScheduleBlocks, 1500);
+        if (dimsDl.convertEnabled) {
+            setTimeout(prebuildAllScheduleBlocks, 1500);
+        }
         if (callback) callback();
     } else {
         console.error("[FTP] MD5 mismatch para " + content.ftpPath);
@@ -3638,7 +4259,9 @@ function captureMpvFrame(outPath, callback) {
 function captureOsDisplayFrame(outPath, callback) {
     var env = getGuiEnv();
     var cmd = '';
-    if (hasWaylandDisplay && hasGrim) {
+    if (activePlayerBin === 'omxplayer' && hasRaspi2png) {
+        cmd = 'raspi2png -p "' + outPath + '"';
+    } else if (hasWaylandDisplay && hasGrim) {
         cmd = 'grim -t jpeg -q 80 "' + outPath + '"';
     } else if (hasX11Display && hasScrot) {
         cmd = 'scrot -q 80 -o "' + outPath + '"';
@@ -3738,7 +4361,7 @@ function sanitizeHostname(rawStr) {
 
 function resolveManagerHostname(data) {
     if (!data || typeof data !== 'object') return { hostname: '', label: '' };
-    var rawDisp = data.displayName || data.nombreDisplay || data.urpName || data.name || data.nombre || data.screenName || data.title || data.alias || data.display || '';
+    var rawDisp = data.nameDisplay || data.displayName || data.nombreDisplay || data.urpName || data.name || data.nombre || data.screenName || data.title || data.alias || data.display || '';
     var rawStore = data.storeName || data.nombreSucursal || data.sucursal || data.branchName || data.localName || data.local || data.tienda || '';
     var explicitHost = data.hostname || data.hostName || '';
     var label = rawStore && rawDisp && String(rawDisp).toLowerCase().indexOf(String(rawStore).toLowerCase()) === -1
@@ -4130,144 +4753,506 @@ if (GITHUB_OTA_ENABLED && (isArm || isLinux)) {
     setInterval(function () { checkGithubOTA(); }, GITHUB_OTA_INTERVAL_MS);
 }
 
+var lastExecutedRemoteCmdId = '';
+var liveSessionUntilMs = 0;
+var liveSessionIntervalId = null;
+var liveStepInFlight = false;
+
+function buildCompactRemoteState(callback) {
+    loadWallConfig();
+    var compose = function (pl) {
+        var dimsNow = getTargetVideoDims();
+        var effOrient = readHdmiRotateFromConfig();
+        callback({
+            version: URPVersion,
+            model: piModelStr,
+            hostname: osMod.hostname(),
+            managerName: URPdata.managerName || '',
+            totalRamMB: totalRamMB,
+            displayBackend: useDrmDirect ? 'DRM/KMS' : (hasWaylandDisplay ? 'Wayland' : 'X11'),
+            playerDriver: activeMpvDriverInfo || (hasOmxplayer ? 'omxplayer' : 'mpv'),
+            targetResolution: !dimsNow.convertEnabled ? ('Directo' + (dimsNow.use720p && wallConfig.hdmi720p !== false ? ' • HDMI 720p' : ' (Original)')) : (dimsNow.mode === 'auto' ? ('Inteligente' + (dimsNow.use720p ? ' (720p img / H.264 directo)' : ' (1080p)')) : (dimsNow.width + 'x' + dimsNow.height)),
+            effectiveOrientation: (effOrient !== null) ? effOrient : (wallConfig.orientation || 0),
+            ip: URPdata.URPIpAddress || '',
+            tailscaleIp: getTailscaleIp(),
+            mac: macAdd,
+            uptimeSec: Math.round(process.uptime()),
+            osUptimeSec: Math.round(osMod.uptime()),
+            freeSpace: URPFreeSpace,
+            freeDiskMb: freeDiskMb,
+            temperature: temperature,
+            cpuUsage: cpuUsage,
+            memPercentUsed: memPercentUsed,
+            throttleStatus: throttleStatus,
+            screenPoweredOff: isScreenPoweredOff,
+            nowPlayingId: URPNowPlaying,
+            blockPlaying: blockPlaying,
+            player: pl,
+            scheduleSummary: buildScheduleSummaryForStatus(),
+            wallActive: isWallActive(),
+            wallConfig: getWallConfigPublic(),
+            queues: {
+                ftp: FTPcontents.length,
+                render: renderQueue.length + (isRendering ? 1 : 0),
+                videoOpt: videoOptQueue.length + (isOptimizingVideo ? 1 : 0)
+            }
+        });
+    };
+    if (isPlaying && activePlayerProcess && activePlayerBin === 'mpv' && fs.existsSync(mpvIpcSocketPath)) {
+        mpvIpcRequest([
+            ['get_property', 'time-pos'],
+            ['get_property', 'duration'],
+            ['get_property', 'filename'],
+            ['get_property', 'pause']
+        ], function (err, ipcRes) {
+            var pos = (!err && ipcRes && ipcRes[1] && ipcRes[1].error === 'success') ? (parseFloat(ipcRes[1].data) || 0) : 0;
+            var dur = (!err && ipcRes && ipcRes[2] && ipcRes[2].error === 'success') ? (parseFloat(ipcRes[2].data) || 0) : 0;
+            var fname = (!err && ipcRes && ipcRes[3] && ipcRes[3].error === 'success') ? String(ipcRes[3].data || '') : '';
+            var paused = (!err && ipcRes && ipcRes[4] && ipcRes[4].error === 'success') ? Boolean(ipcRes[4].data) : false;
+            compose({
+                active: Boolean(isPlaying),
+                bin: activePlayerBin,
+                file: fname || (filesPlaying[0] || ''),
+                timePos: pos,
+                duration: dur,
+                paused: paused
+            });
+        });
+    } else {
+        compose({
+            active: Boolean(isPlaying),
+            bin: activePlayerBin || (activeFehProcess ? 'imagen' : 'idle'),
+            file: filesPlaying[0] || '',
+            timePos: 0,
+            duration: 0,
+            paused: false
+        });
+    }
+}
+
+function sendRemoteAckToManager(extraPayload, cb) {
+    if (!URPdata || !URPdata.idDisplay || !macAdd) {
+        if (typeof cb === 'function') cb();
+        return;
+    }
+    var payload = Object.assign({
+        idDisplay: URPdata.idDisplay,
+        macAddress: macAdd
+    }, extraPayload || {});
+    httpRequest({
+        url: 'http://' + baseUrl + '/ws/ackURPControl.php',
+        method: 'POST',
+        json: true,
+        timeout: 6000,
+        body: payload
+    }, function () {
+        if (typeof cb === 'function') cb();
+    });
+}
+
+function applyRemoteManagerConfig(cfg, cfgVersion) {
+    if (!cfg || typeof cfg !== 'object') return;
+    var verNum = parseInt(cfgVersion, 10) || 0;
+    loadWallConfig();
+    if (verNum > 0 && verNum <= (wallConfig.remoteConfigVersion || 0)) return;
+
+    var dimsBefore = getTargetVideoDims();
+    var prevRot = wallConfig.orientation;
+    var prevResMode = wallConfig.resolutionMode;
+    var prevVoMode = wallConfig.videoOutputMode || 'auto';
+    var patch = { remoteConfigVersion: Math.max(verNum, (wallConfig.remoteConfigVersion || 0) + 1) };
+    var needPlayerRestart = false;
+    var needAudioApply = false;
+    var needPowerApply = false;
+
+    if (cfg.resolutionMode === 'auto' || cfg.resolutionMode === '720p' || cfg.resolutionMode === '1080p' || cfg.resolutionMode === 'direct') {
+        if (cfg.resolutionMode !== wallConfig.resolutionMode) needPlayerRestart = true;
+        patch.resolutionMode = cfg.resolutionMode;
+    }
+    if (cfg.hdmi720p !== undefined) {
+        var nextHdmi = Boolean(cfg.hdmi720p);
+        if (nextHdmi !== wallConfig.hdmi720p) needPlayerRestart = true;
+        patch.hdmi720p = nextHdmi;
+    }
+    if (cfg.showStandbyScreen !== undefined) {
+        patch.showStandbyScreen = Boolean(cfg.showStandbyScreen);
+    }
+    if (cfg.orientation !== undefined) {
+        var oVal = parseInt(cfg.orientation, 10);
+        if ([0, 1, 2, 3].indexOf(oVal) !== -1 && oVal !== wallConfig.orientation) {
+            patch.orientation = oVal;
+            var rotRes = writeHdmiRotateToConfig(oVal);
+            patch.orientationOverride = !(rotRes && rotRes.ok);
+            needPlayerRestart = true;
+        }
+    }
+    if (cfg.videoOutputMode === 'auto' || cfg.videoOutputMode === 'x11_light' || cfg.videoOutputMode === 'gpu_egl' || cfg.videoOutputMode === 'drm') {
+        if (cfg.videoOutputMode !== prevVoMode) needPlayerRestart = true;
+        patch.videoOutputMode = cfg.videoOutputMode;
+        patch.drmMode = (cfg.videoOutputMode === 'drm');
+    }
+
+    if (cfg.audioVolume !== undefined) {
+        var v = Math.max(0, Math.min(100, parseInt(cfg.audioVolume, 10) || 0));
+        if (v !== wallConfig.audioVolume) needAudioApply = true;
+        patch.audioVolume = v;
+    }
+    if (cfg.audioMuted !== undefined) {
+        var m = Boolean(cfg.audioMuted);
+        if (m !== wallConfig.audioMuted) needAudioApply = true;
+        patch.audioMuted = m;
+    }
+    if (cfg.audioOutput === 'auto' || cfg.audioOutput === 'hdmi' || cfg.audioOutput === 'jack') {
+        if (cfg.audioOutput !== wallConfig.audioOutput) needAudioApply = true;
+        patch.audioOutput = cfg.audioOutput;
+    }
+
+    if (cfg.screenScheduleEnabled !== undefined) {
+        patch.screenScheduleEnabled = Boolean(cfg.screenScheduleEnabled);
+        needPowerApply = true;
+    }
+    if (cfg.screenOnTime !== undefined) {
+        patch.screenOnTime = sanitizeTimeHHMM(cfg.screenOnTime, wallConfig.screenOnTime);
+        needPowerApply = true;
+    }
+    if (cfg.screenOffTime !== undefined) {
+        patch.screenOffTime = sanitizeTimeHHMM(cfg.screenOffTime, wallConfig.screenOffTime);
+        needPowerApply = true;
+    }
+
+    if (cfg.enabled !== undefined) {
+        patch.enabled = Boolean(cfg.enabled);
+        needPlayerRestart = true;
+    }
+    if (cfg.activationMode === 'server' || cfg.activationMode === 'local') {
+        patch.activationMode = cfg.activationMode;
+        needPlayerRestart = true;
+    }
+    if (cfg.mode === 'tile' || cfg.mode === 'mirror') {
+        patch.mode = cfg.mode;
+        needPlayerRestart = true;
+    }
+    if (cfg.rows !== undefined) {
+        patch.rows = Math.max(1, Math.min(32, parseInt(cfg.rows, 10) || 1));
+        needPlayerRestart = true;
+    }
+    if (cfg.cols !== undefined) {
+        patch.cols = Math.max(1, Math.min(32, parseInt(cfg.cols, 10) || 1));
+        needPlayerRestart = true;
+    }
+    if (cfg.screenId !== undefined) {
+        patch.screenId = Math.max(1, Math.min(999, parseInt(cfg.screenId, 10) || 1));
+        needPlayerRestart = true;
+    }
+
+    saveWallConfigPartial(patch);
+    console.log('[REMOTE] Configuración v' + patch.remoteConfigVersion + ' recibida y aplicada desde tbee.tv.');
+
+    if (needAudioApply) applyAudioSettings();
+    if (needPowerApply) {
+        manualScreenOffOverride = null;
+        syncScreenPowerSchedule();
+    }
+    if (needPlayerRestart) {
+        mpvSafeFallback = false;
+        lastAppliedHdmiRes = '';
+        applyDisplayResolution720pIfNeeded(true);
+        applyDisplayRotationIfNeeded(null, true);
+        var dimsNow = getTargetVideoDims();
+        if ((dimsBefore.convertEnabled || dimsNow.convertEnabled) &&
+            (wallConfig.resolutionMode !== prevResMode || (wallConfig.orientation !== prevRot && (prevRot % 2 !== wallConfig.orientation % 2)))) {
+            clearWallDerivedCaches();
+        }
+        blockPlaying = 0;
+        stopOmx(function () { setTimeout(function () { checkSchedule(); }, 250); });
+    }
+    sendRemoteAckToManager({ appliedConfigVersion: patch.remoteConfigVersion });
+}
+
+function executeRemoteManagerCommand(cmd, cmdId) {
+    if (!cmd || !cmdId) return;
+    var cleanId = String(cmdId).trim();
+    if (!cleanId || cleanId === lastExecutedRemoteCmdId) return;
+    lastExecutedRemoteCmdId = cleanId;
+    console.log('[REMOTE:CMD] Ejecutando comando desde tbee.tv: ' + cmd);
+
+    if (cmd === 'reboot') {
+        sendRemoteAckToManager({ executedCommandId: cleanId, ok: true }, function () {
+            setTimeout(resetURP, 250);
+        });
+        return;
+    }
+    if (cmd === 'shutdown') {
+        sendRemoteAckToManager({ executedCommandId: cleanId, ok: true }, function () {
+            setTimeout(shutdownURP, 250);
+        });
+        return;
+    }
+
+    if (cmd === 'toggle_pause' && isPlaying && activePlayerProcess && activePlayerBin === 'mpv' && fs.existsSync(mpvIpcSocketPath)) {
+        mpvIpcRequest([['cycle', 'pause']], function () {});
+    } else if (cmd === 'next_item' && isPlaying && currentPlaylist.length > 0) {
+        if (activePlayerProcess && activePlayerBin === 'mpv' && currentPlaylist.length > 1 && fs.existsSync(mpvIpcSocketPath)) {
+            mpvIpcRequest([['playlist-next', 'force']], function (err) {
+                if (err) { currentMediaIndex++; playCurrentIndex(); }
+            });
+        } else {
+            currentMediaIndex++;
+            playCurrentIndex();
+        }
+    } else if (cmd === 'restart_player') {
+        blockPlaying = 0;
+        stopOmx(function () { setTimeout(function () { checkSchedule(); }, 250); });
+    } else if (cmd === 'ota_update') {
+        checkGithubOTA(true);
+    } else if (cmd === 'gc') {
+        garbageCollectUnusedMedia(false);
+    } else if (cmd === 'clean_logs') {
+        execCleanLogs();
+    } else if (cmd === 'delete_contents') {
+        deleteContentFiles();
+    } else if (cmd === 'screen_on') {
+        manualScreenOffOverride = false;
+        applyScreenPowerState(true);
+    } else if (cmd === 'screen_off') {
+        manualScreenOffOverride = true;
+        applyScreenPowerState(false);
+    } else if (cmd === 'screen_auto') {
+        manualScreenOffOverride = null;
+        syncScreenPowerSchedule();
+    }
+
+    sendRemoteAckToManager({ executedCommandId: cleanId, ok: true });
+}
+
+function stopLiveSessionLoop() {
+    liveSessionUntilMs = 0;
+    if (liveSessionIntervalId) {
+        clearInterval(liveSessionIntervalId);
+        liveSessionIntervalId = null;
+    }
+}
+
+function syncLiveSessionStep() {
+    if (Date.now() > liveSessionUntilMs) {
+        stopLiveSessionLoop();
+        return;
+    }
+    if (liveStepInFlight || !URPdata || !URPdata.idDisplay || !macAdd) return;
+    liveStepInFlight = true;
+
+    captureLivePreview(function (ok, previewPath) {
+        var previewB64 = '';
+        try {
+            if (ok && fs.existsSync(previewPath)) {
+                var st = fs.statSync(previewPath);
+                if (st.size > 512 && st.size <= 245000) {
+                    previewB64 = fs.readFileSync(previewPath).toString('base64');
+                }
+            }
+        } catch (e) {}
+
+        buildCompactRemoteState(function (stateObj) {
+            httpRequest({
+                url: 'http://' + baseUrl + '/ws/urpLive.php',
+                method: 'POST',
+                json: true,
+                timeout: 8000,
+                body: {
+                    idDisplay: URPdata.idDisplay,
+                    macAddress: macAdd,
+                    previewJpgBase64: previewB64,
+                    logsText: recentLogs.slice(-100).join('\n'),
+                    state: stateObj
+                }
+            }, function (err, resp, d) {
+                liveStepInFlight = false;
+                if (err || !resp || resp.statusCode !== 200 || !d || typeof d !== 'object') return;
+                if (d.liveActive === false) {
+                    stopLiveSessionLoop();
+                } else if (d.liveActive === true) {
+                    liveSessionUntilMs = Date.now() + 90000;
+                }
+                if (d.urpConfig && d.urpConfigVersion) {
+                    applyRemoteManagerConfig(d.urpConfig, d.urpConfigVersion);
+                }
+                if (d.urpCommand && d.urpCommandId) {
+                    executeRemoteManagerCommand(d.urpCommand, d.urpCommandId);
+                }
+            });
+        });
+    });
+}
+
+function startOrExtendLiveSession() {
+    liveSessionUntilMs = Date.now() + 120000;
+    if (!liveSessionIntervalId) {
+        syncLiveSessionStep();
+        liveSessionIntervalId = setInterval(syncLiveSessionStep, 3500);
+    }
+}
+
+function formatManagerIpField() {
+    var lanIp = String(URPdata.URPIpAddress || '').trim();
+    var tsIp = String(getTailscaleIp() || '').trim();
+    if (lanIp && tsIp && lanIp !== tsIp) return lanIp + ' / ' + tsIp;
+    return lanIp || tsIp || '';
+}
+
 function callWS() {
     getIpAddress(function () {
         getURPHardData(function () {
-            var date = new Date();
-            var options = {
-                url: 'http://' + baseUrl + '/ws/URP.php',
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                json: true,
-                timeout: 10000,
-                body: {
-                    macAddress: macAdd,
-                    ip: URPdata.URPIpAddress,
-                    port: URPPort,
-                    day: date.getDate(),
-                    month: date.getMonth() + 1,
-                    weekDay: date.getDay() + 1,
-                    uptime: Math.round(process.uptime()),
-                    downloading: ftpWorking,
-                    freeSpace: URPFreeSpace,
-                    temperature: temperature,
-                    memPercentUsed: memPercentUsed,
-                    cpuUsage: cpuUsage,
-                    idContent: URPNowPlaying,
-                    type: URPType,
-                    version: URPVersion
-                }
-            };
-
-            httpRequest(options, function (err, httpResponse, data) {
-                if (!err && httpResponse && httpResponse.statusCode == 200) {
-                    respuesta = true;
-                    if (data && typeof data === 'object') {
-                        if (data.reboot === 1 || data.reboot === '1') {
-                            httpRequest({
-                                url: 'http://' + baseUrl + '/ws/updateRebootDisplay.php',
-                                method: 'POST',
-                                json: true,
-                                timeout: 5000,
-                                body: { idDisplay: data.idDisplay || URPdata.idDisplay, reboot: 0 }
-                            }, function () { resetURP(); });
-                            return;
-                        }
-                        if (data.shutdown === 1 || data.shutdown === '1') {
-                            httpRequest({
-                                url: 'http://' + baseUrl + '/ws/updateShutdownDisplay.php',
-                                method: 'POST',
-                                json: true,
-                                timeout: 3000,
-                                body: { idDisplay: data.idDisplay || URPdata.idDisplay, shutdown: 0 }
-                            }, function () { shutdownURP(); });
-                            return;
-                        }
-                        if (data.deleteContents === 1 || data.deleteContents === '1' || data.deleteContent === 1 || data.deleteContent === '1') {
-                            deleteContentFiles();
-                        }
-
-                        if (!URPUpdated && data.URPVersion) checkURPVersion(data.URPVersion, data.URPCodeMD5);
-
-                        URPdata.idURP = data.idURP;
-                        ftpHost = data.ftpHost;
-                        ftpPort = data.ftpPort || 21;
-                        ftpUser = data.ftpUser;
-                        if (data.ftpPass) ftpPass = decrypt(data.ftpPass);
-                        ftpBasePath = data.ftpBasePath || '';
-
-                        if (data.checkTime && data.checkTime * 60000 !== WSCheckTime) {
-                            WSCheckTime = data.checkTime * 60000;
-                            setWSCheckInterval();
-                        }
-
-                        var prevWallActive = isWallActive();
-                        if (data.videoWall == 1 || data.videoWall === '1' || data.videoWall === true) {
-                            URPdata.isVideoWall = true;
-                            wall = data.wall || [];
-                        } else {
-                            URPdata.isVideoWall = false;
-                            wall = [];
-                        }
-                        var nextWallActive = isWallActive();
-                        if (prevWallActive !== nextWallActive) {
-                            console.log('[VIDEOWALL:REMOTO] tbee.tv cambió Video Wall -> ' + (nextWallActive ? 'ACTIVADO' : 'DESACTIVADO'));
-                            stopOmx(function () { setTimeout(function () { checkSchedule(); }, 300); });
-                        }
-
-                        URPdata.idCustomer = data.idCustomer;
-                        URPdata.idZone = data.idZone;
-                        URPdata.idStore = data.idStore;
-                        URPdata.idDisplay = data.idDisplay;
-                        URPdata.autoReboot = data.autoReboot;
-                        URPdata.autoRebootDay = data.autoRebootDay;
-                        URPdata.autoRebootHour = data.autoRebootHour;
-                        URPdata.autoRebootMinute = data.autoRebootMinute;
-                        URPdata.vertical = (data.vertical == 1);
-
-                        var mgrHostInfo = resolveManagerHostname(data);
-                        if (mgrHostInfo.label) URPdata.managerName = mgrHostInfo.label;
-                        if (mgrHostInfo.hostname) {
-                            URPdata.managerHostname = mgrHostInfo.hostname;
-                            syncSystemAndTailscaleHostname(mgrHostInfo.hostname);
-                        }
-                        ensureTailscaleEnrolled(mgrHostInfo.hostname, data.tailscaleAuthKey || data.tsAuthKey || '');
-
-                        if (data.cleanLogs == 1 || data.cleanLogs === '1') cleanLogs();
-                        if (data.uploadLogs == 1 || data.uploadLogs === '1') uploadLogs();
-                        if (data.screenshot == 1 || data.screenshot === '1') takeScreenshot();
-                        if (data.background == 1 || data.background === '1') downloadBackgroundFile();
-
-                        if (data.blocks != undefined) {
-                            if (data.blocks.length > 0) {
-                                var newBlocksStr = JSON.stringify(data.blocks);
-                                var oldBlocksStr = JSON.stringify(schedule);
-                                if (newBlocksStr !== oldBlocksStr) {
-                                    console.log("[SCHEDULE] Nueva programación recibida (" + data.blocks.length + " bloques).");
-                                    schedule = data.blocks;
-                                    if (db) db.put('schedule', newBlocksStr);
-                                    checkContentsFTP();
-                                    checkSchedule();
-                                    setTimeout(prebuildAllScheduleBlocks, 2000);
-                                } else {
-                                    checkContentsFTP();
-                                }
-                            } else {
-                                schedule = [];
-                                contents = [];
-                                max = 0;
-                                blockPlaying = 0;
-                                URPNowPlaying = 0;
-                                if (db) {
-                                    db.del('schedule', function () {});
-                                    db.del('contents', function () {});
-                                }
-                                stopOmx(function () { setBackground(); });
-                            }
-                        }
-                        if (db) db.put('URPData', JSON.stringify(URPdata));
+            buildCompactRemoteState(function (urpStateObj) {
+                var date = new Date();
+                var options = {
+                    url: 'http://' + baseUrl + '/ws/URP.php',
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    json: true,
+                    timeout: 10000,
+                    body: {
+                        macAddress: macAdd,
+                        ip: formatManagerIpField(),
+                        port: URPPort,
+                        day: date.getDate(),
+                        month: date.getMonth() + 1,
+                        weekDay: date.getDay() + 1,
+                        uptime: Math.round(process.uptime()),
+                        downloading: ftpWorking,
+                        freeSpace: URPFreeSpace,
+                        temperature: temperature,
+                        memPercentUsed: memPercentUsed,
+                        cpuUsage: cpuUsage,
+                        idContent: URPNowPlaying,
+                        type: URPType,
+                        version: URPVersion,
+                        urpState: urpStateObj
                     }
-                }
+                };
+
+                httpRequest(options, function (err, httpResponse, data) {
+                    if (!err && httpResponse && httpResponse.statusCode == 200) {
+                        respuesta = true;
+                        if (data && typeof data === 'object') {
+                            if (data.reboot === 1 || data.reboot === '1') {
+                                httpRequest({
+                                    url: 'http://' + baseUrl + '/ws/updateRebootDisplay.php',
+                                    method: 'POST',
+                                    json: true,
+                                    timeout: 5000,
+                                    body: { idDisplay: data.idDisplay || URPdata.idDisplay, reboot: 0 }
+                                }, function () { resetURP(); });
+                                return;
+                            }
+                            if (data.shutdown === 1 || data.shutdown === '1') {
+                                httpRequest({
+                                    url: 'http://' + baseUrl + '/ws/updateShutdownDisplay.php',
+                                    method: 'POST',
+                                    json: true,
+                                    timeout: 3000,
+                                    body: { idDisplay: data.idDisplay || URPdata.idDisplay, shutdown: 0 }
+                                }, function () { shutdownURP(); });
+                                return;
+                            }
+                            if (data.deleteContents === 1 || data.deleteContents === '1' || data.deleteContent === 1 || data.deleteContent === '1') {
+                                deleteContentFiles();
+                            }
+
+                            if (!URPUpdated && data.URPVersion) checkURPVersion(data.URPVersion, data.URPCodeMD5);
+
+                            URPdata.idURP = data.idURP;
+                            ftpHost = data.ftpHost;
+                            ftpPort = data.ftpPort || 21;
+                            ftpUser = data.ftpUser;
+                            if (data.ftpPass) ftpPass = decrypt(data.ftpPass);
+                            ftpBasePath = data.ftpBasePath || '';
+
+                            if (data.checkTime && data.checkTime * 60000 !== WSCheckTime) {
+                                WSCheckTime = data.checkTime * 60000;
+                                setWSCheckInterval();
+                            }
+
+                            var prevWallActive = isWallActive();
+                            if (data.videoWall == 1 || data.videoWall === '1' || data.videoWall === true) {
+                                URPdata.isVideoWall = true;
+                                wall = data.wall || [];
+                            } else {
+                                URPdata.isVideoWall = false;
+                                wall = [];
+                            }
+                            var nextWallActive = isWallActive();
+                            if (prevWallActive !== nextWallActive) {
+                                console.log('[VIDEOWALL:REMOTO] tbee.tv cambió Video Wall -> ' + (nextWallActive ? 'ACTIVADO' : 'DESACTIVADO'));
+                                stopOmx(function () { setTimeout(function () { checkSchedule(); }, 300); });
+                            }
+
+                            URPdata.idCustomer = data.idCustomer;
+                            URPdata.idZone = data.idZone;
+                            URPdata.idStore = data.idStore;
+                            URPdata.idDisplay = data.idDisplay;
+                            URPdata.autoReboot = data.autoReboot;
+                            URPdata.autoRebootDay = data.autoRebootDay;
+                            URPdata.autoRebootHour = data.autoRebootHour;
+                            URPdata.autoRebootMinute = data.autoRebootMinute;
+                            URPdata.vertical = (data.vertical == 1);
+
+                            var mgrHostInfo = resolveManagerHostname(data);
+                            if (mgrHostInfo.label) URPdata.managerName = mgrHostInfo.label;
+                            if (mgrHostInfo.hostname) {
+                                URPdata.managerHostname = mgrHostInfo.hostname;
+                                syncSystemAndTailscaleHostname(mgrHostInfo.hostname);
+                            }
+                            ensureTailscaleEnrolled(mgrHostInfo.hostname, data.tailscaleAuthKey || data.tsAuthKey || '');
+
+                            if (data.cleanLogs == 1 || data.cleanLogs === '1') cleanLogs();
+                            if (data.uploadLogs == 1 || data.uploadLogs === '1') uploadLogs();
+                            if (data.screenshot == 1 || data.screenshot === '1') takeScreenshot();
+                            if (data.background == 1 || data.background === '1') downloadBackgroundFile();
+
+                            // Integración nativa tbee.tv <-> Panel Remoto (sin Tailscale)
+                            if (data.urpConfig && data.urpConfigVersion) {
+                                applyRemoteManagerConfig(data.urpConfig, data.urpConfigVersion);
+                            }
+                            if (data.urpCommand && data.urpCommandId) {
+                                executeRemoteManagerCommand(data.urpCommand, data.urpCommandId);
+                            }
+                            if (data.urpLiveSession === true) {
+                                startOrExtendLiveSession();
+                            }
+
+                            if (data.blocks != undefined) {
+                                if (data.blocks.length > 0) {
+                                    var newBlocksStr = JSON.stringify(data.blocks);
+                                    var oldBlocksStr = JSON.stringify(schedule);
+                                    if (newBlocksStr !== oldBlocksStr) {
+                                        console.log("[SCHEDULE] Nueva programación recibida (" + data.blocks.length + " bloques).");
+                                        schedule = data.blocks;
+                                        if (db) db.put('schedule', newBlocksStr);
+                                        checkContentsFTP();
+                                        checkSchedule();
+                                        if (getTargetVideoDims().convertEnabled) {
+                                            setTimeout(prebuildAllScheduleBlocks, 2000);
+                                        }
+                                    } else {
+                                        checkContentsFTP();
+                                    }
+                                } else {
+                                    schedule = [];
+                                    contents = [];
+                                    max = 0;
+                                    blockPlaying = 0;
+                                    URPNowPlaying = 0;
+                                    if (db) {
+                                        db.del('schedule', function () {});
+                                        db.del('contents', function () {});
+                                    }
+                                    stopOmx(function () { setBackground(); });
+                                }
+                            }
+                            if (db) db.put('URPData', JSON.stringify(URPdata));
+                        }
+                    }
+                });
             });
         });
     });
@@ -4493,7 +5478,7 @@ function buildLocalDashboardHtml() {
         '<style>' +
         '*{box-sizing:border-box}' +
         'body{margin:0;font-family:system-ui,-apple-system,sans-serif;background:#090d16;color:#e2e8f0;padding:18px}' +
-        '.wrap{max-width:1040px;margin:0 auto}' +
+        '.wrap{max-width:1080px;margin:0 auto}' +
         '.top{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px;margin-bottom:18px}' +
         'h1{margin:0;font-size:19px;color:#fff} h2{margin:0 0 8px 0;font-size:16px;color:#fff} .sub{font-size:12px;color:#94a3b8}' +
         '.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px;margin-bottom:14px}' +
@@ -4505,7 +5490,7 @@ function buildLocalDashboardHtml() {
         'button:hover{filter:brightness(1.15)} .b-blue{background:#2563eb}.b-indigo{background:#4f46e5}.b-amber{background:#d97706}.b-red{background:#dc2626}.b-green{background:#059669}.b-ghost{background:#0f172a;border:1px solid #334155}' +
         'pre{background:#030712;border:1px solid #1f2937;border-radius:10px;padding:12px;font-size:11px;line-height:1.45;max-height:290px;overflow:auto;color:#cbd5e1;margin:0}' +
         '.shot{max-width:100%;max-height:460px;object-fit:contain;border-radius:8px;border:1px solid #1f2937;background:#020617;display:block;margin:8px auto 0 auto}' +
-        '.pbarWrap{height:6px;background:#030712;border-radius:99px;overflow:hidden;margin-top:7px;border:1px solid #1f2937}' +
+        '.pbarWrap{height:6px;background:#030712;border-radius:6px;overflow:hidden;margin-top:7px;border:1px solid #1f2937}' +
         '.pbarFill{height:100%;width:0%;background:#3b82f6;transition:width .4s ease}' +
         '.liveHead{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}' +
         '.liveBadge{display:inline-block;padding:2px 8px;border-radius:6px;font-size:10px;font-weight:700;letter-spacing:.05em;background:#1e293b;color:#94a3b8}' +
@@ -4513,9 +5498,10 @@ function buildLocalDashboardHtml() {
         '.hide{display:none!important}' +
         '.msg{padding:10px 12px;border-radius:9px;font-size:12px;margin-bottom:14px;border:1px solid #1e40af;background:#0f172a;color:#bfdbfe;display:none}' +
         '.msg.err{border-color:#991b1b;background:#1f1215;color:#fecaca} .msg.ok{border-color:#065f46;background:#091f18;color:#a7f3d0}' +
-        '.fgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin-bottom:12px}' +
+        '.fgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-bottom:12px}' +
         'label.lbl{display:block;font-size:11px;color:#94a3b8;text-transform:uppercase;margin-bottom:5px}' +
-        'select,input[type=number],input[type=text]{width:100%;background:#030712;border:1px solid #334155;border-radius:8px;padding:8px 10px;color:#f8fafc;font-size:13px}' +
+        'select,input[type=number],input[type=text],input[type=password],input[type=time]{width:100%;background:#030712;border:1px solid #334155;border-radius:8px;padding:8px 10px;color:#f8fafc;font-size:13px}' +
+        'input[type=range]{width:100%;accent-color:#2563eb}' +
         '.stepRow{display:flex;gap:6px;align-items:center} .stepRow button{min-width:36px;padding:8px 10px}' +
         '.presets{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:10px} .pbtn{padding:6px 10px;font-size:11px;background:#0f172a;border:1px solid #334155}' +
         '.pbtn.on{background:#2563eb;border-color:#3b82f6}' +
@@ -4523,7 +5509,7 @@ function buildLocalDashboardHtml() {
         '.mgrid{display:inline-grid;gap:6px;background:#030712;padding:10px;border-radius:10px;border:1px solid #1f2937}' +
         '.mcell{min-width:54px;height:42px;border-radius:7px;border:1px solid #334155;background:#111827;color:#cbd5e1;font-size:11px;font-weight:700;display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer}' +
         '.mcell small{font-size:9px;font-weight:400;color:#64748b} .mcell.active{background:#2563eb;border-color:#60a5fa;color:#fff} .mcell.active small{color:#dbeafe}' +
-        '.warnBox{padding:9px 11px;border-radius:8px;background:#291d09;border:1px solid #b45309;color:#fde68a;font-size:12px;margin-top:8px;display:none;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}' +
+        '.warnBox{padding:9px 11px;border-radius:8px;background:#291d09;border:1px solid #b45309;color:#fde68a;font-size:12px;margin-bottom:12px;display:none;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}' +
         '.chkRow{display:flex;align-items:center;gap:8px;font-size:13px;color:#e2e8f0;padding-top:6px}' +
         '.agendaBlk{background:#030712;border:1px solid #1f2937;border-radius:10px;padding:10px 12px;margin-top:8px}' +
         '.agendaHead{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px;font-size:12px;font-weight:700;color:#e2e8f0}' +
@@ -4532,17 +5518,28 @@ function buildLocalDashboardHtml() {
         '.tag.on{background:#065f46;color:#6ee7b7} .tag.wait{background:#78350f;color:#fde68a}' +
         '</style></head><body><div class="wrap">' +
         '<div class="top"><div><h1><span id="titleMain">URP Signage Monitor</span> <span id="ver"></span></h1><div class="sub" id="meta">Cargando...</div></div>' +
-        '<div class="sub" id="conn"></div></div>' +
+        '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><div class="sub" id="conn"></div><button id="btnLogout" class="b-ghost hide" style="padding:6px 10px;font-size:11px">Cerrar sesión</button></div></div>' +
         '<div id="msgBox" class="msg"></div>' +
+        '<div id="hwAlert" class="warnBox"></div>' +
+
+        '<div id="viewLogin" class="hide"><div class="card" style="max-width:420px;margin:40px auto">' +
+        '<h2>Acceso Protegido (:8090)</h2>' +
+        '<div class="sub" style="margin-bottom:12px">Ingresá el PIN del panel para ver o administrar esta Raspberry Pi.</div>' +
+        '<label class="lbl" for="loginPin">PIN del panel</label>' +
+        '<input type="password" id="loginPin" placeholder="Ingresá tu PIN" autocomplete="current-password">' +
+        '<div class="btns" style="margin-top:12px;margin-bottom:0"><button id="btnLogin" class="b-blue" style="width:100%">Desbloquear Panel</button></div>' +
+        '</div></div>' +
 
         '<div id="viewMonitor">' +
         '<div class="grid" style="margin-bottom:0">' +
         '<div class="card"><div class="k">Reproduciendo</div><div class="v" id="now" style="font-size:13px;word-break:break-all">-</div><div class="pbarWrap"><div id="pbar" class="pbarFill"></div></div><div class="sub" id="ptime" style="margin-top:4px">-</div></div>' +
-        '<div class="card"><div class="k">CPU / RAM / Temp</div><div class="v" id="hw">-</div></div>' +
-        '<div class="card"><div class="k">Disco Libre</div><div class="v" id="disk">-</div></div>' +
-        '<div class="card"><div class="k">Video Wall</div><div class="v" id="vw" style="font-size:13px">-</div></div>' +
+        '<div class="card"><div class="k">CPU / RAM / Temp</div><div class="v" id="hw">-</div><div class="sub" id="hwExtra" style="margin-top:4px">-</div></div>' +
+        '<div class="card"><div class="k">Disco Libre / Pantalla</div><div class="v" id="disk">-</div><div class="sub" id="powerSub" style="margin-top:4px">-</div></div>' +
+        '<div class="card"><div class="k">Video Wall</div><div class="v" id="vw" style="font-size:13px">-</div><div class="sub" id="uptimeSub" style="margin-top:4px">-</div></div>' +
         '</div>' +
         '<div class="btns">' +
+        '<button id="btnTogglePause" class="b-ghost">Pausar / Reanudar</button>' +
+        '<button id="btnNextItem" class="b-ghost">Siguiente ítem</button>' +
         '<button id="btnOpenWall" class="b-indigo">Configurar Video Wall</button>' +
         '<button id="btnRestartPlayer" class="b-amber">Reiniciar Reproductor</button>' +
         '<button id="btnUpdate" class="b-blue">Buscar OTA GitHub</button>' +
@@ -4553,14 +5550,15 @@ function buildLocalDashboardHtml() {
         '<button id="btnDelete" class="b-red">Borrar Contenidos</button>' +
         '</div>' +
         '<div class="card"><div class="liveHead" style="margin-bottom:10px">' +
-        '<div class="k" style="margin:0">Resolución de Conversión y Rotación de Pantalla</div>' +
+        '<div class="k" style="margin:0">Modo / Resolución de Conversión y Rotación de Pantalla</div>' +
         '<button type="button" id="btnSaveDisplay" class="b-green">Aplicar Pantalla / Conversión</button>' +
         '</div>' +
         '<div class="fgrid" style="margin-bottom:6px">' +
-        '<div><label class="lbl" for="mResMode">Resolución de conversión (videos e imágenes)</label><select id="mResMode">' +
-        '<option value="auto">Automática (720p en Pi 3 / 1080p en Pi 4-5)</option>' +
-        '<option value="720p">1280x720 (720p Fluido - Bajo CPU/RAM)</option>' +
-        '<option value="1080p">1920x1080 (Full HD 1080p)</option>' +
+        '<div><label class="lbl" for="mResMode">Conversión de contenido (videos e imágenes)</label><select id="mResMode">' +
+        '<option value="auto">Inteligente / Bajo CPU (Imágenes MP4 + H.264 hasta 1080p directo)</option>' +
+        '<option value="720p">Forzar conversión todo a 1280x720 (Solo si suben 4K/pesados)</option>' +
+        '<option value="1080p">Forzar conversión todo a 1920x1080 (Full HD 1080p)</option>' +
+        '<option value="direct">Directo puro (Sin conversión ffmpeg)</option>' +
         '</select></div>' +
         '<div><label class="lbl" for="mOrient">Rotación de contenido / HDMI</label><select id="mOrient">' +
         '<option value="0">0° Horizontal Normal</option>' +
@@ -4568,9 +5566,46 @@ function buildLocalDashboardHtml() {
         '<option value="2">180° Invertido</option>' +
         '<option value="3">270° Vertical Izquierda</option>' +
         '</select></div>' +
+        '<div><label class="lbl" for="mVoMode">Salida / Aceleración de Video</label><select id="mVoMode">' +
+        '<option value="auto">Automática (Detecta EGL / X11 Ligero / DRM)</option>' +
+        '<option value="x11_light">X11 Ligero sin OpenGL (Menor CPU en Pi 3B+)</option>' +
+        '<option value="gpu_egl">GPU OpenGL ES / EGL (VideoCore)</option>' +
+        '<option value="drm">DRM / KMS Directo (Sin escritorio X11)</option>' +
+        '</select></div>' +
         '</div>' +
-        '<label class="chkRow"><input type="checkbox" id="mHdmi720"> Ajustar salida HDMI/X11 a 1280x720 cuando el modo esté en 720p</label>' +
+        '<label class="chkRow"><input type="checkbox" id="mHdmi720"> Ajustar salida HDMI/X11 a 1280x720 en Pi 3B+ o modo 720p (0% CPU, mejora fluidez)</label>' +
+        '<label class="chkRow"><input type="checkbox" id="mStandby"> Mostrar pantalla de espera URP cuando aún no haya programación cargada</label>' +
         '</div>' +
+
+        '<div class="fgrid" style="margin-bottom:0">' +
+        '<div class="card"><div class="liveHead" style="margin-bottom:10px">' +
+        '<div class="k" style="margin:0">Control de Audio y Volumen</div>' +
+        '<button type="button" id="btnSaveAudio" class="b-blue">Aplicar Audio</button>' +
+        '</div>' +
+        '<div class="fgrid" style="margin-bottom:6px">' +
+        '<div><label class="lbl" for="aVol">Volumen (<span id="aVolVal">100</span>%)</label><input type="range" id="aVol" min="0" max="100" step="5" value="100"></div>' +
+        '<div><label class="lbl" for="aOut">Salida de Audio</label><select id="aOut">' +
+        '<option value="auto">Automática del sistema</option>' +
+        '<option value="hdmi">HDMI (TV)</option>' +
+        '<option value="jack">Jack 3.5mm (Auriculares/Parlantes)</option>' +
+        '</select></div>' +
+        '</div>' +
+        '<label class="chkRow"><input type="checkbox" id="aMuted"> Silenciar audio (Mute)</label>' +
+        '</div>' +
+
+        '<div class="card"><div class="liveHead" style="margin-bottom:10px">' +
+        '<div class="k" style="margin:0">Ahorro de Energía (Horario HDMI)</div>' +
+        '<button type="button" id="btnSavePower" class="b-indigo">Guardar Horario</button>' +
+        '</div>' +
+        '<div class="fgrid" style="margin-bottom:6px">' +
+        '<div><label class="lbl" for="pOn">Encender HDMI</label><input type="time" id="pOn" value="08:00"></div>' +
+        '<div><label class="lbl" for="pOff">Apagar HDMI</label><input type="time" id="pOff" value="22:00"></div>' +
+        '</div>' +
+        '<label class="chkRow" style="margin-bottom:8px"><input type="checkbox" id="pSchedEn"> Activar apagado/encendido automático de TV</label>' +
+        '<div class="btns" style="margin:0"><button type="button" id="btnHdmiOn" class="b-green">Encender HDMI Ahora</button><button type="button" id="btnHdmiOff" class="b-amber">Apagar HDMI Ahora</button><button type="button" id="btnHdmiAuto" class="b-ghost">Modo Automático</button></div>' +
+        '</div>' +
+        '</div>' +
+
         '<div class="card"><div class="liveHead">' +
         '<div><span class="k" style="margin-right:8px">Monitor Visual en Vivo</span><span id="liveBadge" class="liveBadge">PAUSADO</span><div class="sub" id="liveMeta" style="margin-top:2px">Activá Vista en Vivo para supervisar la pantalla desde cualquier ubicación (sin subir al FTP)</div></div>' +
         '<div class="btns" style="margin:0">' +
@@ -4581,8 +5616,27 @@ function buildLocalDashboardHtml() {
         '<div id="liveEmpty" class="sub" style="padding:18px;text-align:center;border:1px dashed #334155;border-radius:8px;margin-top:6px">Sin captura cargada todavía. Pulsá &ldquo;Capturar Ahora&rdquo; o &ldquo;Activar Vista en Vivo&rdquo;.</div>' +
         '<img id="shotImg" class="shot" style="display:none" alt="Vista previa pantalla">' +
         '</div>' +
+
         '<div class="card"><div class="k">Agenda Cargada</div><div id="queues" class="sub" style="margin-top:4px">-</div><div id="agendaList" class="sub" style="margin-top:6px">Cargando agenda...</div></div>' +
-        '<div class="card"><div class="k">Logs en vivo</div><pre id="logs">Cargando...</pre></div>' +
+
+        '<div class="card"><div class="liveHead" style="margin-bottom:8px">' +
+        '<div class="k" style="margin:0">Logs en vivo</div>' +
+        '<div class="btns" style="margin:0;align-items:center">' +
+        '<input type="text" id="logFilter" placeholder="Filtrar logs (ej: ERR, OTA, PLAYER)" style="width:200px;padding:6px 9px;font-size:12px">' +
+        '<label class="chkRow" style="padding:0;font-size:11px"><input type="checkbox" id="logFreeze"> Pausar scroll</label>' +
+        '<button type="button" id="btnRefreshLogs" class="b-ghost" style="padding:6px 10px">Refrescar</button>' +
+        '<button type="button" id="btnDownloadLogs" class="b-ghost" style="padding:6px 10px">Descargar .txt</button>' +
+        '</div></div><pre id="logs">Cargando...</pre></div>' +
+
+        '<div class="card"><div class="liveHead" style="margin-bottom:8px">' +
+        '<div><div class="k" style="margin:0">Seguridad del Panel (:8090)</div><div class="sub" id="secState">Cargando estado de seguridad...</div></div>' +
+        '</div>' +
+        '<div id="secFormWrap" class="fgrid" style="margin-bottom:8px">' +
+        '<div id="secCurWrap" class="hide"><label class="lbl" for="secCurPin">PIN actual</label><input type="password" id="secCurPin" placeholder="PIN actual"></div>' +
+        '<div><label class="lbl" for="secNewPin">Nuevo PIN (mín. 4 caracteres)</label><input type="password" id="secNewPin" placeholder="Ej: 4829"></div>' +
+        '</div>' +
+        '<div id="secBtns" class="btns" style="margin:0"><button type="button" id="btnSavePin" class="b-blue">Guardar PIN</button><button type="button" id="btnClearPin" class="b-ghost hide">Quitar PIN</button></div>' +
+        '</div>' +
         '</div>' +
 
         '<div id="viewWall" class="hide">' +
@@ -4634,10 +5688,11 @@ function buildLocalDashboardHtml() {
         '<option value="2">180° Invertido</option>' +
         '<option value="3">270° Vertical Izquierda</option>' +
         '</select></div>' +
-        '<div><label class="lbl" for="wResMode">Resolución de Video / Imágenes</label><select id="wResMode">' +
-        '<option value="auto">Automática (720p en Pi 3 / 1080p en Pi 4-5)</option>' +
-        '<option value="720p">1280x720 (720p Fluido - Recomendado Pi 3B+)</option>' +
-        '<option value="1080p">1920x1080 (Full HD 1080p)</option>' +
+        '<div><label class="lbl" for="wResMode">Conversión de Video / Imágenes</label><select id="wResMode">' +
+        '<option value="auto">Inteligente / Bajo CPU (Imágenes MP4 + H.264 hasta 1080p directo)</option>' +
+        '<option value="720p">Forzar conversión todo a 1280x720 (720p Fluido)</option>' +
+        '<option value="1080p">Forzar conversión todo a 1920x1080 (Full HD 1080p)</option>' +
+        '<option value="direct">Directo puro (En Mosaico recorta automático)</option>' +
         '</select></div>' +
         '</div>' +
         '<div class="fgrid">' +
@@ -4665,20 +5720,78 @@ function buildLocalDashboardHtml() {
 
         '</div><script>' +
         'var lastStatus = null;' +
+        'var authToken = "";' +
+        'var isLocked = false;' +
         'var wallLoaded = false;' +
         'var displaySynced = false;' +
+        'var audioPowerSynced = false;' +
         'var liveActive = false;' +
         'var liveTimer = null;' +
         'var liveInFlight = false;' +
+        'var lastPreviewBlobUrl = "";' +
+        'var rawLogsArr = [];' +
         'var nl = String.fromCharCode(10);' +
         'function byId(id){ return document.getElementById(id); }' +
         'function pad2(n){ n = parseInt(n, 10) || 0; return (n < 10 ? "0" : "") + n; }' +
+        'function fmtUptime(sec){' +
+        '  var s = Math.max(0, Math.floor(sec || 0));' +
+        '  var d = Math.floor(s / 86400); s %= 86400;' +
+        '  var h = Math.floor(s / 3600); s %= 3600;' +
+        '  var m = Math.floor(s / 60);' +
+        '  return (d > 0 ? (d + "d ") : "") + h + "h " + m + "m";' +
+        '}' +
+        'function setAuthLocked(locked){' +
+        '  isLocked = Boolean(locked);' +
+        '  if (isLocked) {' +
+        '    if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; }' +
+        '    byId("viewLogin").className = "";' +
+        '    byId("viewMonitor").className = "hide";' +
+        '    byId("viewWall").className = "hide";' +
+        '  } else {' +
+        '    byId("viewLogin").className = "hide";' +
+        '    byId("viewMonitor").className = "";' +
+        '  }' +
+        '}' +
+        'function authFetch(url, opts){' +
+        '  opts = opts || {};' +
+        '  var hdrs = Object.assign({}, opts.headers || {});' +
+        '  if (authToken) hdrs["Authorization"] = "Bearer " + authToken;' +
+        '  return fetch(url, Object.assign({}, opts, { headers: hdrs })).then(function(r){' +
+        '    if (r.status === 401) {' +
+        '      authToken = "";' +
+        '      setAuthLocked(true);' +
+        '    }' +
+        '    return r;' +
+        '  });' +
+        '}' +
         'function syncDisplayQuickForm(cfg, effOrient){' +
         '  if (!cfg) return;' +
-        '  byId("mResMode").value = (cfg.resolutionMode === "720p" || cfg.resolutionMode === "1080p") ? cfg.resolutionMode : "auto";' +
+        '  byId("mResMode").value = (cfg.resolutionMode === "720p" || cfg.resolutionMode === "1080p" || cfg.resolutionMode === "direct") ? cfg.resolutionMode : "auto";' +
         '  var rotVal = (typeof effOrient === "number" && effOrient >= 0 && effOrient <= 3) ? effOrient : clampInt(cfg.orientation, 0, 3, 0);' +
         '  byId("mOrient").value = String(rotVal);' +
+        '  byId("mVoMode").value = (cfg.videoOutputMode === "x11_light" || cfg.videoOutputMode === "gpu_egl" || cfg.videoOutputMode === "drm") ? cfg.videoOutputMode : (cfg.drmMode ? "drm" : "auto");' +
         '  byId("mHdmi720").checked = (cfg.hdmi720p !== false);' +
+        '  byId("mStandby").checked = (cfg.showStandbyScreen !== false);' +
+        '}' +
+        'function syncAudioAndPowerForm(cfg){' +
+        '  if (!cfg) return;' +
+        '  var vol = (typeof cfg.audioVolume === "number") ? clampInt(cfg.audioVolume, 0, 100, 100) : 100;' +
+        '  byId("aVol").value = vol;' +
+        '  byId("aVolVal").textContent = String(vol);' +
+        '  byId("aOut").value = (cfg.audioOutput === "hdmi" || cfg.audioOutput === "jack") ? cfg.audioOutput : "auto";' +
+        '  byId("aMuted").checked = Boolean(cfg.audioMuted);' +
+        '  byId("pOn").value = cfg.screenOnTime || "08:00";' +
+        '  byId("pOff").value = cfg.screenOffTime || "22:00";' +
+        '  byId("pSchedEn").checked = Boolean(cfg.screenScheduleEnabled);' +
+        '}' +
+        'function renderLogsBox(){' +
+        '  var box = byId("logs");' +
+        '  var q = String(byId("logFilter").value || "").trim().toLowerCase();' +
+        '  var filtered = !q ? rawLogsArr : rawLogsArr.filter(function(ln){ return String(ln).toLowerCase().indexOf(q) !== -1; });' +
+        '  box.textContent = filtered.join(nl) || "Sin logs coincidentes";' +
+        '  if (!byId("logFreeze").checked) {' +
+        '    box.scrollTop = box.scrollHeight;' +
+        '  }' +
         '}' +
         'function renderAgenda(blocks){' +
         '  var box = byId("agendaList");' +
@@ -4753,28 +5866,32 @@ function buildLocalDashboardHtml() {
         '  return Math.max(min, Math.min(max, n));' +
         '}' +
         'function scheduleLiveNext(){' +
-        '  if (!liveActive) return;' +
+        '  if (!liveActive || isLocked) return;' +
         '  if (liveTimer) clearTimeout(liveTimer);' +
         '  var ms = clampInt(byId("liveInt").value, 1000, 30000, 3000);' +
         '  liveTimer = setTimeout(fetchLiveFrame, ms);' +
         '}' +
         'function fetchLiveFrame(){' +
-        '  if (liveInFlight) return;' +
+        '  if (liveInFlight || isLocked) return;' +
         '  liveInFlight = true;' +
         '  var img = byId("shotImg");' +
-        '  img.onload = function(){' +
+        '  authFetch("/api/preview.jpg?t=" + Date.now()).then(function(r){' +
+        '    if (!r.ok) throw new Error("no frame");' +
+        '    return r.blob();' +
+        '  }).then(function(blob){' +
         '    liveInFlight = false;' +
+        '    if (lastPreviewBlobUrl) { try { URL.revokeObjectURL(lastPreviewBlobUrl); } catch (e) {} }' +
+        '    lastPreviewBlobUrl = URL.createObjectURL(blob);' +
         '    byId("liveEmpty").style.display = "none";' +
         '    img.style.display = "block";' +
+        '    img.src = lastPreviewBlobUrl;' +
         '    byId("liveMeta").textContent = "Último frame capturado: " + new Date().toLocaleTimeString();' +
         '    scheduleLiveNext();' +
-        '  };' +
-        '  img.onerror = function(){' +
+        '  }).catch(function(){' +
         '    liveInFlight = false;' +
         '    byId("liveMeta").textContent = "Sin frame disponible aún (esperando reproductor...)";' +
         '    scheduleLiveNext();' +
-        '  };' +
-        '  img.src = "/api/preview.jpg?t=" + Date.now();' +
+        '  });' +
         '}' +
         'function setLiveMode(on){' +
         '  liveActive = Boolean(on);' +
@@ -4807,7 +5924,7 @@ function buildLocalDashboardHtml() {
         '  else if (cfg.syncMode === "master") { byId("wSync").value = "master"; }' +
         '  else { byId("wSync").value = "ntp"; }' +
         '  byId("wMasterIp").value = cfg.masterIp || "";' +
-        '  byId("wResMode").value = (cfg.resolutionMode === "720p" || cfg.resolutionMode === "1080p") ? cfg.resolutionMode : "auto";' +
+        '  byId("wResMode").value = (cfg.resolutionMode === "720p" || cfg.resolutionMode === "1080p" || cfg.resolutionMode === "direct") ? cfg.resolutionMode : "auto";' +
         '  byId("wHdmi720").checked = (cfg.hdmi720p !== false);' +
         '  byId("wDrm").checked = Boolean(cfg.drmMode);' +
         '  byId("vwSub").textContent = "Control tbee.tv ahora: " + (serverFlag ? "ACTIVO" : "DESACTIVADO") + " | Soporta IDs 1..999 y matrices hasta 32x32";' +
@@ -4880,57 +5997,98 @@ function buildLocalDashboardHtml() {
         '  if (liveActive) scheduleLiveNext();' +
         '}' +
         'function refresh(){' +
-        '  fetch("/api/status").then(function(r){ return r.json(); }).then(function(s){' +
+        '  if (isLocked) return;' +
+        '  authFetch("/api/status").then(function(r){' +
+        '    if (r.status === 401) return null;' +
+        '    return r.json();' +
+        '  }).then(function(s){' +
+        '    if (!s) return;' +
         '    lastStatus = s;' +
         '    var displayTitle = s.managerName || s.hostname || "URP Signage Monitor";' +
         '    byId("titleMain").textContent = displayTitle;' +
         '    document.title = displayTitle + " • v" + s.version;' +
         '    byId("ver").textContent = "v" + s.version;' +
-        '    byId("meta").textContent = (s.model || "Linux") + " • Host " + (s.hostname || "-") + " • IP " + (s.ip || "-") + (s.tailscaleIp ? (" • Tailscale " + s.tailscaleIp) : "") + " • " + s.displayBackend + (s.targetResolution ? (" • " + s.targetResolution) : "");' +
+        '    byId("meta").textContent = (s.model || "Linux") + " • Host " + (s.hostname || "-") + " • IP " + (s.ip || "-") + (s.tailscaleIp ? (" • Tailscale " + s.tailscaleIp) : "") + " • " + s.displayBackend + (s.targetResolution ? (" • " + s.targetResolution) : "") + (s.playerDriver ? (" • " + s.playerDriver) : "");' +
         '    byId("conn").textContent = s.connection ? "tbee.tv ONLINE" : "MODO OFFLINE";' +
+        '    var alertEl = byId("hwAlert");' +
+        '    if (s.throttleStatus && !s.throttleStatus.ok) {' +
+        '      alertEl.textContent = "Alerta de Hardware Raspberry Pi: " + s.throttleStatus.label + " (revisá fuente 5V 2.5A/3A o disipación).";' +
+        '      alertEl.style.display = "flex";' +
+        '    } else if (typeof s.freeDiskMb === "number" && s.freeDiskMb >= 0 && s.freeDiskMb < 600) {' +
+        '      alertEl.textContent = "Alerta de Disco: quedan solo " + s.freeDiskMb + " MB libres en microSD.";' +
+        '      alertEl.style.display = "flex";' +
+        '    } else {' +
+        '      alertEl.style.display = "none";' +
+        '    }' +
         '    var pl = s.player || {};' +
         '    var playingLabel = (pl.file || s.filesPlaying.join(", ") || "En espera");' +
-        '    byId("now").textContent = playingLabel;' +
+        '    byId("now").textContent = (pl.paused ? "[PAUSA] " : "") + playingLabel;' +
+        '    byId("btnTogglePause").textContent = pl.paused ? "Reanudar" : "Pausar / Reanudar";' +
         '    if (pl.duration && pl.duration > 0) {' +
         '      var pct = Math.max(0, Math.min(100, Math.round((pl.timePos / pl.duration) * 100)));' +
         '      byId("pbar").style.width = pct + "%";' +
-        '      byId("ptime").textContent = fmtSec(pl.timePos) + " / " + fmtSec(pl.duration) + " (" + pct + "%) • " + (pl.bin || "mpv");' +
+        '      byId("ptime").textContent = fmtSec(pl.timePos) + " / " + fmtSec(pl.duration) + " (" + pct + "%) • " + (s.playerDriver || pl.bin || "mpv");' +
         '    } else {' +
         '      byId("pbar").style.width = "0%";' +
-        '      byId("ptime").textContent = pl.active ? ("Motor: " + (pl.bin || "-")) : "Sin reproducción activa";' +
+        '      byId("ptime").textContent = pl.active ? ("Motor: " + (s.playerDriver || pl.bin || "-")) : (s.screenPoweredOff ? "Pantalla apagada por ahorro de energía" : "Sin reproducción activa");' +
         '    }' +
         '    byId("hw").textContent = s.cpuUsage + "% / " + s.memPercentUsed + "% / " + s.temperature + "°C";' +
+        '    byId("hwExtra").textContent = "Energía: " + ((s.throttleStatus && s.throttleStatus.label) ? s.throttleStatus.label : "OK");' +
         '    byId("disk").textContent = s.freeSpace;' +
+        '    byId("powerSub").textContent = "HDMI: " + (s.screenPoweredOff ? "APAGADA" : "ENCENDIDA") + " • Audio: " + (s.wallConfig && s.wallConfig.audioMuted ? "MUTE" : ((s.wallConfig ? s.wallConfig.audioVolume : 100) + "%"));' +
         '    byId("vw").textContent = s.wallActive ? (s.wallConfig.mode + " " + s.wallConfig.rows + "x" + s.wallConfig.cols + " #" + s.wallConfig.screenId + " (drift " + (s.wallSyncStatus.driftMs || 0) + "ms)") : ("Normal (" + (s.wallConfig.activationMode === "server" ? "remoto tbee.tv OFF" : "desactivado") + ")");' +
+        '    byId("uptimeSub").textContent = "Uptime Pi: " + fmtUptime(s.osUptimeSec) + " • Proceso: " + fmtUptime(s.uptimeSec);' +
         '    byId("queues").textContent = "Bloque activo: " + s.blockPlaying + " | Bloques hoy: " + s.scheduleCount + " | Descargas FTP: " + s.queues.ftp + " | Imágenes: " + s.queues.render + " | Videos Opt: " + s.queues.videoOpt + " | Seamless activo: " + (s.queues.concatenating ? "Sí" : "No");' +
         '    renderAgenda(s.scheduleSummary || []);' +
-        '    byId("logs").textContent = (s.logs || []).join(nl) || "Sin logs";' +
+        '    rawLogsArr = Array.isArray(s.logs) ? s.logs : [];' +
+        '    renderLogsBox();' +
+        '    var sec = s.security || {};' +
+        '    byId("btnLogout").className = sec.pinEnabled ? "b-ghost" : "b-ghost hide";' +
+        '    if (sec.envManaged) {' +
+        '      byId("secState").textContent = "PIN administrado por variable de entorno URP_PANEL_PIN en el servidor.";' +
+        '      byId("secFormWrap").className = "hide";' +
+        '      byId("secBtns").className = "hide";' +
+        '    } else {' +
+        '      byId("secFormWrap").className = "fgrid";' +
+        '      byId("secBtns").className = "btns";' +
+        '      byId("secState").textContent = sec.pinEnabled ? "Panel protegido con PIN (sesión en memoria)." : "Sin PIN configurado (acceso abierto en LAN/Tailscale).";' +
+        '      byId("secCurWrap").className = sec.pinEnabled ? "" : "hide";' +
+        '      byId("btnClearPin").className = sec.pinEnabled ? "b-ghost" : "b-ghost hide";' +
+        '    }' +
         '    if (!wallLoaded && s.wallConfig) { syncToForm(s.wallConfig, s.serverVideoWallFlag); wallLoaded = true; }' +
         '    if (!displaySynced && s.wallConfig) { syncDisplayQuickForm(s.wallConfig, s.effectiveOrientation); displaySynced = true; }' +
+        '    if (!audioPowerSynced && s.wallConfig) { syncAudioAndPowerForm(s.wallConfig); audioPowerSynced = true; }' +
         '  }).catch(function(){});' +
+        '}' +
+        'function postJson(url, payload, onOk){' +
+        '  authFetch(url, {' +
+        '    method: "POST",' +
+        '    headers: { "Content-Type": "application/json" },' +
+        '    body: JSON.stringify(payload || {})' +
+        '  }).then(function(r){ return r.json(); }).then(function(res){' +
+        '    if (!res || !res.ok) { showMsg((res && res.error) ? res.error : "Error ejecutando acción", "err"); return; }' +
+        '    if (typeof onOk === "function") onOk(res);' +
+        '    refresh();' +
+        '  }).catch(function(e){ showMsg("Error: " + e.message, "err"); });' +
         '}' +
         'function saveDisplaySettings(){' +
         '  var payload = {' +
         '    resolutionMode: byId("mResMode").value,' +
         '    orientation: clampInt(byId("mOrient").value, 0, 3, 0),' +
-        '    hdmi720p: Boolean(byId("mHdmi720").checked)' +
+        '    videoOutputMode: byId("mVoMode").value,' +
+        '    hdmi720p: Boolean(byId("mHdmi720").checked),' +
+        '    showStandbyScreen: Boolean(byId("mStandby").checked)' +
         '  };' +
-        '  fetch("/api/display-settings", {' +
-        '    method: "POST",' +
-        '    headers: { "Content-Type": "application/json" },' +
-        '    body: JSON.stringify(payload)' +
-        '  }).then(function(r){ return r.json(); }).then(function(res){' +
-        '    if (!res || !res.ok) { showMsg((res && res.error) ? res.error : "Error guardando pantalla", "err"); return; }' +
+        '  postJson("/api/display-settings", payload, function(res){' +
         '    displaySynced = false;' +
         '    wallLoaded = false;' +
-        '    var info = "Configuración aplicada: " + (res.targetResolution || payload.resolutionMode) + ", rotación " + (payload.orientation * 90) + "°.";' +
+        '    var info = "Configuración aplicada: " + (res.targetResolution || payload.resolutionMode) + ", rotación " + (payload.orientation * 90) + "°, salida " + (payload.videoOutputMode || "auto") + ".";' +
         '    if (res.rotChanged) info += res.rotUpdated ? " (config.txt actualizado; rotación aplicada al reproductor)" : " (rotación aplicada en caliente por X11/mpv)";' +
         '    showMsg(info, "ok");' +
-        '    refresh();' +
-        '  }).catch(function(e){ showMsg("Error guardando configuración: " + e.message, "err"); });' +
+        '  });' +
         '}' +
         'function act(u){' +
-        '  fetch(u).then(function(r){ return r.text(); }).then(function(t){' +
+        '  authFetch(u).then(function(r){ return r.text(); }).then(function(t){' +
         '    showMsg(t, "ok");' +
         '    refresh();' +
         '  }).catch(function(e){ showMsg("Error: " + e.message, "err"); });' +
@@ -4958,20 +6116,80 @@ function buildLocalDashboardHtml() {
         '    resolutionMode: byId("wResMode").value,' +
         '    hdmi720p: Boolean(byId("wHdmi720").checked)' +
         '  };' +
-        '  fetch("/api/wall", {' +
-        '    method: "POST",' +
-        '    headers: { "Content-Type": "application/json" },' +
-        '    body: JSON.stringify(payload)' +
-        '  }).then(function(r){ return r.json(); }).then(function(res){' +
-        '    if (!res || !res.ok) { showMsg((res && res.error) ? res.error : "Error al guardar Video Wall", "err"); return; }' +
+        '  postJson("/api/wall", payload, function(res){' +
         '    wallLoaded = false;' +
         '    closeWallView();' +
         '    var info = "Video Wall guardado (" + res.config.mode + " " + res.config.rows + "x" + res.config.cols + " #" + res.config.screenId + ").";' +
         '    if (res.rotChanged) info += res.rotUpdated ? " HDMI rotate actualizado en config.txt (reiniciá la Pi para rotación física completa)." : " Aviso: rotación HDMI requiere sudo desde SSH (urp-wall).";' +
         '    showMsg(info, "ok");' +
-        '    refresh();' +
-        '  }).catch(function(e){ showMsg("Error guardando Video Wall: " + e.message, "err"); });' +
+        '  });' +
         '}' +
+        'byId("btnLogin").onclick = function(){' +
+        '  var pin = byId("loginPin").value;' +
+        '  fetch("/api/auth/login", {' +
+        '    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pin: pin })' +
+        '  }).then(function(r){ return r.json(); }).then(function(res){' +
+        '    if (!res || !res.ok || !res.token) { showMsg((res && res.error) ? res.error : "PIN incorrecto", "err"); return; }' +
+        '    authToken = res.token;' +
+        '    byId("loginPin").value = "";' +
+        '    showMsg("");' +
+        '    setAuthLocked(false);' +
+        '    refresh();' +
+        '  }).catch(function(e){ showMsg("Error de acceso: " + e.message, "err"); });' +
+        '};' +
+        'byId("loginPin").onkeydown = function(ev){ if (ev.key === "Enter") byId("btnLogin").click(); };' +
+        'byId("btnLogout").onclick = function(){' +
+        '  authFetch("/api/auth/logout", { method: "POST" }).catch(function(){});' +
+        '  authToken = "";' +
+        '  setAuthLocked(true);' +
+        '};' +
+        'byId("btnSaveAudio").onclick = function(){' +
+        '  postJson("/api/audio", {' +
+        '    volume: clampInt(byId("aVol").value, 0, 100, 100),' +
+        '    muted: Boolean(byId("aMuted").checked),' +
+        '    output: byId("aOut").value' +
+        '  }, function(){ audioPowerSynced = false; showMsg("Audio actualizado correctamente.", "ok"); });' +
+        '};' +
+        'byId("aVol").oninput = function(){ byId("aVolVal").textContent = this.value; };' +
+        'byId("btnSavePower").onclick = function(){' +
+        '  postJson("/api/power-schedule", {' +
+        '    enabled: Boolean(byId("pSchedEn").checked),' +
+        '    onTime: byId("pOn").value,' +
+        '    offTime: byId("pOff").value,' +
+        '    manualAction: "auto"' +
+        '  }, function(){ audioPowerSynced = false; showMsg("Horario de energía HDMI guardado.", "ok"); });' +
+        '};' +
+        'byId("btnHdmiOn").onclick = function(){ postJson("/api/power-schedule", { manualAction: "on" }, function(){ showMsg("HDMI encendido manualmente.", "ok"); }); };' +
+        'byId("btnHdmiOff").onclick = function(){ postJson("/api/power-schedule", { manualAction: "off" }, function(){ showMsg("HDMI apagado manualmente.", "ok"); }); };' +
+        'byId("btnHdmiAuto").onclick = function(){ postJson("/api/power-schedule", { manualAction: "auto" }, function(){ showMsg("Control HDMI devuelto a modo automático.", "ok"); }); };' +
+        'byId("btnSavePin").onclick = function(){' +
+        '  postJson("/api/security/pin", { currentPin: byId("secCurPin").value, newPin: byId("secNewPin").value }, function(res){' +
+        '    if (res.token) authToken = res.token;' +
+        '    byId("secCurPin").value = ""; byId("secNewPin").value = "";' +
+        '    showMsg("PIN de seguridad actualizado.", "ok");' +
+        '  });' +
+        '};' +
+        'byId("btnClearPin").onclick = function(){' +
+        '  postJson("/api/security/pin", { currentPin: byId("secCurPin").value, newPin: "" }, function(){' +
+        '    authToken = ""; byId("secCurPin").value = ""; byId("secNewPin").value = "";' +
+        '    showMsg("PIN desactivado (panel abierto en LAN/Tailscale).", "ok");' +
+        '  });' +
+        '};' +
+        'byId("btnTogglePause").onclick = function(){ postJson("/api/player/toggle-pause", {}, function(res){ showMsg(res.paused ? "Reproducción en pausa." : "Reproducción reanudada.", "ok"); }); };' +
+        'byId("btnNextItem").onclick = function(){ postJson("/api/player/next", {}, function(){ showMsg("Avanzando al siguiente contenido.", "ok"); }); };' +
+        'byId("logFilter").oninput = renderLogsBox;' +
+        'byId("btnRefreshLogs").onclick = function(){' +
+        '  authFetch("/api/logs").then(function(r){ return r.json(); }).then(function(d){' +
+        '    if (d && Array.isArray(d.logs)) { rawLogsArr = d.logs; renderLogsBox(); }' +
+        '  }).catch(function(){});' +
+        '};' +
+        'byId("btnDownloadLogs").onclick = function(){' +
+        '  var blob = new Blob([rawLogsArr.join(nl)], { type: "text/plain" });' +
+        '  var url = URL.createObjectURL(blob);' +
+        '  var a = document.createElement("a"); a.href = url; a.download = "urp-logs.txt";' +
+        '  document.body.appendChild(a); a.click(); document.body.removeChild(a);' +
+        '  setTimeout(function(){ URL.revokeObjectURL(url); }, 1000);' +
+        '};' +
         'byId("btnOpenWall").onclick = openWallView;' +
         'byId("btnBackWall").onclick = closeWallView;' +
         'byId("btnCancelWall").onclick = function(){ wallLoaded = false; if (lastStatus && lastStatus.wallConfig) syncToForm(lastStatus.wallConfig, lastStatus.serverVideoWallFlag); closeWallView(); };' +
@@ -5009,7 +6227,9 @@ function buildLocalDashboardHtml() {
         'byId("btnReboot").onclick = function(){ if (confirm("¿Reiniciar Raspberry Pi?")) act("/reboot"); };' +
         'byId("btnShutdown").onclick = function(){ if (confirm("¿Apagar Raspberry Pi?")) act("/shutdown"); };' +
         'byId("btnDelete").onclick = function(){ if (confirm("¿Borrar todo el contenido local?")) act("/deleteContents"); };' +
-        'refresh();' +
+        'fetch("/api/auth/check").then(function(r){ return r.json(); }).then(function(a){' +
+        '  if (a && a.locked) { setAuthLocked(true); } else { setAuthLocked(false); refresh(); }' +
+        '}).catch(function(){ refresh(); });' +
         'setInterval(refresh, 3000);' +
         '</script></body></html>';
 }
@@ -5019,7 +6239,10 @@ var app = express();
 app.use(express.static(__dirname + '/web'));
 
 app.use(function (req, res, next) {
-    res.header('Access-Control-Allow-Origin', '*');
+    var origin = req.headers.origin;
+    if (origin && !getPanelAuthConfig().enabled) {
+        res.header('Access-Control-Allow-Origin', origin);
+    }
     res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     if (req.method === 'OPTIONS') return res.status(200).end();
@@ -5028,6 +6251,84 @@ app.use(function (req, res, next) {
 
 app.get('/', function (req, res) {
     res.status(200).type('html').send(buildLocalDashboardHtml());
+});
+
+app.get('/api/auth/check', function (req, res) {
+    loadWallConfig();
+    var cfg = getPanelAuthConfig();
+    var authed = isRequestAuthenticated(req);
+    res.json({
+        pinEnabled: cfg.enabled,
+        envManaged: cfg.envManaged,
+        locked: cfg.enabled && !authed
+    });
+});
+
+app.post('/api/auth/login', function (req, res) {
+    readJsonBody(req, function (err, body) {
+        if (err || !body || typeof body !== 'object') {
+            return res.status(400).json({ ok: false, error: 'JSON inválido' });
+        }
+        loadWallConfig();
+        var clientKey = String((req.socket && req.socket.remoteAddress) || 'local');
+        var failRec = authFailures[clientKey];
+        if (failRec && failRec.until > Date.now()) {
+            return res.status(429).json({ ok: false, error: 'Demasiados intentos; esperá 60 segundos.' });
+        }
+        if (!getPanelAuthConfig().enabled) {
+            return res.json({ ok: true, token: issueAuthToken() });
+        }
+        if (!verifyPanelPin(body.pin)) {
+            var count = (failRec && failRec.resetAt > Date.now()) ? (failRec.count + 1) : 1;
+            authFailures[clientKey] = {
+                count: count,
+                resetAt: Date.now() + 60000,
+                until: (count >= 5) ? (Date.now() + 60000) : 0
+            };
+            return res.status(401).json({ ok: false, error: 'PIN incorrecto' });
+        }
+        delete authFailures[clientKey];
+        res.json({ ok: true, token: issueAuthToken() });
+    });
+});
+
+app.post('/api/auth/logout', function (req, res) {
+    var authHdr = String((req.headers && req.headers.authorization) || '');
+    if (authHdr.indexOf('Bearer ') === 0) {
+        delete authSessions[authHdr.slice(7).trim()];
+    }
+    res.json({ ok: true });
+});
+
+app.post('/api/security/pin', requirePanelAuth, function (req, res) {
+    readJsonBody(req, function (err, body) {
+        if (err || !body || typeof body !== 'object') {
+            return res.status(400).json({ ok: false, error: 'JSON inválido' });
+        }
+        loadWallConfig();
+        var authCfg = getPanelAuthConfig();
+        if (authCfg.envManaged) {
+            return res.status(403).json({ ok: false, error: 'El PIN está fijado por variable de entorno URP_PANEL_PIN' });
+        }
+        if (authCfg.enabled && !verifyPanelPin(body.currentPin)) {
+            return res.status(401).json({ ok: false, error: 'PIN actual incorrecto' });
+        }
+        var newPin = String(body.newPin || '').trim();
+        if (!newPin) {
+            saveWallConfigPartial({ panelPinHash: '' });
+            authSessions = {};
+            console.log('[SECURITY] PIN del panel :8090 desactivado.');
+            return res.json({ ok: true, pinEnabled: false });
+        }
+        if (newPin.length < 4 || newPin.length > 32) {
+            return res.status(400).json({ ok: false, error: 'El PIN debe tener entre 4 y 32 caracteres.' });
+        }
+        saveWallConfigPartial({ panelPinHash: hashPinScrypt(newPin) });
+        authSessions = {};
+        var freshToken = issueAuthToken();
+        console.log('[SECURITY] PIN del panel :8090 actualizado (scrypt).');
+        res.json({ ok: true, pinEnabled: true, token: freshToken });
+    });
 });
 
 function buildScheduleSummaryForStatus() {
@@ -5053,10 +6354,12 @@ function buildScheduleSummaryForStatus() {
                 var ready = false;
                 if (imgItem) {
                     var imgMp4 = contentBasePath + safeC.replace(/\.[^/.]+$/, '') + resTag + wallTag + '_' + dur + 's.mp4';
-                    ready = (fileExist(imgMp4) && fs.statSync(imgMp4).size > 4096) || fileExist(contentBasePath + safeC) || fileExist(contentBasePath + rawC);
+                    ready = dimsNow.convertEnabled
+                        ? ((fileExist(imgMp4) && fs.statSync(imgMp4).size > 4096) || fileExist(contentBasePath + safeC) || fileExist(contentBasePath + rawC))
+                        : Boolean(fileExist(contentBasePath + safeC) || fileExist(contentBasePath + rawC));
                 } else if (safeC) {
                     var rawPath = fileExist(contentBasePath + safeC) ? (contentBasePath + safeC) : (contentBasePath + rawC);
-                    var optP = getOptimizedVideoPath(rawPath);
+                    var optP = dimsNow.convertEnabled ? getOptimizedVideoPath(rawPath) : null;
                     ready = Boolean((optP && fileExist(optP)) || fileExist(rawPath));
                 }
                 return {
@@ -5072,11 +6375,12 @@ function buildScheduleSummaryForStatus() {
     });
 }
 
-app.get('/api/status', function (req, res) {
+app.get('/api/status', requirePanelAuth, function (req, res) {
     loadWallConfig();
     var buildPayload = function (pl) {
         var dimsNow = getTargetVideoDims();
         var effOrient = readHdmiRotateFromConfig();
+        var secCfg = getPanelAuthConfig();
         res.json({
             version: URPVersion,
             model: piModelStr,
@@ -5084,18 +6388,24 @@ app.get('/api/status', function (req, res) {
             managerName: URPdata.managerName || '',
             totalRamMB: totalRamMB,
             displayBackend: useDrmDirect ? 'DRM/KMS' : (hasWaylandDisplay ? 'Wayland' : 'X11'),
-            targetResolution: dimsNow.width + 'x' + dimsNow.height + (dimsNow.use720p ? ' (720p)' : ' (1080p)'),
+            playerDriver: activeMpvDriverInfo || (hasOmxplayer ? 'omxplayer' : 'mpv'),
+            glRenderer: mpvCaps.glRenderer || '',
+            targetResolution: !dimsNow.convertEnabled ? ('Directo' + (dimsNow.use720p && wallConfig.hdmi720p !== false ? ' • HDMI 720p' : ' (Original)')) : (dimsNow.mode === 'auto' ? ('Inteligente' + (dimsNow.use720p ? ' (720p img / H.264 directo)' : ' (1080p)')) : (dimsNow.width + 'x' + dimsNow.height + (dimsNow.use720p ? ' (720p Forzado)' : ' (1080p)'))),
             effectiveOrientation: (effOrient !== null) ? effOrient : (wallConfig.orientation || 0),
             ip: URPdata.URPIpAddress || '',
             tailscaleIp: getTailscaleIp(),
             mac: macAdd,
             uptimeSec: Math.round(process.uptime()),
+            osUptimeSec: Math.round(osMod.uptime()),
             connection: iConn,
             freeSpace: URPFreeSpace,
             freeDiskMb: freeDiskMb,
             temperature: temperature,
             cpuUsage: cpuUsage,
             memPercentUsed: memPercentUsed,
+            throttleStatus: throttleStatus,
+            screenPoweredOff: isScreenPoweredOff,
+            security: { pinEnabled: secCfg.enabled, envManaged: secCfg.envManaged },
             blockPlaying: blockPlaying,
             nowPlayingId: URPNowPlaying,
             filesPlaying: filesPlaying,
@@ -5104,7 +6414,7 @@ app.get('/api/status', function (req, res) {
             scheduleSummary: buildScheduleSummaryForStatus(),
             serverVideoWallFlag: Boolean(URPdata && URPdata.isVideoWall),
             wallActive: isWallActive(),
-            wallConfig: wallConfig,
+            wallConfig: getWallConfigPublic(),
             wallSyncStatus: wallSyncStatus,
             queues: {
                 ftp: FTPcontents.length,
@@ -5148,7 +6458,11 @@ app.get('/api/status', function (req, res) {
     }
 });
 
-app.get('/api/preview.jpg', function (req, res) {
+app.get('/api/logs', requirePanelAuth, function (req, res) {
+    res.json({ ok: true, logs: recentLogs });
+});
+
+app.get('/api/preview.jpg', requirePanelAuth, function (req, res) {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     captureLivePreview(function (ok, previewPath) {
         if (ok && fs.existsSync(previewPath)) {
@@ -5158,7 +6472,83 @@ app.get('/api/preview.jpg', function (req, res) {
     });
 });
 
-app.get('/restartPlayer', function (req, res) {
+app.post('/api/player/toggle-pause', requirePanelAuth, function (req, res) {
+    if (!isPlaying || !activePlayerProcess || activePlayerBin !== 'mpv' || !fs.existsSync(mpvIpcSocketPath)) {
+        return res.status(409).json({ ok: false, error: 'Pausa rápida disponible cuando mpv está reproduciendo.' });
+    }
+    mpvIpcRequest([['cycle', 'pause'], ['get_property', 'pause']], function (err, ipcRes) {
+        if (err) return res.status(500).json({ ok: false, error: err.message });
+        var paused = Boolean(ipcRes && ipcRes[2] && ipcRes[2].error === 'success' && ipcRes[2].data);
+        res.json({ ok: true, paused: paused });
+    });
+});
+
+app.post('/api/player/next', requirePanelAuth, function (req, res) {
+    if (!isPlaying || currentPlaylist.length === 0) {
+        return res.status(409).json({ ok: false, error: 'Sin playlist activa.' });
+    }
+    if (activePlayerProcess && activePlayerBin === 'mpv' && currentPlaylist.length > 1 && fs.existsSync(mpvIpcSocketPath)) {
+        mpvIpcRequest([['playlist-next', 'force']], function (err) {
+            if (!err) return res.json({ ok: true, method: 'ipc' });
+            currentMediaIndex++;
+            playCurrentIndex();
+            res.json({ ok: true, method: 'restart' });
+        });
+        return;
+    }
+    currentMediaIndex++;
+    playCurrentIndex();
+    res.json({ ok: true, method: 'index' });
+});
+
+app.post('/api/audio', requirePanelAuth, function (req, res) {
+    readJsonBody(req, function (err, body) {
+        if (err || !body || typeof body !== 'object') {
+            return res.status(400).json({ ok: false, error: 'JSON inválido' });
+        }
+        loadWallConfig();
+        var vol = (body.volume !== undefined) ? Math.max(0, Math.min(100, parseInt(body.volume, 10) || 0)) : wallConfig.audioVolume;
+        var muted = (body.muted !== undefined) ? Boolean(body.muted) : wallConfig.audioMuted;
+        var out = (body.output === 'hdmi' || body.output === 'jack' || body.output === 'auto') ? body.output : wallConfig.audioOutput;
+        saveWallConfigPartial({ audioVolume: vol, audioMuted: muted, audioOutput: out });
+        applyAudioSettings(function () {
+            res.json({ ok: true, config: getWallConfigPublic() });
+        });
+    });
+});
+
+app.post('/api/power-schedule', requirePanelAuth, function (req, res) {
+    readJsonBody(req, function (err, body) {
+        if (err || !body || typeof body !== 'object') {
+            return res.status(400).json({ ok: false, error: 'JSON inválido' });
+        }
+        loadWallConfig();
+        var patch = {};
+        if (body.enabled !== undefined) patch.screenScheduleEnabled = Boolean(body.enabled);
+        if (body.onTime !== undefined) patch.screenOnTime = sanitizeTimeHHMM(body.onTime, wallConfig.screenOnTime);
+        if (body.offTime !== undefined) patch.screenOffTime = sanitizeTimeHHMM(body.offTime, wallConfig.screenOffTime);
+        if (Object.keys(patch).length > 0) {
+            saveWallConfigPartial(patch);
+        }
+        if (body.manualAction === 'on') {
+            manualScreenOffOverride = false;
+            return applyScreenPowerState(true, function () {
+                res.json({ ok: true, screenPoweredOff: isScreenPoweredOff, config: getWallConfigPublic() });
+            });
+        }
+        if (body.manualAction === 'off') {
+            manualScreenOffOverride = true;
+            return applyScreenPowerState(false, function () {
+                res.json({ ok: true, screenPoweredOff: isScreenPoweredOff, config: getWallConfigPublic() });
+            });
+        }
+        manualScreenOffOverride = null;
+        syncScreenPowerSchedule();
+        res.json({ ok: true, screenPoweredOff: isScreenPoweredOff, config: getWallConfigPublic() });
+    });
+});
+
+app.get('/restartPlayer', requirePanelAuth, function (req, res) {
     blockPlaying = 0;
     stopOmx(function () {
         setTimeout(function () { checkSchedule(); }, 250);
@@ -5166,52 +6556,52 @@ app.get('/restartPlayer', function (req, res) {
     res.status(200).send('Reproductor reiniciado');
 });
 
-app.get('/resetContent', function (req, res) {
+app.get('/resetContent', requirePanelAuth, function (req, res) {
     blockPlaying = 0;
     checkSchedule();
     res.status(200).send('Reset Content');
 });
-app.get('/reboot', function (req, res) {
+app.get('/reboot', requirePanelAuth, function (req, res) {
     res.status(200).send('Reboot');
     setTimeout(resetURP, 200);
 });
-app.get('/shutdown', function (req, res) {
+app.get('/shutdown', requirePanelAuth, function (req, res) {
     res.status(200).send('Shutdown');
     setTimeout(shutdownURP, 200);
 });
-app.get('/deleteContents', function (req, res) {
+app.get('/deleteContents', requirePanelAuth, function (req, res) {
     res.status(200).send('Delete Contents');
     deleteContentFiles();
 });
-app.get('/deleteContent', function (req, res) {
+app.get('/deleteContent', requirePanelAuth, function (req, res) {
     res.status(200).send('Delete Contents');
     deleteContentFiles();
 });
-app.get('/gc', function (req, res) {
+app.get('/gc', requirePanelAuth, function (req, res) {
     garbageCollectUnusedMedia(false, function (info) {
         res.json(info);
     });
 });
-app.get('/cleanLogs', function (req, res) {
+app.get('/cleanLogs', requirePanelAuth, function (req, res) {
     cleanLogs();
     res.status(200).send('Clean Logs');
 });
-app.get('/uploadLogs', function (req, res) {
+app.get('/uploadLogs', requirePanelAuth, function (req, res) {
     uploadLogs(function (ok) {
         res.status(200).send(ok ? 'Logs uploaded' : 'No logs');
     });
 });
-app.get('/screenshot', function (req, res) {
+app.get('/screenshot', requirePanelAuth, function (req, res) {
     takeScreenshot(function (ok) {
         res.status(ok ? 200 : 500).send(ok ? 'Screenshot OK' : 'Screenshot failed');
     });
 });
-app.get('/screenshot.jpg', function (req, res) {
+app.get('/screenshot.jpg', requirePanelAuth, function (req, res) {
     var p = basePath + 'screenshot.jpg';
     if (fs.existsSync(p)) return res.sendFile(p);
     res.status(404).send('No screenshot');
 });
-app.get('/contents', function (req, res) {
+app.get('/contents', requirePanelAuth, function (req, res) {
     try {
         var files = fs.readdirSync(contentBasePath);
         res.json({ contents: files.map(function (f) { return { file: f }; }) });
@@ -5219,7 +6609,7 @@ app.get('/contents', function (req, res) {
         res.json({ contents: [] });
     }
 });
-app.get('/schedule', function (req, res) {
+app.get('/schedule', requirePanelAuth, function (req, res) {
     var date = new Date();
     res.json({
         connection: iConn,
@@ -5233,10 +6623,10 @@ app.get('/schedule', function (req, res) {
 app.get('/URPTemperature', function (req, res) { res.json({ temperature: temperature }); });
 app.get('/URPmemPercentUsed', function (req, res) { res.json({ memPercentUsed: memPercentUsed }); });
 app.get('/URPcpuUsage', function (req, res) { res.json({ cpuUsage: cpuUsage }); });
-app.get('/update', function (req, res) {
+app.get('/update', requirePanelAuth, function (req, res) {
     checkGithubOTA(function (result) { res.json(result); });
 });
-app.get('/wall', function (req, res) {
+app.get('/wall', requirePanelAuth, function (req, res) {
     loadWallConfig();
     res.json({
         active: isWallActive(),
@@ -5244,57 +6634,70 @@ app.get('/wall', function (req, res) {
         activationMode: wallConfig.activationMode,
         serverVideoWallFlag: Boolean(URPdata && URPdata.isVideoWall),
         signature: getWallSignature(),
-        config: wallConfig,
+        config: getWallConfigPublic(),
         syncStatus: wallSyncStatus,
         masterState: wallMasterState
     });
 });
-app.post('/api/display-settings', function (req, res) {
+app.post('/api/display-settings', requirePanelAuth, function (req, res) {
     readJsonBody(req, function (err, body) {
         if (err || !body || typeof body !== 'object') {
             return res.status(400).json({ ok: false, error: 'JSON inválido' });
         }
         try {
             loadWallConfig();
+            var dimsBefore = getTargetVideoDims();
             var prevRot = wallConfig.orientation;
+            var prevResMode = wallConfig.resolutionMode;
+            var prevOrient = wallConfig.orientation;
+            var prevVoMode = wallConfig.videoOutputMode || 'auto';
             var orientation = [0, 1, 2, 3].indexOf(parseInt(body.orientation, 10)) !== -1 ? parseInt(body.orientation, 10) : wallConfig.orientation;
-            var resMode = (body.resolutionMode === '720p' || body.resolutionMode === '1080p' || body.resolutionMode === 'auto') ? body.resolutionMode : wallConfig.resolutionMode;
+            var resMode = (body.resolutionMode === 'auto' || body.resolutionMode === '720p' || body.resolutionMode === '1080p' || body.resolutionMode === 'direct') ? body.resolutionMode : wallConfig.resolutionMode;
+            var voMode = (body.videoOutputMode === 'x11_light' || body.videoOutputMode === 'gpu_egl' || body.videoOutputMode === 'drm' || body.videoOutputMode === 'auto') ? body.videoOutputMode : prevVoMode;
             var hdmi720p = (body.hdmi720p === undefined) ? wallConfig.hdmi720p : Boolean(body.hdmi720p);
+            var showStandby = (body.showStandbyScreen === undefined) ? wallConfig.showStandbyScreen : Boolean(body.showStandbyScreen);
             var rotChanged = (orientation !== prevRot);
             var rotUpdated = false;
             if (rotChanged) {
                 var rotRes = writeHdmiRotateToConfig(orientation);
                 rotUpdated = Boolean(rotRes && rotRes.ok);
             }
-            var nextCfg = Object.assign({}, wallConfig, {
+            saveWallConfigPartial({
                 orientation: orientation,
                 resolutionMode: resMode,
                 hdmi720p: hdmi720p,
-                orientationOverride: rotChanged ? (!rotUpdated) : Boolean(wallConfig.orientationOverride),
-                updatedAt: new Date().toISOString()
+                showStandbyScreen: showStandby,
+                videoOutputMode: voMode,
+                drmMode: (voMode === 'drm'),
+                orientationOverride: rotChanged ? (!rotUpdated) : Boolean(wallConfig.orientationOverride)
             });
-
-            ensureDir(basePath);
-            var tmpPath = wallConfigPath + '.tmp';
-            fs.writeFileSync(tmpPath, JSON.stringify(nextCfg, null, 2) + '\n', 'utf8');
-            fs.renameSync(tmpPath, wallConfigPath);
-            wallConfigMtime = 0;
-            loadWallConfig();
+            mpvSafeFallback = false;
+            if (voMode === 'drm' && (hasX11Display || hasWaylandDisplay)) {
+                exec('sudo -n systemctl stop lightdm 2>/dev/null || sudo -n systemctl stop gdm 2>/dev/null || true', { timeout: 3000 }, function () {
+                    detectDisplaySession();
+                });
+            }
             lastAppliedHdmiRes = '';
             applyDisplayResolution720pIfNeeded(true);
-            applyDisplayRotationIfNeeded();
+            applyDisplayRotationIfNeeded(null, true);
 
-            clearWallDerivedCaches();
+            if (resMode === 'direct' && !isWallTileActive()) {
+                renderQueue = [];
+                videoOptQueue = [];
+            }
+            var dimsNow = getTargetVideoDims();
+            if ((dimsBefore.convertEnabled || dimsNow.convertEnabled) && (resMode !== prevResMode || (rotChanged && (prevOrient % 2 !== orientation % 2)))) {
+                clearWallDerivedCaches();
+            }
             blockPlaying = 0;
             stopOmx(function () {
                 setTimeout(function () { checkSchedule(); }, 250);
             });
 
-            var dimsNow = getTargetVideoDims();
             res.json({
                 ok: true,
-                config: wallConfig,
-                targetResolution: dimsNow.width + 'x' + dimsNow.height + (dimsNow.use720p ? ' (720p)' : ' (1080p)'),
+                config: getWallConfigPublic(),
+                targetResolution: !dimsNow.convertEnabled ? ('Directo' + (dimsNow.use720p && wallConfig.hdmi720p !== false ? ' • HDMI 720p' : ' (Original)')) : (dimsNow.mode === 'auto' ? ('Inteligente' + (dimsNow.use720p ? ' (720p img / H.264 directo)' : ' (1080p)')) : (dimsNow.width + 'x' + dimsNow.height + (dimsNow.use720p ? ' (720p Forzado)' : ' (1080p)'))),
                 rotChanged: rotChanged,
                 rotUpdated: rotUpdated
             });
@@ -5304,7 +6707,7 @@ app.post('/api/display-settings', function (req, res) {
     });
 });
 
-app.post('/api/wall', function (req, res) {
+app.post('/api/wall', requirePanelAuth, function (req, res) {
     readJsonBody(req, function (err, body) {
         if (err || !body || typeof body !== 'object') {
             return res.status(400).json({ ok: false, error: 'JSON inválido' });
@@ -5319,14 +6722,15 @@ app.post('/api/wall', function (req, res) {
             var effIdx = (screenId - 1) % total;
             var orientation = [0, 1, 2, 3].indexOf(parseInt(body.orientation, 10)) !== -1 ? parseInt(body.orientation, 10) : 0;
             var actMode = (body.activationMode === 'server' || body.activationMode === 'local') ? body.activationMode : 'local';
-            var resMode = (body.resolutionMode === '720p' || body.resolutionMode === '1080p') ? body.resolutionMode : 'auto';
+            var resMode = (body.resolutionMode === '720p' || body.resolutionMode === '1080p' || body.resolutionMode === 'direct') ? body.resolutionMode : 'auto';
+            var drmChecked = Boolean(body.drmMode);
             var rotChanged = (orientation !== prevRot);
             var rotUpdated = false;
             if (rotChanged) {
                 var rotRes = writeHdmiRotateToConfig(orientation);
                 rotUpdated = Boolean(rotRes && rotRes.ok);
             }
-            var nextCfg = {
+            saveWallConfigPartial({
                 enabled: (actMode === 'server') ? true : Boolean(body.enabled),
                 activationMode: actMode,
                 mode: (body.mode === 'mirror') ? 'mirror' : 'tile',
@@ -5339,22 +6743,16 @@ app.post('/api/wall', function (req, res) {
                 orientation: orientation,
                 syncMode: (body.syncMode === 'master') ? 'master' : 'ntp',
                 masterIp: String(body.masterIp || '').trim(),
-                drmMode: Boolean(body.drmMode),
+                drmMode: drmChecked,
+                videoOutputMode: drmChecked ? 'drm' : ((wallConfig.videoOutputMode === 'drm') ? 'auto' : (wallConfig.videoOutputMode || 'auto')),
                 resolutionMode: resMode,
                 hdmi720p: (body.hdmi720p === undefined) ? true : Boolean(body.hdmi720p),
-                orientationOverride: rotChanged ? (!rotUpdated) : Boolean(wallConfig.orientationOverride),
-                updatedAt: new Date().toISOString()
-            };
-
-            ensureDir(basePath);
-            var tmpPath = wallConfigPath + '.tmp';
-            fs.writeFileSync(tmpPath, JSON.stringify(nextCfg, null, 2) + '\n', 'utf8');
-            fs.renameSync(tmpPath, wallConfigPath);
-            wallConfigMtime = 0;
-            loadWallConfig();
+                orientationOverride: rotChanged ? (!rotUpdated) : Boolean(wallConfig.orientationOverride)
+            });
+            mpvSafeFallback = false;
             lastAppliedHdmiRes = '';
             applyDisplayResolution720pIfNeeded(true);
-            applyDisplayRotationIfNeeded();
+            applyDisplayRotationIfNeeded(null, true);
 
             clearWallDerivedCaches();
             blockPlaying = 0;
@@ -5364,7 +6762,7 @@ app.post('/api/wall', function (req, res) {
 
             res.json({
                 ok: true,
-                config: wallConfig,
+                config: getWallConfigPublic(),
                 wallActive: isWallActive(),
                 rotChanged: rotChanged,
                 rotUpdated: rotUpdated
@@ -5386,6 +6784,7 @@ app.get('/wall/sync', function (req, res) {
         screenId: wallConfig.screenId,
         mode: wallConfig.mode,
         file: wallMasterState.file,
+        playlistPos: wallMasterState.playlistPos || 0,
         timePos: livePos,
         duration: dur,
         ts: Date.now()

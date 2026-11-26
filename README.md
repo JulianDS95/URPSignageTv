@@ -7,18 +7,21 @@ Se conecta al servidor Manager (`tbee.tv`), sincroniza horarios y contenidos por
 
 ## ¿Qué hace esta aplicación?
 
-- **Reproducción continua sin cortes (`Seamless Loop`):** Concatena automáticamente los videos e imágenes de cada bloque horario en un único stream MP4 continuo (`/home/pi/URP/seamless/`), evitando flashes negros o destellos del escritorio entre archivos (con unión instantánea `-c copy` cuando los clips ya están estandarizados).
-- **Resolución 720p fluida automática en Raspberry Pi 3B+ (`1280x720 @ 24fps`):** En equipos con <=1.5 GB de RAM (`Pi 3B+` / `Zero 2W`), normaliza videos e imágenes a `1280x720` H.264 Baseline `≤2.2 Mbps` (y ajusta automáticamente HDMI/X11 a `1280x720`), reduciendo más de un 55% el uso de CPU/RAM; en Pi 4 y 5 mantiene `1920x1080`. También podés elegir manualmente `Automática / 720p / 1080p` desde el panel web `:8090`.
-- **Optimización automática de cualquier video subido:** Analiza cada video nuevo con `ffprobe` y lo normaliza en segundo plano con prioridad mínima (`nice -n 19`, pausa preventiva si la RAM >=86% o temperatura >=78 °C) en `/home/pi/URP/optimized/`, con padding exacto y pista AAC estéreo para garantizar unión `-c copy` sin re-codificar el bloque entero.
+- **Reproducción inteligente de bajo CPU y transiciones 0 ms (sin cortes ni fondo de escritorio):** Por defecto (`resolutionMode: "auto"` — *Inteligente / Bajo CPU*), en Raspberry Pi 3B+ ajusta la salida HDMI/X11 a `1280x720` por hardware (`xrandr`, 0% CPU) para evitar sobrecargar X11/GPU. Los videos MP4 H.264 estándar (720p y 1080p hasta `31 fps` y `10 Mbps`) se reproducen **directamente sin recodificar con `ffmpeg`**, manteniendo bajo uso de CPU.
+- **Imágenes a MP4 en ~1s + loop continuo en ventana única:** Cada imagen se decodifica y escala **una sola vez** para generar un MP4 720p liviano en `optimized/`, logrando mezclar imágenes y videos en un único loop continuo 0 ms (`mpv --loop-playlist=inf` o unión instantánea `-c copy` en `seamless/`, y `omxplayer --loop` para 1 solo video) sin que jamás vuelva a verse el fondo de pantalla al cambiar de ítem o reiniciar la lista. Solo convierte videos si superan 1080p (4K), 31 fps (60fps), usan HEVC/VP9/AV1, o si activás `Forzar 1280x720` / `Video Wall` (con `nice -n 19` y pausa preventiva si RAM >=75%, CPU >=70% o temperatura >=72 °C).
 - **Panel Web Local y Remoto (`:8090`):**
-  - Título dinámico sincronizado con el nombre asignado al reproductor en el Manager (`tbee.tv`).
-  - **Monitor Visual en Vivo** (`GET /api/preview.jpg`): muestra en tiempo real lo que se ve en pantalla (cada 2s/3s/5s) sin subir capturas al FTP, junto a la barra de progreso actual (`mpv` IPC) y botón **Reiniciar Reproductor**.
-  - **Resolución de conversión y Rotación directa:** permite cambiar entre `Automática / 720p / 1080p`, activar ajuste HDMI `1280x720` y rotar contenido/pantalla (`0° / 90° / 180° / 270°`) desde el panel principal.
-  - **Agenda Cargada:** lista todos los bloques horarios activos, horario de inicio, duración y estado (`Listo` / `Pendiente`) de cada video o imagen.
-  - **Configurador de Video Wall:** soporta IDs `1..999` y matrices hasta `32x32`.
+  - Título dinámico sincronizado con el nombre asignado al reproductor en el Manager (`tbee.tv`), telemetría ampliada (CPU, RAM, disco libre en MB, *uptime* del equipo/proceso) y **alerta automática de hardware** (`vcgencmd get_throttled`: bajo voltaje o *throttling* térmico) + limpieza preventiva de disco si baja de `600 MB`.
+  - **Monitor Visual en Vivo** (`GET /api/preview.jpg`): muestra en tiempo real lo que se ve en pantalla (cada 2s/3s/5s) con captura priorizada vía `raspi2png` si usa `omxplayer` (capa DispmanX), barra de progreso en vivo (`mpv` IPC), driver activo (`vo` / `hwdec`) y controles rápidos **Pausar / Reanudar**, **Siguiente ítem**, **Reiniciar Reproductor** y **Buscar OTA**.
+  - **Audio / Volumen y Salida (`POST /api/audio`):** control de volumen `0–100%`, Silenciar (`Mute`) y selector de salida (`Automática`, `HDMI`, `Jack 3.5mm`) aplicado al instante por `mpv` IPC / `amixer` / `wpctl` / `omxplayer`.
+  - **Horarios de Encendido / Apagado de Pantalla HDMI (`POST /api/power-schedule`):** programación diaria opcional (ej. apagar `22:00`, encender `07:00`) y botones manuales On / Off / Automático vía `vcgencmd display_power`, `xrandr`, `wlr-randr` y `cec-client`, pausando la reproducción mientras está apagada.
+  - **Modo / Resolución de conversión, Rotación y Salida de Video directa:** permite elegir entre `Inteligente / Bajo CPU (Recomendado)`, `Forzar 1280x720 (Máxima fluidez Pi 3B+)`, `1920x1080 (Full HD Pi 4/5)` o `Directo / Sin conversión (estilo URPPI3 original)`, activar ajuste HDMI `1280x720` (sin recodificar), rotar contenido/pantalla (`0° / 90° / 180° / 270°`) **sin destruir caché de conversión cuando no hace falta** y elegir la salida de video (`Automática`, `X11 Ligero sin OpenGL`, `GPU EGL` o `DRM/KMS Directo`).
+  - **Agenda Cargada y Logs Filtrables:** lista todos los bloques horarios activos, inicio, duración y estado (`Listo` / `Pendiente`), junto al visor de logs en vivo (`GET /api/logs`) con filtro por texto, botón **Pausar scroll** y **Descargar `.txt`**.
+  - **Seguridad opcional por PIN (`POST /api/security/pin`):** permite proteger el panel `:8090` con un PIN numérico almacenado con hash seguro (`scrypt`, o variable `URP_PANEL_PIN`), bloqueo temporal ante 5 intentos fallidos y sesiones Bearer en memoria sin afectar los endpoints de sincronización LAN ni telemetría.
+  - **Configurador de Video Wall:** soporta IDs `1..999`, matrices hasta `32x32` y **sincronización multi-ítem** de posición en playlist + tiempo vía IPC de `mpv`.
+- **Pantalla Standby Offline automática:** si el equipo arranca sin contenidos ni `background.png`, genera una única vez `standby_urp.png` en disco para evitar pantalla totalmente negra mientras espera programación (activable/desactivable desde el panel).
 - **Hostname sincronizado desde el Manager:** actualiza automáticamente el hostname del sistema operativo (`hostnamectl`) y el nombre en Tailscale (`tailscale set --hostname`) tomando el nombre configurado en `tbee.tv`.
 - **Descarga FTP reanudable (`curl`):** Descarga archivos grandes con soporte de reanudación (`-C -`), monitoreo de velocidad en Mbps y verificación MD5 de bajo consumo de memoria (con respaldo automático en `JSFtp`).
-- **Motor dual por hardware / DRM:** Utiliza `omxplayer` en sistemas legacy (Buster/Bullseye) o `mpv` optimizado en X11/Wayland/DRM-KMS directo (`--hwdec=auto`, búfer RAM reducido en Pi 3B+, `--framedrop=vo`, `--ontop`).
+- **Motor dual por hardware / DRM con autodetección segura:** Utiliza `omxplayer` en sistemas legacy o `mpv` con detección automática en runtime de capacidades (`--hwdec=help`, `--vo=help`, `--gpu-context=help`, `glxinfo`/`es2_info`/`Xorg.0.log`) para activar `x11egl` + `drm`/`v4l2m2m-copy`/`mmal-copy` cuando hay GPU real, evitar OpenGL por software (`llvmpipe`) pasando a `--vo=xv,x11` ligero, y contar con fallback automático sin cuelgues.
 - **Cortina negra y modo kiosko limpio:** Desactiva fondo de escritorio, barras de tareas (`lxpanel`/`wf-panel-pi`), salvapantallas, cursor y **todos los popups/notificaciones del sistema**.
 - **Modo Offline resiliente:** Si se corta internet, continúa reproduciendo al instante la programación guardada localmente (`URPDB` / `URPDB.json` y contenido en disco).
 - **Auto-actualización remota desde GitHub (OTA con rollback):** Cada **5 minutos** verifica si hay una versión nueva de `URPPI3-v2.5.js` en `JulianDS95/URPSignageTv`, valida sintaxis con `node --check`, crea respaldo (`.bak`) y aplica rollback automático ante cualquier fallo de arranque en los primeros 20 segundos.
@@ -29,10 +32,10 @@ Se conecta al servidor Manager (`tbee.tv`), sincroniza horarios y contenidos por
 
 | Archivo | Descripción |
 | :--- | :--- |
-| `URPPI3-v2.5.js` | **Base activa (`v2.5.0`):** Cliente principal, optimización 720p/1080p, panel web `:8090` con Monitor en Vivo, rotación, agenda, hostname automático, Video Wall sin límite y OTA con rollback. |
+| `URPPI3-v2.5.js` | **Base activa (`v2.5.5`):** Reproducción inteligente de bajo CPU con transiciones 0 ms sin flashes al escritorio + control remoto completo tanto en el puerto local `:8090` como integrado de forma nativa en `tbee.tv` (sin Tailscale: telemetría, vista en vivo cada 3s vía `urpLive.php`, audio, resolución, rotación, horario HDMI, logs y comandos rápidos). |
 | `URPPI3.js` | Versión legado estable (`v2.4.1`). |
 | `urp-wall.sh` | Configurador ejecutable independiente (`urp-wall`) para activar Video Wall, elegir ID (`1..999`), disposición (`hasta 32x32`) y orientación. |
-| `install-urp.sh` | Instalador automático *zero-touch* para Raspberry Pi recién flasheada. |
+| `install-urp.sh` | Instalador automático *zero-touch* (`v2.5.5`) con protección microSD (`journald` volátil + `pm2-logrotate`), `alsa-utils` y soporte `raspi2png`. |
 | `README.md` | Documentación completa de instalación, Tailscale, panel `:8090`, Video Wall, comandos e historial de mejoras. |
 
 ---
@@ -63,12 +66,12 @@ sudo reboot
 
 ### ¿Qué configura automáticamente `install-urp.sh`?
 1. Detecta modelo de Raspberry Pi (3B+, 4, 5), sistema operativo (Buster, Bullseye, Bookworm, Trixie) y usuario actual (crea enlace simbólico si no es `pi`).
-2. Aplica fix automático de repositorios archivados en Raspbian Buster EOL e instala `curl`, `ffmpeg`, `feh`, `unclutter`, `x11-xserver-utils`, `mpv`/`omxplayer`, `nodejs`, `npm` y `pm2`.
+2. Aplica fix automático de repositorios archivados en Raspbian Buster EOL e instala `curl`, `ffmpeg`, `feh`, `unclutter`, `x11-xserver-utils`, `alsa-utils`, `raspi2png` (si está disponible), `mpv`/`omxplayer`, `nodejs`, `npm` y `pm2`.
 3. Crea `/home/pi/URP/` (`content/`, `temp/`, `seamless/`, `optimized/`, `web/`) e instala dependencias Node.js (sin `request`).
-4. Descarga `URPPI3-v2.5.js`, valida su sintaxis con `node --check` y lo registra en **PM2** con arranque automático al encender.
+4. Descarga `URPPI3-v2.5.js`, valida su sintaxis con `node --check`, configura rotación de logs **`pm2-logrotate`** (10 MB × 3) y `journald` volátil en RAM (`32 MB`) para cuidar la microSD.
 5. Activa **autologin gráfico (B4)**, fuerza **X11 (W1)** en Bookworm/Trixie, desactiva salvapantallas/DPMS y deja **comentada** la opción de rotación en `config.txt`.
 6. **Bloquea popups y notificaciones** (`piwiz`, `xfce4-notifyd`, `notification-daemon`, `mako`, `dunst`, `update-notifier`, `blueman`, `nm-applet`, automontaje USB en `pcmanfm` y avisos OSD con `avoid_warnings=1`).
-7. Habilita permisos `NOPASSWD` en `/etc/sudoers.d/urp` para reinicio, apagado, `hostnamectl` y `tailscale`.
+7. Habilita permisos `NOPASSWD` en `/etc/sudoers.d/urp` para reinicio, apagado, `hostnamectl`, `tailscale` y `vcgencmd`.
 
 ---
 
@@ -154,8 +157,10 @@ curl -fsSL "https://raw.githubusercontent.com/JulianDS95/URPSignageTv/main/URPPI
 | Reiniciar la Raspberry Pi | `sudo reboot` |
 
 ### Endpoints HTTP locales (Puerto `8090`)
-- `GET /` (Panel web completo) · `GET /api/status` · `GET /api/preview.jpg`
-- `POST /api/display-settings` · `POST /api/wall`
+- `GET /` (Panel web completo) · `GET /api/status` · `GET /api/preview.jpg` · `GET /api/logs`
+- `GET /api/auth/check` · `POST /api/auth/login` · `POST /api/auth/logout` · `POST /api/security/pin`
+- `POST /api/display-settings` · `POST /api/audio` · `POST /api/power-schedule` · `POST /api/wall`
+- `POST /api/player/toggle-pause` · `POST /api/player/next`
 - `GET /restartPlayer` · `GET /resetContent` · `GET /gc`
 - `GET /deleteContents` · `GET /reboot` · `GET /shutdown`
 - `GET /schedule` · `GET /contents` · `GET /update`
@@ -220,6 +225,42 @@ Para que todas las pantallas se mantengan perfectamente alineadas y sin deformac
 ---
 
 ## Historial de mejoras por actualización
+
+### `v2.5.5` — Control Remoto Integrado en `tbee.tv` (MySQL + PHP, sin necesitar Tailscale)
+- **Integración bidireccional nativa con `tbee.tv`:** `URPPI3-v2.5.js` ahora envía el estado completo del equipo (`urpState`: hardware, `get_throttled`, agenda, audio, horario HDMI, resolución y rotación) dentro del polling actual de `ws/URP.php`, reporta en el campo `ip` tanto la IP LAN como la de Tailscale (`IP_LAN / IP_TAILSCALE` si está activa), lee `data.nameDisplay` para sincronizar el hostname y aplica cambios remotos de configuración (`urpConfig`) y botones rápidos (`urpCommand`) confirmándolos vía `ws/ackURPControl.php`.
+- **Monitoreo en Vivo sin Tailscale ni puertos abiertos (`ws/urpLive.php`):** Al activar el monitoreo desde `remoteControlPanel.php` en `tbee.tv`, la Pi sube captura JPG comprimida y logs recientes cada ~3.5 segundos por `POST` saliente durante 2 minutos (retrocompatible 100% con Raspberry Pis viejas).
+- **Paquete listo para el servidor `tbee.tv`:** Incluye tabla MySQL independiente (`tbee_remote_control.sql`), helper seguro con *Prepared Statements* (`urpRemoteHelper.php`), `ackURPControl.php`, `urpLive.php` y panel web completo (`remoteControlPanel.php?idDisplay=...`).
+
+### `v2.5.4` — Suite Completa de Control, Diagnóstico de Hardware, Energía, Audio y Seguridad
+- **Logs en vivo avanzados + OTA con 1 clic:** Nuevo endpoint `GET /api/logs` (buffer circular de 200 líneas) con buscador/filtro en tiempo real, botón **Pausar scroll**, descarga a `urp-logs.txt` y botón directo **Buscar actualización OTA** (`/update`).
+- **Vista en vivo compatible con `omxplayer`:** Cuando el reproductor activo usa la capa hardware DispmanX (`omxplayer`), `captureOsDisplayFrame()` prioriza `raspi2png` para mostrar la imagen real del HDMI en `:8090`.
+- **Diagnóstico de hardware y protección de disco/SD:** Lectura de `vcgencmd get_throttled` (alerta de bajo voltaje o temperatura crítica en el panel), *uptime* del equipo/proceso, espacio libre en MB con limpieza automática preventiva si baja de `600 MB`, más rotación de logs `pm2-logrotate` y `journald` volátil en `install-urp.sh`.
+- **Controles rápidos + Audio + Horarios de pantalla HDMI:** Botones **Pausar / Reanudar** y **Siguiente ítem** en `:8090`; control de **Volumen (0–100%)**, **Mute** y salida (`Auto / HDMI / Jack 3.5mm`) vía `mpv` IPC / `amixer` / `omxplayer`; y **Programación de encendido/apagado HDMI** por horario o modo manual (`vcgencmd display_power`, `xrandr`, `wlr-randr`, `cec-client`).
+- **Seguridad por PIN opcional (`scrypt`) + caché preservado:** Bloqueo opcional del panel `:8090` con hash `scrypt` y límite de intentos, rotación de pantalla sin borrar caché si no hay conversión activa, pantalla **Standby Offline** automática y **sincronización Video Wall multi-ítem** (`playlist-pos` + `time-pos`).
+
+### `v2.5.3` — Equilibrio Bajo CPU + Cero cortes ni fondo de escritorio (0 ms)
+- **Videos H.264 720p/1080p directos por hardware (sin recodificar en Pi 3B+):** En el modo predeterminado (`resolutionMode: "auto"` — *Inteligente / Bajo CPU*), todos los MP4 H.264 estándar hasta `1920x1080 @ 31 fps <= 10 Mbps` (`yuv420p`) se reproducen **directo sin ejecutar `ffmpeg libx264`**, evitando el 100% de CPU durante la reproducción. Solo convierte videos si superan 1080p (4K), 31 fps (60fps), usan HEVC/VP9/AV1, 10-bit, si activás `Forzar 1280x720` o `Video Wall`.
+- **Imágenes a MP4 ultra livianas en ~1 segundo (cero parpadeos al escritorio):** La conversión de imágenes decodifica y escala la imagen **una única vez** (`loop=loop=-1:size=1:start=0,fps=24`), reduciendo ~90% el costo de CPU. Al estar en MP4, imágenes y videos se reproducen dentro del mismo flujo continuo 0 ms sin mostrar jamás el fondo de pantalla al cambiar de ítem o reiniciar la playlist.
+- **Ventana única continua (`omxplayer --loop` / `mpv --loop-playlist=inf`) + cortina negra:** Si hay 1 solo video y existe `omxplayer`, reproduce en loop hardware (~5% CPU, 0 ms). Con múltiples ítems usa una sola ventana persistente `mpv --loop-playlist=inf` (o unión instantánea `-c copy` cuando los clips coinciden) sobre `black_curtain.png`, eliminando cierres/reaperturas entre vueltas de lista.
+- **Protección estricta contra `llvmpipe` y salida HDMI `1280x720` (0% CPU):** `detectMpvCapabilities()` verifica `glxinfo`, `es2_info` y módulos `vc4`/`v3d`; si en Pi 3B+ no se confirma OpenGL por hardware real, fuerza `--vo=xv,x11` ligero con `--vd-lavc-threads=2`, `--audio-display=no` y escalador rápido en lugar de caer en Mesa `llvmpipe`. Además ajusta la salida HDMI a `1280x720` vía `xrandr` (0% CPU, 56% menos píxeles a dibujar).
+- **Backpressure conservador en Pi 3B+:** Pausa cualquier tarea de conversión en cola si RAM >=75%, CPU >=70% o temperatura >=72 °C.
+
+### `v2.5.2` — Modo Directo sin conversión por defecto (CPU <20%, estilo `URPPI3` original)
+- **Cero conversiones automáticas en segundo plano:** Por defecto (`resolutionMode: "direct"`), `URPPI3-v2.5.js` reproduce los videos e imágenes originales descargados en `/home/pi/URP/content/` sin ejecutar procesos `ffmpeg` o `ffprobe` (ni `imgToVideo`, ni `scheduleVideoOptimization`, ni `seamless` concat), devolviendo el consumo de CPU al rango `<20%` del archivo original.
+- **Migración automática tras OTA:** Si un equipo ya tenía `wall.json` en modo `"auto"` de versiones anteriores, al actualizar a `v2.5.2` pasa automáticamente a `"direct"` y detiene las conversiones pendientes.
+- **Salida HDMI `1280x720` ligera sin recodificar:** En Raspberry Pi 3B+, mantiene la opción de ajustar la salida HDMI/X11 a `1280x720` por hardware (`xrandr`, 0% CPU) para mejorar la fluidez de pantalla sin tocar los archivos de video.
+- **Conversión `720p / 1080p` preservada como opción manual en `:8090`:** Si necesitás convertir videos pesados o unificar imágenes a MP4, podés elegir `Convertir a 1280x720` o `Convertir a 1920x1080` en cualquier momento desde el panel web `:8090`.
+
+### `v2.5.1` — Reproducción Fluida de Bajo CPU en 720p (Pi 3B+ X11 / EGL / DRM)
+- **Autodetección inteligente de aceleración gráfica en `mpv`:** Al iniciar sondea `mpv --hwdec=help`, `mpv --vo=help`, `mpv --gpu-context=help`, `mpv --list-options` y el renderer OpenGL de X11 (`glxinfo`, `/dev/dri/renderD*`, `Xorg.0.log`):
+  - Si X11 está usando OpenGL por software (`llvmpipe`/`softpipe`/`FBDEV`), evita `--vo=gpu` (que consumía 200-350% CPU) y cambia automáticamente a `--vo=xv,x11` ligero sin shaders junto a decodificación por hardware (`v4l2m2m-copy`/`mmal-copy`).
+  - Si hay GPU VideoCore activa (`VC4`/`V3D`), utiliza `--gpu-context=x11egl` + `--opengl-es=yes` + `--gpu-dumb-mode=yes` y cadena priorizada de hardware decode (`drm`, `drm-copy`, `v4l2m2m-copy`, `mmal-copy`, `auto-copy`), además de 4 hilos en `--vd-lavc-threads` si hay fallback a software y auto-recuperación ante error de driver.
+- **Fin de la sobrecarga de `ffmpeg` en segundo plano durante reproducción 720p:**
+  - Los videos MP4 H.264 `1280x720` hasta `31 fps` y `5 Mbps` (incluyendo perfil `High`) se reproducen **directamente sin recodificar**, evitando minutos de `libx264` al 100% CPU y estrangulamiento térmico.
+  - En Raspberry Pi de bajos recursos (`Pi 3B+`), `scheduleSeamlessBuild` usa `-c copy` instantáneo (ahora compatible hasta `31 fps`) y **omite** concatenaciones pesadas con recodificación completa para que `mpv` reproduzca la lista en ventana única sin gasto extra de CPU.
+  - La conversión de imágenes estáticas a MP4 pasa a `-framerate 1` en entrada antes de `fps=24`, reduciendo ~85% el CPU de `swscale`, y el *backpressure* térmico/CPU pausa `ffmpeg` desde `72 °C`, `78% RAM` o `75% CPU`.
+  - Reducida la frecuencia de mantenimiento de escritorio (`60s`) y evitados spawns redundantes de `xrandr`.
+- **Nuevo control en panel `:8090`:** Selector **Salida / Aceleración de Video** (`Automática`, `X11 Ligero sin OpenGL`, `GPU EGL`, `DRM/KMS Directo`) e indicador del driver activo en el encabezado y reproductor.
 
 ### `v2.5.0` — Panel Completo en Vivo (`:8090`), 720p Fluido Pi 3B+, Rotación/Agenda y Tailscale
 - **Controles directos en el panel principal `:8090`:**
