@@ -16,7 +16,7 @@ Se conecta al servidor Manager (`tbee.tv`), sincroniza horarios y contenidos por
   - **Horarios de Encendido / Apagado de Pantalla HDMI (`POST /api/power-schedule`):** programación diaria opcional (ej. apagar `22:00`, encender `07:00`) y botones manuales On / Off / Automático vía `vcgencmd display_power`, `xrandr`, `wlr-randr` y `cec-client`, pausando la reproducción mientras está apagada.
   - **Modo / Resolución de conversión, Rotación y Salida de Video directa:** permite elegir entre `Inteligente / Bajo CPU (Recomendado)`, `Forzar 1280x720 (Máxima fluidez Pi 3B+)`, `1920x1080 (Full HD Pi 4/5)` o `Directo / Sin conversión (estilo URPPI3 original)`, activar ajuste HDMI `1280x720` (sin recodificar), rotar contenido/pantalla (`0° / 90° / 180° / 270°`) **sin destruir caché de conversión cuando no hace falta** y elegir la salida de video (`Automática`, `X11 Ligero sin OpenGL`, `GPU EGL` o `DRM/KMS Directo`).
   - **Agenda Cargada y Logs Filtrables:** lista todos los bloques horarios activos, inicio, duración y estado (`Listo` / `Pendiente`), junto al visor de logs en vivo (`GET /api/logs`) con filtro por texto, botón **Pausar scroll** y **Descargar `.txt`**.
-  - **Seguridad opcional por PIN (`POST /api/security/pin`):** permite proteger el panel `:8090` con un PIN numérico almacenado con hash seguro (`scrypt`, o variable `URP_PANEL_PIN`), bloqueo temporal ante 5 intentos fallidos y sesiones Bearer en memoria sin afectar los endpoints de sincronización LAN ni telemetría.
+  - **Seguridad con la clave de la Raspberry Pi + Consola Web Liviana (`POST /api/terminal`):** por defecto el panel `:8090` y la consola integrada se desbloquean con la misma contraseña configurada en la Raspberry Pi (validación PAM/Linux nativa vía `unix_chkpwd` / `su`, límite de 5 intentos fallidos y sesiones Bearer en memoria), con opción de cambiar a PIN personalizado (`scrypt` / `URP_PANEL_PIN`) o dejar solo el monitoreo abierto manteniendo la consola siempre protegida. Incluye botones de diagnóstico rápido (`df -h`, `pm2 status`, `vcgencmd`, `tailscale status`, `free -m`).
   - **Configurador de Video Wall:** soporta IDs `1..999`, matrices hasta `32x32` y **sincronización multi-ítem** de posición en playlist + tiempo vía IPC de `mpv`.
 - **Pantalla Standby Offline automática:** si el equipo arranca sin contenidos ni `background.png`, genera una única vez `standby_urp.png` en disco para evitar pantalla totalmente negra mientras espera programación (activable/desactivable desde el panel).
 - **Hostname sincronizado desde el Manager:** actualiza automáticamente el hostname del sistema operativo (`hostnamectl`) y el nombre en Tailscale (`tailscale set --hostname`) tomando el nombre configurado en `tbee.tv`.
@@ -32,10 +32,10 @@ Se conecta al servidor Manager (`tbee.tv`), sincroniza horarios y contenidos por
 
 | Archivo | Descripción |
 | :--- | :--- |
-| `URPPI3-v2.5.js` | **Base activa (`v2.5.5`):** Reproducción inteligente de bajo CPU con transiciones 0 ms sin flashes al escritorio + control remoto completo tanto en el puerto local `:8090` como integrado de forma nativa en `tbee.tv` (sin Tailscale: telemetría, vista en vivo cada 3s vía `urpLive.php`, audio, resolución, rotación, horario HDMI, logs y comandos rápidos). |
+| `URPPI3-v2.5.js` | **Base activa (`v2.5.7`):** Consola Web Liviana en `:8090` protegida con la clave de la Raspberry Pi + reproducción inteligente sin duplicar `seamless/` en `mpv` + limpieza automática + control nativo en `tbee.tv`. |
 | `URPPI3.js` | Versión legado estable (`v2.4.1`). |
 | `urp-wall.sh` | Configurador ejecutable independiente (`urp-wall`) para activar Video Wall, elegir ID (`1..999`), disposición (`hasta 32x32`) y orientación. |
-| `install-urp.sh` | Instalador automático *zero-touch* (`v2.5.5`) con protección microSD (`journald` volátil + `pm2-logrotate`), `alsa-utils` y soporte `raspi2png`. |
+| `install-urp.sh` | Instalador automático *zero-touch* (`v2.5.7`) con protección microSD (`journald` volátil + `pm2-logrotate`), `alsa-utils` y soporte `raspi2png`. |
 | `README.md` | Documentación completa de instalación, Tailscale, panel `:8090`, Video Wall, comandos e historial de mejoras. |
 
 ---
@@ -159,6 +159,7 @@ curl -fsSL "https://raw.githubusercontent.com/JulianDS95/URPSignageTv/main/URPPI
 ### Endpoints HTTP locales (Puerto `8090`)
 - `GET /` (Panel web completo) · `GET /api/status` · `GET /api/preview.jpg` · `GET /api/logs`
 - `GET /api/auth/check` · `POST /api/auth/login` · `POST /api/auth/logout` · `POST /api/security/pin`
+- `POST /api/terminal` · `POST /api/terminal/unlock`
 - `POST /api/display-settings` · `POST /api/audio` · `POST /api/power-schedule` · `POST /api/wall`
 - `POST /api/player/toggle-pause` · `POST /api/player/next`
 - `GET /restartPlayer` · `GET /resetContent` · `GET /gc`
@@ -226,8 +227,17 @@ Para que todas las pantallas se mantengan perfectamente alineadas y sin deformac
 
 ## Historial de mejoras por actualización
 
+### `v2.5.7` — Consola Web Liviana en `:8090` con clave de la Raspberry Pi
+- **Consola Web integrada sin instalar dependencias pesadas (`POST /api/terminal`):** Permite ejecutar comandos de diagnóstico (`df -h`, `du -sh /home/pi/URP/*`, `pm2 status`, `pm2 logs URP`, `vcgencmd`, `tailscale status`, `free -m`, navegación con `cd` e historial con flechas) directamente desde el navegador en `:8090`, con tope de 15s por comando, buffer de 64 KB y bloqueo seguro de programas de pantalla completa (`nano`, `htop`, `urp-wall`).
+- **Autenticación con la contraseña configurada en la Raspberry Pi:** Por defecto el acceso al panel `:8090` y a la consola valida la clave del usuario Linux activo (ej. `pi`) mediante `unix_chkpwd` / PAM sin ser engañado por `NOPASSWD` de `sudoers` y con bloqueo temporal tras 5 intentos fallidos. También podés cambiar a PIN personalizado (`scrypt`) o dejar el monitoreo abierto manteniendo la consola siempre protegida vía `POST /api/terminal/unlock`.
+
+### `v2.5.6` — Corrección de espacio en microSD (sin duplicación `seamless/` en `mpv` + limpieza de logs)
+- **Eliminación de copias duplicadas en `seamless/` cuando corre `mpv`:** Como `mpv --loop-playlist=inf` ya encadena listas en ventana única `0 ms`, `URPPI3-v2.5.js` deja de duplicar bloques completos en `/home/pi/URP/seamless/` salvo en equipos legacy que solo tengan `omxplayer`, ahorrando hasta 50% de espacio en la microSD.
+- **Tope preventivo de disco (`< 750 MB` / `< 900 MB`):** Evita iniciar nuevas optimizaciones o concatenaciones si queda poco espacio libre.
+- **Limpieza automática de emergencia mejorada (`< 600 MB`):** Además de purgar `seamless/`, `optimized/` y `temp/` (>10 min), protege contenidos internos de sub-listas (`playlistContents`) y vacía automáticamente logs acumulados de **PM2** (>5 MB) y `journalctl` (`--vacuum-size=32M`) en equipos actualizados por OTA.
+
 ### `v2.5.5` — Control Remoto Integrado en `tbee.tv` (MySQL + PHP, sin necesitar Tailscale)
-- **Integración bidireccional nativa con `tbee.tv`:** `URPPI3-v2.5.js` ahora envía el estado completo del equipo (`urpState`: hardware, `get_throttled`, agenda, audio, horario HDMI, resolución y rotación) dentro del polling actual de `ws/URP.php`, reporta en el campo `ip` tanto la IP LAN como la de Tailscale (`IP_LAN / IP_TAILSCALE` si está activa), lee `data.nameDisplay` para sincronizar el hostname y aplica cambios remotos de configuración (`urpConfig`) y botones rápidos (`urpCommand`) confirmándolos vía `ws/ackURPControl.php`.
+- **Integración bidireccional nativa con `tbee.tv`:** `URPPI3-v2.5.js` ahora envía el estado completo del equipo (`urpState`: hardware, `get_throttled`, agenda, audio, horario HDMI, resolución y rotación) dentro del polling actual de `ws/URP.php`, reporta en el campo `ip` hacia el Manager la **IP de Tailscale** (con respaldo en IP LAN solo si Tailscale no está vinculado), lee `data.nameDisplay` para sincronizar el hostname y aplica cambios remotos de configuración (`urpConfig`) y botones rápidos (`urpCommand`) confirmándolos vía `ws/ackURPControl.php`.
 - **Monitoreo en Vivo sin Tailscale ni puertos abiertos (`ws/urpLive.php`):** Al activar el monitoreo desde `remoteControlPanel.php` en `tbee.tv`, la Pi sube captura JPG comprimida y logs recientes cada ~3.5 segundos por `POST` saliente durante 2 minutos (retrocompatible 100% con Raspberry Pis viejas).
 - **Paquete listo para el servidor `tbee.tv`:** Incluye tabla MySQL independiente (`tbee_remote_control.sql`), helper seguro con *Prepared Statements* (`urpRemoteHelper.php`), `ackURPControl.php`, `urpLive.php` y panel web completo (`remoteControlPanel.php?idDisplay=...`).
 

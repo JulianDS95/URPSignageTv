@@ -1,6 +1,6 @@
 var URPActive = true;
 var URPType = 'URPPI3';
-var URPVersion = '2.5.5';
+var URPVersion = '2.5.7';
 var URPUpdated = false;
 var isArm = process.arch === 'arm' || process.arch === 'arm64';
 var isLinux = process.platform === 'linux';
@@ -381,6 +381,7 @@ var wallConfig = {
     screenOffTime: '22:00',
     showStandbyScreen: true,
     remoteConfigVersion: 0,
+    panelAuthMode: 'os',
     panelPinHash: ''
 };
 var wallConfigMtime = 0;
@@ -408,7 +409,7 @@ function loadWallConfig() {
                 videoOutputMode: 'auto',
                 audioVolume: 100, audioMuted: false, audioOutput: 'auto',
                 screenScheduleEnabled: false, screenOnTime: '08:00', screenOffTime: '22:00',
-                showStandbyScreen: true, remoteConfigVersion: 0, panelPinHash: ''
+                showStandbyScreen: true, remoteConfigVersion: 0, panelAuthMode: 'os', panelPinHash: ''
             };
             wallConfigMtime = 0;
             detectDisplaySession();
@@ -471,6 +472,9 @@ function loadWallConfig() {
             screenOffTime: sanitizeTimeHHMM(parsed.screenOffTime, '22:00'),
             showStandbyScreen: (parsed.showStandbyScreen === undefined) ? true : Boolean(parsed.showStandbyScreen),
             remoteConfigVersion: Math.max(0, parseInt(parsed.remoteConfigVersion, 10) || 0),
+            panelAuthMode: (parsed.panelAuthMode === 'os' || parsed.panelAuthMode === 'pin' || parsed.panelAuthMode === 'off')
+                ? parsed.panelAuthMode
+                : ((typeof parsed.panelPinHash === 'string' && parsed.panelPinHash.indexOf(':') > 0) ? 'pin' : 'os'),
             panelPinHash: (typeof parsed.panelPinHash === 'string' && parsed.panelPinHash.indexOf(':') > 0) ? parsed.panelPinHash : ''
         };
         wallConfigMtime = st.mtime.getTime();
@@ -681,19 +685,37 @@ function ensureBlackCurtainAsset() {
 }
 
 // ==============================================================================
-// 1A. SEGURIDAD PIN (:8090), AUDIO/VOLUMEN, AHORRO HDMI Y STANDBY OFFLINE
+// 1A. SEGURIDAD OS / PIN (:8090 + CONSOLA), AUDIO/VOLUMEN, AHORRO HDMI Y STANDBY
 // ==============================================================================
 var authSessions = {};
 var authFailures = {};
 var AUTH_SESSION_TTL_MS = 24 * 3600 * 1000;
 
+function getPanelOsUser() {
+    try {
+        var u = osMod.userInfo().username;
+        if (u && /^[a-z_][a-z0-9_-]*$/.test(u)) return u;
+    } catch (e) {}
+    var envUser = String(process.env.USER || process.env.LOGNAME || '').trim();
+    if (envUser && /^[a-z_][a-z0-9_-]*$/.test(envUser)) return envUser;
+    return 'pi';
+}
+
 function getPanelAuthConfig() {
+    var osUser = getPanelOsUser();
     var envPin = String(process.env.URP_PANEL_PIN || '').trim();
     if (envPin.length > 0) {
-        return { enabled: true, envManaged: true };
+        return { enabled: true, mode: 'env', envManaged: true, osUser: osUser };
     }
     var storedHash = (wallConfig && wallConfig.panelPinHash) ? String(wallConfig.panelPinHash) : '';
-    return { enabled: storedHash.indexOf(':') > 0, envManaged: false };
+    var rawMode = (wallConfig && wallConfig.panelAuthMode) ? String(wallConfig.panelAuthMode) : 'os';
+    if (rawMode === 'off') {
+        return { enabled: false, mode: 'off', envManaged: false, osUser: osUser };
+    }
+    if (rawMode === 'pin' && storedHash.indexOf(':') > 0) {
+        return { enabled: true, mode: 'pin', envManaged: false, osUser: osUser };
+    }
+    return { enabled: true, mode: 'os', envManaged: false, osUser: osUser };
 }
 
 function hashPinScrypt(pinStr) {
@@ -715,45 +737,214 @@ function verifyPinScrypt(pinStr, storedHash) {
     }
 }
 
-function verifyPanelPin(candidatePin) {
-    var cand = String(candidatePin || '');
-    if (!cand) return false;
-    var envPin = String(process.env.URP_PANEL_PIN || '').trim();
-    if (envPin.length > 0) {
-        var hA = crypto.createHash('sha256').update(cand).digest();
-        var hB = crypto.createHash('sha256').update(envPin).digest();
-        return crypto.timingSafeEqual(hA, hB);
+function verifyLinuxOsPasswordPty(osUser, cand, callback) {
+    var doneFlag = false;
+    var finish = function (ok) {
+        if (doneFlag) return;
+        doneFlag = true;
+        callback(Boolean(ok));
+    };
+    if (!isLinux && !isArm) return finish(false);
+    var pyScript = [
+        'import os, pty, sys, select, time, errno',
+        'user = sys.argv[1]',
+        'pw = sys.stdin.buffer.read()',
+        'pid, fd = pty.fork()',
+        'if pid == 0:',
+        '    os.execv("/bin/su", ["su", "-c", "true", user])',
+        '    os._exit(127)',
+        'sent = False',
+        'buf = b""',
+        'deadline = time.time() + 4.5',
+        'while time.time() < deadline:',
+        '    r, _, _ = select.select([fd], [], [], 0.2)',
+        '    if fd in r:',
+        '        try:',
+        '            chunk = os.read(fd, 1024)',
+        '            if not chunk: break',
+        '            buf += chunk',
+        '            low = buf.lower()',
+        '            if not sent and (b"password:" in low or b"contrase" in low or b":" in low):',
+        '                os.write(fd, pw + b"\n")',
+        '                sent = True',
+        '        except OSError as e:',
+        '            if e.errno == errno.EIO: break',
+        '            break',
+        '    wpid, status = os.waitpid(pid, os.WNOHANG)',
+        '    if wpid == pid:',
+        '        try: os.close(fd)',
+        '        except Exception: pass',
+        '        sys.exit(0 if (os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0) else 1)',
+        'try:',
+        '    os.kill(pid, 9)',
+        '    os.waitpid(pid, 0)',
+        'except Exception: pass',
+        'try: os.close(fd)',
+        'except Exception: pass',
+        'sys.exit(1)'
+    ].join('\n');
+
+    try {
+        var py = spawn('python3', ['-c', pyScript, osUser], { stdio: ['pipe', 'ignore', 'ignore'] });
+        var timer = setTimeout(function () {
+            try { py.kill('SIGKILL'); } catch (ke) {}
+            finish(false);
+        }, 5500);
+        py.on('error', function () {
+            clearTimeout(timer);
+            finish(false);
+        });
+        py.on('close', function (code) {
+            clearTimeout(timer);
+            finish(code === 0);
+        });
+        if (py.stdin) {
+            py.stdin.end(Buffer.from(cand, 'utf8'));
+        }
+    } catch (e) {
+        finish(false);
     }
-    return verifyPinScrypt(cand, wallConfig && wallConfig.panelPinHash);
 }
 
-function issueAuthToken() {
+function verifyLinuxOsPassword(candidatePass, callback) {
+    var cand = String(candidatePass || '');
+    if (!cand || cand.length > 256 || (!isLinux && !isArm)) {
+        return callback(false);
+    }
+    var osUser = getPanelOsUser();
+    var chkBins = ['/sbin/unix_chkpwd', '/usr/sbin/unix_chkpwd'];
+    var chkBin = '';
+    var hasPriv = false;
+    for (var i = 0; i < chkBins.length; i++) {
+        try {
+            if (fs.existsSync(chkBins[i])) {
+                chkBin = chkBins[i];
+                var st = fs.statSync(chkBin);
+                var isRoot = (typeof process.getuid === 'function' && process.getuid() === 0);
+                hasPriv = Boolean(isRoot || (st.mode & 0o4000) || (st.mode & 0o2000));
+                break;
+            }
+        } catch (e) {}
+    }
+
+    if (chkBin) {
+        var settled = false;
+        var doneChk = function (ok) {
+            if (settled) return;
+            settled = true;
+            callback(Boolean(ok));
+        };
+        try {
+            var p = spawn(chkBin, [osUser, 'nullok'], { stdio: ['pipe', 'ignore', 'ignore'] });
+            var chkTimer = setTimeout(function () {
+                try { p.kill('SIGKILL'); } catch (ke) {}
+                doneChk(false);
+            }, 4000);
+            p.on('error', function () {
+                clearTimeout(chkTimer);
+                verifyLinuxOsPasswordPty(osUser, cand, doneChk);
+            });
+            p.on('close', function (code) {
+                clearTimeout(chkTimer);
+                if (code === 0) return doneChk(true);
+                if (!hasPriv) {
+                    return verifyLinuxOsPasswordPty(osUser, cand, doneChk);
+                }
+                doneChk(false);
+            });
+            if (p.stdin) {
+                p.stdin.end(Buffer.from(cand + '\0', 'utf8'));
+            }
+            return;
+        } catch (e) {}
+    }
+
+    verifyLinuxOsPasswordPty(osUser, cand, callback);
+}
+
+function verifyPanelCredentialAsync(candidatePin, forceOsCheck, callback) {
+    var cand = String(candidatePin || '');
+    if (!cand) return callback(false);
+    var cfg = getPanelAuthConfig();
+    if (cfg.mode === 'env' && !forceOsCheck) {
+        var envPin = String(process.env.URP_PANEL_PIN || '').trim();
+        var hA = crypto.createHash('sha256').update(cand).digest();
+        var hB = crypto.createHash('sha256').update(envPin).digest();
+        return callback(crypto.timingSafeEqual(hA, hB));
+    }
+    if (cfg.mode === 'pin' && !forceOsCheck) {
+        return callback(verifyPinScrypt(cand, wallConfig && wallConfig.panelPinHash));
+    }
+    verifyLinuxOsPassword(cand, callback);
+}
+
+function issueAuthToken(metaObj) {
     var now = Date.now();
     var keys = Object.keys(authSessions);
     for (var i = 0; i < keys.length; i++) {
-        if (authSessions[keys[i]] < now) delete authSessions[keys[i]];
+        var rec = authSessions[keys[i]];
+        var exp = (typeof rec === 'number') ? rec : (rec && rec.expiresAt ? rec.expiresAt : 0);
+        if (exp < now) delete authSessions[keys[i]];
     }
     var tok = crypto.randomBytes(32).toString('hex');
-    authSessions[tok] = now + AUTH_SESSION_TTL_MS;
+    var info = metaObj || {};
+    authSessions[tok] = {
+        expiresAt: now + AUTH_SESSION_TTL_MS,
+        osVerified: Boolean(info.osVerified),
+        pinVerified: Boolean(info.pinVerified),
+        user: String(info.user || getPanelOsUser()),
+        cwd: basePath
+    };
     return tok;
+}
+
+function getActiveSession(req) {
+    var authHdr = String((req.headers && req.headers.authorization) || '');
+    if (authHdr.indexOf('Bearer ') !== 0) return null;
+    var tok = authHdr.slice(7).trim();
+    if (!tok || !authSessions[tok]) return null;
+    var rec = authSessions[tok];
+    var exp = (typeof rec === 'number') ? rec : (rec.expiresAt || 0);
+    if (exp < Date.now()) {
+        delete authSessions[tok];
+        return null;
+    }
+    return { token: tok, data: rec };
 }
 
 function isRequestAuthenticated(req) {
     if (!getPanelAuthConfig().enabled) return true;
-    var authHdr = String((req.headers && req.headers.authorization) || '');
-    if (authHdr.indexOf('Bearer ') !== 0) return false;
-    var tok = authHdr.slice(7).trim();
-    if (!tok || !authSessions[tok]) return false;
-    if (authSessions[tok] < Date.now()) {
-        delete authSessions[tok];
-        return false;
-    }
-    return true;
+    return Boolean(getActiveSession(req));
+}
+
+function isTerminalAuthenticated(req) {
+    var sess = getActiveSession(req);
+    if (!sess) return false;
+    return Boolean(sess.data && (sess.data.osVerified || sess.data.pinVerified));
 }
 
 function requirePanelAuth(req, res, next) {
     if (isRequestAuthenticated(req)) return next();
-    res.status(401).json({ ok: false, authRequired: true, error: 'PIN requerido para acceder al panel' });
+    var cfg = getPanelAuthConfig();
+    var msg = (cfg.mode === 'os')
+        ? ('Ingresá la clave de la Raspberry Pi (usuario ' + cfg.osUser + ') para acceder.')
+        : 'PIN requerido para acceder al panel';
+    res.status(401).json({ ok: false, authRequired: true, authMode: cfg.mode, osUser: cfg.osUser, error: msg });
+}
+
+function requireTerminalAuth(req, res, next) {
+    var sess = getActiveSession(req);
+    if (sess && sess.data && (sess.data.osVerified || sess.data.pinVerified)) {
+        req.urpSession = sess;
+        return next();
+    }
+    var cfg = getPanelAuthConfig();
+    res.status(401).json({
+        ok: false,
+        terminalAuthRequired: true,
+        osUser: cfg.osUser,
+        error: 'Autenticá con la clave de la Raspberry Pi (' + cfg.osUser + ') para usar la consola.'
+    });
 }
 
 function saveWallConfigPartial(patchObj) {
@@ -2725,6 +2916,11 @@ function processNextVideoOpt() {
         return;
     }
     var bpReason = getEncodingBackpressureReason();
+    if (freeDiskMb > 0 && freeDiskMb < 750) {
+        console.log('[OPT:VIDEO] Espacio libre ajustado (' + freeDiskMb + ' MB < 750 MB). Omitiendo optimización extra para proteger la microSD.');
+        videoOptQueue = [];
+        return;
+    }
     if (bpReason && optDeferCount < 8) {
         optDeferCount++;
         console.log('[OPT:VIDEO] Posponiendo normalización 20s por ' + bpReason + '...');
@@ -2944,36 +3140,49 @@ function garbageCollectUnusedMedia(forceEmergency, callback) {
         var dimsGc = getTargetVideoDims();
         var wallTagImg = isWallTileActive() ? ('_' + getWallSignature()) : '';
         var resTagGc = dimsGc.use720p ? '_720p' : '';
+        var registerKeepItem = function (itm) {
+            if (!itm) return null;
+            var safeName = normalizeName(itm.content);
+            if (!safeName) return null;
+            markKeep(path.join(contentBasePath, safeName));
+            markKeep(path.join(contentBasePath, itm.content));
+
+            if (!dimsGc.convertEnabled) return null;
+
+            if (isImg(safeName) || isImg(itm.content)) {
+                var dur = parseInt(itm.length, 10);
+                if (isNaN(dur) || dur <= 0) dur = 10;
+                var imgVid = safeName.replace(/\.[^/.]+$/, '') + resTagGc + wallTagImg + '_' + dur + 's.mp4';
+                markKeep(path.join(contentBasePath, imgVid));
+                return { file: imgVid, duration: dur };
+            }
+            var rawPath = path.join(contentBasePath, safeName);
+            var optPath = getOptimizedVideoPath(rawPath);
+            if (optPath) markKeep(optPath);
+            return {
+                file: (optPath && fs.existsSync(optPath)) ? optPath : safeName,
+                duration: parseInt(itm.length, 10) || 10
+            };
+        };
+
         for (var b = 0; b < scheduleArr.length; b++) {
             var blk = scheduleArr[b];
             var blkItems = blk.contents || [];
             var resolvedBlockItems = [];
             for (var c = 0; c < blkItems.length; c++) {
                 var itm = blkItems[c];
-                var safeName = normalizeName(itm.content);
-                if (!safeName) continue;
-                markKeep(path.join(contentBasePath, safeName));
-                markKeep(path.join(contentBasePath, itm.content));
-
-                if (!dimsGc.convertEnabled) continue;
-
-                if (isImg(safeName) || isImg(itm.content)) {
-                    var dur = parseInt(itm.length, 10);
-                    if (isNaN(dur) || dur <= 0) dur = 10;
-                    var imgVid = safeName.replace(/\.[^/.]+$/, '') + resTagGc + wallTagImg + '_' + dur + 's.mp4';
-                    markKeep(path.join(contentBasePath, imgVid));
-                    resolvedBlockItems.push({ file: imgVid, duration: dur });
+                if (itm.type === 'playlist' && Array.isArray(itm.playlistContents)) {
+                    for (var pc = 0; pc < itm.playlistContents.length; pc++) {
+                        var subRes = registerKeepItem(itm.playlistContents[pc]);
+                        if (subRes) resolvedBlockItems.push(subRes);
+                    }
                 } else {
-                    var rawPath = path.join(contentBasePath, safeName);
-                    var optPath = getOptimizedVideoPath(rawPath);
-                    if (optPath) markKeep(optPath);
-                    resolvedBlockItems.push({
-                        file: (optPath && fs.existsSync(optPath)) ? optPath : safeName,
-                        duration: parseInt(itm.length, 10) || 10
-                    });
+                    var resIt = registerKeepItem(itm);
+                    if (resIt) resolvedBlockItems.push(resIt);
                 }
             }
-            if (dimsGc.convertEnabled && resolvedBlockItems.length > 1) {
+            // Solo preservar cache seamless/ cuando NO hay mpv (omxplayer puro) y hay espacio suficiente
+            if (!hasMpv && dimsGc.convertEnabled && resolvedBlockItems.length > 1 && !(forceEmergency && freeDiskMb > 0 && freeDiskMb < 600)) {
                 var bHash = computeBlockHash(resolvedBlockItems);
                 markKeep(path.join(seamlessBasePath, 'block_' + blk.idScheduleBlock + '_' + bHash + '.mp4'));
             }
@@ -2981,7 +3190,7 @@ function garbageCollectUnusedMedia(forceEmergency, callback) {
 
         var nowMs = Date.now();
         var orphanAgeThresholdMs = forceEmergency ? 0 : (24 * 3600 * 1000);
-        var tempAgeThresholdMs = 2 * 3600 * 1000;
+        var tempAgeThresholdMs = forceEmergency ? (10 * 60 * 1000) : (2 * 3600 * 1000);
 
         var scanAndPrune = function (dirPath, isTempDir) {
             if (!fs.existsSync(dirPath)) return;
@@ -2993,7 +3202,7 @@ function garbageCollectUnusedMedia(forceEmergency, callback) {
                     var st = fs.statSync(fullP);
                     if (!st.isFile()) continue;
                     var ageMs = nowMs - st.mtime.getTime();
-                    if (isTempDir || entries[ei].indexOf('temp_') === 0 || /.part$/i.test(entries[ei])) {
+                    if (isTempDir || entries[ei].indexOf('temp_') === 0 || /.part$/i.test(entries[ei]) || /^concat_.*.txt$/i.test(entries[ei])) {
                         if (ageMs > tempAgeThresholdMs && !ftpWorking && !isRendering && !isOptimizingVideo && !isConcatenating) {
                             fs.unlinkSync(fullP);
                             result.removedFiles++;
@@ -3015,8 +3224,30 @@ function garbageCollectUnusedMedia(forceEmergency, callback) {
             scanAndPrune(contentBasePath, false);
         }
 
+        // En emergencia (< 600 MB), también vaciar logs gigantes de PM2 y journald acumulados antes del alta
+        if (forceEmergency && (isArm || isLinux)) {
+            try {
+                var homeLogsDir = path.join(process.env.HOME || '/home/pi', '.pm2', 'logs');
+                if (fs.existsSync(homeLogsDir)) {
+                    var lFiles = fs.readdirSync(homeLogsDir);
+                    for (var li = 0; li < lFiles.length; li++) {
+                        var lPath = path.join(homeLogsDir, lFiles[li]);
+                        try {
+                            var lst = fs.statSync(lPath);
+                            if (lst.isFile() && lst.size > 5 * 1024 * 1024) {
+                                fs.truncateSync(lPath, 0);
+                                result.freedBytes += lst.size;
+                                result.removedFiles++;
+                            }
+                        } catch (le) {}
+                    }
+                }
+            } catch (ple) {}
+            exec("pm2 flush 2>/dev/null || true; sudo -n journalctl --vacuum-size=32M 2>/dev/null || true", { timeout: 8000 }, function () {});
+        }
+
         if (result.removedFiles > 0) {
-            console.log('[GC:DISCO] Limpieza ' + (forceEmergency ? 'EMERGENCIA' : 'programada') + ': ' + result.removedFiles + ' archivo(s) huérfano(s) eliminado(s), ' + (result.freedBytes / (1024 * 1024)).toFixed(1) + ' MB liberados.');
+            console.log('[GC:DISCO] Limpieza ' + (forceEmergency ? 'EMERGENCIA' : 'programada') + ': ' + result.removedFiles + ' archivo(s)/log(s) limpiado(s), ' + (result.freedBytes / (1024 * 1024)).toFixed(1) + ' MB liberados.');
         }
     } catch (e) {
         console.error('[GC:DISCO] Error:', e.message);
@@ -3190,6 +3421,8 @@ function cleanupOldSeamless(idBlock, keepFileName) {
 }
 
 function prebuildAllScheduleBlocks() {
+    if (hasMpv) return;
+    if (freeDiskMb > 0 && freeDiskMb < 900) return;
     if (!getTargetVideoDims().convertEnabled) return;
     if (!bootGraceDone || isRendering || isOptimizingVideo || isConcatenating) return;
     var scheduleArr = Array.isArray(schedule) ? schedule : [];
@@ -3230,6 +3463,8 @@ function prebuildAllScheduleBlocks() {
 }
 
 function scheduleSeamlessBuild(idBlock, blockHash, items, outPath) {
+    if (hasMpv) return;
+    if (freeDiskMb > 0 && freeDiskMb < 900) return;
     if (!getTargetVideoDims().convertEnabled) return;
     if (!bootGraceDone || isRendering || isConcatenating) return;
     if (failedSeamlessHashes[blockHash]) return;
@@ -3497,7 +3732,7 @@ function playContent(idBlock) {
         return isVideoFile(it.file);
     });
 
-    if (dimsPlay.convertEnabled && allItemsAreVideos) {
+    if (!hasMpv && dimsPlay.convertEnabled && allItemsAreVideos) {
         var blockHash = computeBlockHash(filesToPlay);
         var seamlessPath = seamlessBasePath + 'block_' + idBlock + '_' + blockHash + '.mp4';
         if (fileExist(seamlessPath)) {
@@ -5521,11 +5756,11 @@ function buildLocalDashboardHtml() {
         '<div id="msgBox" class="msg"></div>' +
         '<div id="hwAlert" class="warnBox"></div>' +
 
-        '<div id="viewLogin" class="hide"><div class="card" style="max-width:420px;margin:40px auto">' +
+        '<div id="viewLogin" class="hide"><div class="card" style="max-width:440px;margin:40px auto">' +
         '<h2>Acceso Protegido (:8090)</h2>' +
-        '<div class="sub" style="margin-bottom:12px">Ingresá el PIN del panel para ver o administrar esta Raspberry Pi.</div>' +
-        '<label class="lbl" for="loginPin">PIN del panel</label>' +
-        '<input type="password" id="loginPin" placeholder="Ingresá tu PIN" autocomplete="current-password">' +
+        '<div class="sub" id="loginSub" style="margin-bottom:12px">Ingresá la clave configurada en la Raspberry Pi para acceder al panel y a la consola.</div>' +
+        '<label class="lbl" id="loginLbl" for="loginPin">Clave de Raspberry Pi</label>' +
+        '<input type="password" id="loginPin" placeholder="Clave del sistema o PIN" autocomplete="current-password">' +
         '<div class="btns" style="margin-top:12px;margin-bottom:0"><button id="btnLogin" class="b-blue" style="width:100%">Desbloquear Panel</button></div>' +
         '</div></div>' +
 
@@ -5628,13 +5863,42 @@ function buildLocalDashboardHtml() {
         '</div></div><pre id="logs">Cargando...</pre></div>' +
 
         '<div class="card"><div class="liveHead" style="margin-bottom:8px">' +
+        '<div><div class="k" style="margin:0">Consola Web Liviana (Raspberry Pi)</div><div class="sub" id="termMeta">Ejecutá comandos rápidos sin abrir cliente SSH (cwd: /home/pi/URP)</div></div>' +
+        '<div class="btns" style="margin:0"><button type="button" id="btnTermClear" class="b-ghost" style="padding:6px 10px">Limpiar</button></div>' +
+        '</div>' +
+        '<div id="termUnlockBox" class="hide" style="margin-bottom:10px;padding:10px;border:1px solid #334155;border-radius:9px;background:#030712">' +
+        '<div class="sub" id="termUnlockHint" style="margin-bottom:8px">El monitoreo del panel está abierto, pero la consola exige la clave de tu Raspberry Pi.</div>' +
+        '<div style="display:flex;gap:8px;flex-wrap:wrap"><input type="password" id="termUnlockPass" placeholder="Clave de Raspberry Pi" style="flex:1;min-width:190px"><button type="button" id="btnTermUnlock" class="b-blue">Habilitar Consola</button></div>' +
+        '</div>' +
+        '<div id="termBodyWrap">' +
+        '<div id="termQuick" class="presets" style="margin-bottom:8px">' +
+        '<button type="button" class="pbtn" data-cmd="df -h">Disco (df -h)</button>' +
+        '<button type="button" class="pbtn" data-cmd="du -sh /home/pi/URP/*">Peso carpetas URP</button>' +
+        '<button type="button" class="pbtn" data-cmd="pm2 status">pm2 status</button>' +
+        '<button type="button" class="pbtn" data-cmd="pm2 logs URP --lines 25 --nostream">pm2 logs</button>' +
+        '<button type="button" class="pbtn" data-cmd="vcgencmd get_throttled && vcgencmd measure_temp">Voltaje/Temp</button>' +
+        '<button type="button" class="pbtn" data-cmd="tailscale status">Tailscale</button>' +
+        '<button type="button" class="pbtn" data-cmd="free -m">RAM (free -m)</button>' +
+        '</div>' +
+        '<div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">' +
+        '<input type="text" id="termCmd" placeholder="Escribí un comando (ej: ls -la /home/pi/URP/content) y Enter" style="flex:1;min-width:220px;font-family:monospace">' +
+        '<button type="button" id="btnTermRun" class="b-green">Ejecutar</button>' +
+        '</div>' +
+        '<pre id="termOut" style="min-height:110px;max-height:280px;font-family:monospace;color:#e2e8f0">Listo. Elegí un atajo arriba o escribí un comando.</pre>' +
+        '</div></div>' +
+
+        '<div class="card"><div class="liveHead" style="margin-bottom:8px">' +
         '<div><div class="k" style="margin:0">Seguridad del Panel (:8090)</div><div class="sub" id="secState">Cargando estado de seguridad...</div></div>' +
         '</div>' +
         '<div id="secFormWrap" class="fgrid" style="margin-bottom:8px">' +
-        '<div id="secCurWrap" class="hide"><label class="lbl" for="secCurPin">PIN actual</label><input type="password" id="secCurPin" placeholder="PIN actual"></div>' +
-        '<div><label class="lbl" for="secNewPin">Nuevo PIN (mín. 4 caracteres)</label><input type="password" id="secNewPin" placeholder="Ej: 4829"></div>' +
+        '<div id="secCurWrap"><label class="lbl" for="secCurPin">Clave / PIN actual</label><input type="password" id="secCurPin" placeholder="Clave de Raspberry Pi o PIN actual"></div>' +
+        '<div><label class="lbl" for="secNewPin">PIN personalizado opcional (mín. 4 caracteres)</label><input type="password" id="secNewPin" placeholder="Solo si querés reemplazar la clave de Pi"></div>' +
         '</div>' +
-        '<div id="secBtns" class="btns" style="margin:0"><button type="button" id="btnSavePin" class="b-blue">Guardar PIN</button><button type="button" id="btnClearPin" class="b-ghost hide">Quitar PIN</button></div>' +
+        '<div id="secBtns" class="btns" style="margin:0">' +
+        '<button type="button" id="btnUseOsAuth" class="b-indigo">Usar clave de la Raspberry Pi</button>' +
+        '<button type="button" id="btnSavePin" class="b-blue">Usar PIN personalizado</button>' +
+        '<button type="button" id="btnClearPin" class="b-ghost">Panel sin clave (Consola sigue protegida)</button>' +
+        '</div>' +
         '</div>' +
         '</div>' +
 
@@ -6043,6 +6307,14 @@ function buildLocalDashboardHtml() {
         '    renderLogsBox();' +
         '    var sec = s.security || {};' +
         '    byId("btnLogout").className = sec.pinEnabled ? "b-ghost" : "b-ghost hide";' +
+        '    if (byId("termUnlockBox") && byId("termBodyWrap")) {' +
+        '      var termOk = Boolean(sec.terminalUnlocked);' +
+        '      byId("termUnlockBox").className = termOk ? "hide" : "";' +
+        '      byId("termBodyWrap").className = termOk ? "" : "hide";' +
+        '      if (byId("termUnlockHint")) {' +
+        '        byId("termUnlockHint").textContent = "El monitoreo del panel está abierto, pero la consola exige la clave de la Raspberry Pi (usuario " + (sec.osUser || "pi") + ").";' +
+        '      }' +
+        '    }' +
         '    if (sec.envManaged) {' +
         '      byId("secState").textContent = "PIN administrado por variable de entorno URP_PANEL_PIN en el servidor.";' +
         '      byId("secFormWrap").className = "hide";' +
@@ -6050,9 +6322,16 @@ function buildLocalDashboardHtml() {
         '    } else {' +
         '      byId("secFormWrap").className = "fgrid";' +
         '      byId("secBtns").className = "btns";' +
-        '      byId("secState").textContent = sec.pinEnabled ? "Panel protegido con PIN (sesión en memoria)." : "Sin PIN configurado (acceso abierto en LAN/Tailscale).";' +
-        '      byId("secCurWrap").className = sec.pinEnabled ? "" : "hide";' +
-        '      byId("btnClearPin").className = sec.pinEnabled ? "b-ghost" : "b-ghost hide";' +
+        '      if (sec.authMode === "os") {' +
+        '        byId("secState").textContent = "Modo activo: clave configurada en la Raspberry Pi (usuario " + (sec.osUser || "pi") + ") protege panel y consola.";' +
+        '      } else if (sec.authMode === "pin") {' +
+        '        byId("secState").textContent = "Modo activo: PIN personalizado (scrypt).";' +
+        '      } else {' +
+        '        byId("secState").textContent = "Monitoreo sin clave en LAN/Tailscale (Consola Web protegida con clave de " + (sec.osUser || "pi") + ").";' +
+        '      }' +
+        '      byId("secCurWrap").className = "";' +
+        '      byId("btnUseOsAuth").className = (sec.authMode === "os") ? "b-indigo hide" : "b-indigo";' +
+        '      byId("btnClearPin").className = (sec.authMode === "off") ? "b-ghost hide" : "b-ghost";' +
         '    }' +
         '    if (!wallLoaded && s.wallConfig) { syncToForm(s.wallConfig, s.serverVideoWallFlag); wallLoaded = true; }' +
         '    if (!displaySynced && s.wallConfig) { syncDisplayQuickForm(s.wallConfig, s.effectiveOrientation); displaySynced = true; }' +
@@ -6128,7 +6407,7 @@ function buildLocalDashboardHtml() {
         '  fetch("/api/auth/login", {' +
         '    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pin: pin })' +
         '  }).then(function(r){ return r.json(); }).then(function(res){' +
-        '    if (!res || !res.ok || !res.token) { showMsg((res && res.error) ? res.error : "PIN incorrecto", "err"); return; }' +
+        '    if (!res || !res.ok || !res.token) { showMsg((res && res.error) ? res.error : "Clave / PIN incorrecto", "err"); return; }' +
         '    authToken = res.token;' +
         '    byId("loginPin").value = "";' +
         '    showMsg("");' +
@@ -6142,6 +6421,83 @@ function buildLocalDashboardHtml() {
         '  authToken = "";' +
         '  setAuthLocked(true);' +
         '};' +
+        'var termHistory = [];' +
+        'var termHistIdx = -1;' +
+        'function appendTermBlock(txt){' +
+        '  var box = byId("termOut");' +
+        '  if (!box) return;' +
+        '  var cur = box.textContent || "";' +
+        '  if (cur.indexOf("Listo. Elegí un atajo") === 0) cur = "";' +
+        '  var next = (cur ? (cur + nl + nl) : "") + txt;' +
+        '  if (next.length > 48000) next = next.slice(next.length - 48000);' +
+        '  box.textContent = next;' +
+        '  box.scrollTop = box.scrollHeight;' +
+        '}' +
+        'function runTerminalCommand(cmdStr){' +
+        '  var cmd = String(cmdStr || "").trim();' +
+        '  if (!cmd) return;' +
+        '  if (termHistory.length === 0 || termHistory[termHistory.length - 1] !== cmd) {' +
+        '    termHistory.push(cmd);' +
+        '    if (termHistory.length > 30) termHistory.shift();' +
+        '  }' +
+        '  termHistIdx = termHistory.length;' +
+        '  var btn = byId("btnTermRun");' +
+        '  if (btn) { btn.disabled = true; btn.textContent = "Ejecutando..."; }' +
+        '  authFetch("/api/terminal", {' +
+        '    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ command: cmd })' +
+        '  }).then(function(r){ return r.json(); }).then(function(res){' +
+        '    if (btn) { btn.disabled = false; btn.textContent = "Ejecutar"; }' +
+        '    if (!res) return;' +
+        '    if (res.terminalAuthRequired) { refresh(); showMsg(res.error || "Autenticación requerida", "err"); return; }' +
+        '    if (!res.ok) {' +
+        '      appendTermBlock("$ " + cmd + nl + "[ERROR] " + (res.error || "Fallo de ejecución"));' +
+        '      return;' +
+        '    }' +
+        '    if (byId("termMeta") && res.cwd) byId("termMeta").textContent = "Consola activa • directorio: " + res.cwd + " (" + (res.durationMs || 0) + " ms)";' +
+        '    var parts = ["$ " + cmd];' +
+        '    if (res.stdout) parts.push(res.stdout.replace(/\s+$/, ""));' +
+        '    if (res.stderr) parts.push("[stderr] " + res.stderr.replace(/\s+$/, ""));' +
+        '    if (!res.stdout && !res.stderr) parts.push("(sin salida, código " + res.code + ")");' +
+        '    else if (res.code !== 0) parts.push("[exit " + res.code + "]");' +
+        '    if (res.truncated) parts.push("[salida truncada a 64 KB]");' +
+        '    appendTermBlock(parts.join(nl));' +
+        '    byId("termCmd").value = "";' +
+        '  }).catch(function(e){' +
+        '    if (btn) { btn.disabled = false; btn.textContent = "Ejecutar"; }' +
+        '    appendTermBlock("$ " + cmd + nl + "[ERROR RED] " + e.message);' +
+        '  });' +
+        '}' +
+        'byId("btnTermRun").onclick = function(){ runTerminalCommand(byId("termCmd").value); };' +
+        'byId("btnTermClear").onclick = function(){ byId("termOut").textContent = ""; };' +
+        'byId("termCmd").onkeydown = function(ev){' +
+        '  if (ev.key === "Enter") { ev.preventDefault(); runTerminalCommand(this.value); }' +
+        '  else if (ev.key === "ArrowUp" && termHistory.length > 0) {' +
+        '    ev.preventDefault(); termHistIdx = Math.max(0, termHistIdx - 1); this.value = termHistory[termHistIdx] || "";' +
+        '  } else if (ev.key === "ArrowDown" && termHistory.length > 0) {' +
+        '    ev.preventDefault(); termHistIdx = Math.min(termHistory.length, termHistIdx + 1); this.value = termHistory[termHistIdx] || "";' +
+        '  }' +
+        '};' +
+        'var tqBtns = byId("termQuick").querySelectorAll("button");' +
+        'for (var ti = 0; ti < tqBtns.length; ti++) {' +
+        '  tqBtns[ti].onclick = function(){' +
+        '    var c = this.getAttribute("data-cmd");' +
+        '    byId("termCmd").value = c;' +
+        '    runTerminalCommand(c);' +
+        '  };' +
+        '}' +
+        'byId("btnTermUnlock").onclick = function(){' +
+        '  var pw = byId("termUnlockPass").value;' +
+        '  fetch("/api/terminal/unlock", {' +
+        '    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ password: pw })' +
+        '  }).then(function(r){ return r.json(); }).then(function(res){' +
+        '    if (!res || !res.ok || !res.token) { showMsg((res && res.error) ? res.error : "Clave incorrecta", "err"); return; }' +
+        '    authToken = res.token;' +
+        '    byId("termUnlockPass").value = "";' +
+        '    showMsg("Consola web habilitada para esta sesión.", "ok");' +
+        '    refresh();' +
+        '  }).catch(function(e){ showMsg("Error: " + e.message, "err"); });' +
+        '};' +
+        'byId("termUnlockPass").onkeydown = function(ev){ if (ev.key === "Enter") byId("btnTermUnlock").click(); };' +
         'byId("btnSaveAudio").onclick = function(){' +
         '  postJson("/api/audio", {' +
         '    volume: clampInt(byId("aVol").value, 0, 100, 100),' +
@@ -6161,17 +6517,24 @@ function buildLocalDashboardHtml() {
         'byId("btnHdmiOn").onclick = function(){ postJson("/api/power-schedule", { manualAction: "on" }, function(){ showMsg("HDMI encendido manualmente.", "ok"); }); };' +
         'byId("btnHdmiOff").onclick = function(){ postJson("/api/power-schedule", { manualAction: "off" }, function(){ showMsg("HDMI apagado manualmente.", "ok"); }); };' +
         'byId("btnHdmiAuto").onclick = function(){ postJson("/api/power-schedule", { manualAction: "auto" }, function(){ showMsg("Control HDMI devuelto a modo automático.", "ok"); }); };' +
-        'byId("btnSavePin").onclick = function(){' +
-        '  postJson("/api/security/pin", { currentPin: byId("secCurPin").value, newPin: byId("secNewPin").value }, function(res){' +
+        'byId("btnUseOsAuth").onclick = function(){' +
+        '  postJson("/api/security/pin", { mode: "os", currentPin: byId("secCurPin").value }, function(res){' +
         '    if (res.token) authToken = res.token;' +
         '    byId("secCurPin").value = ""; byId("secNewPin").value = "";' +
-        '    showMsg("PIN de seguridad actualizado.", "ok");' +
+        '    showMsg("Seguridad cambiada a la clave de la Raspberry Pi.", "ok");' +
+        '  });' +
+        '};' +
+        'byId("btnSavePin").onclick = function(){' +
+        '  postJson("/api/security/pin", { mode: "pin", currentPin: byId("secCurPin").value, newPin: byId("secNewPin").value }, function(res){' +
+        '    if (res.token) authToken = res.token;' +
+        '    byId("secCurPin").value = ""; byId("secNewPin").value = "";' +
+        '    showMsg("PIN personalizado actualizado.", "ok");' +
         '  });' +
         '};' +
         'byId("btnClearPin").onclick = function(){' +
-        '  postJson("/api/security/pin", { currentPin: byId("secCurPin").value, newPin: "" }, function(){' +
+        '  postJson("/api/security/pin", { mode: "off", currentPin: byId("secCurPin").value, newPin: "" }, function(){' +
         '    authToken = ""; byId("secCurPin").value = ""; byId("secNewPin").value = "";' +
-        '    showMsg("PIN desactivado (panel abierto en LAN/Tailscale).", "ok");' +
+        '    showMsg("Monitoreo abierto en LAN/Tailscale (Consola sigue pidiendo clave de Raspberry Pi).", "ok");' +
         '  });' +
         '};' +
         'byId("btnTogglePause").onclick = function(){ postJson("/api/player/toggle-pause", {}, function(res){ showMsg(res.paused ? "Reproducción en pausa." : "Reproducción reanudada.", "ok"); }); };' +
@@ -6227,6 +6590,14 @@ function buildLocalDashboardHtml() {
         'byId("btnShutdown").onclick = function(){ if (confirm("¿Apagar Raspberry Pi?")) act("/shutdown"); };' +
         'byId("btnDelete").onclick = function(){ if (confirm("¿Borrar todo el contenido local?")) act("/deleteContents"); };' +
         'fetch("/api/auth/check").then(function(r){ return r.json(); }).then(function(a){' +
+        '  if (a && a.authMode === "os") {' +
+        '    byId("loginSub").textContent = "Ingresá la clave configurada en la Raspberry Pi (usuario: " + (a.osUser || "pi") + ") para abrir el panel y la consola.";' +
+        '    byId("loginLbl").textContent = "Clave de la Raspberry Pi (" + (a.osUser || "pi") + ")";' +
+        '    byId("loginPin").placeholder = "Clave de " + (a.osUser || "pi");' +
+        '  } else if (a && a.authMode === "pin") {' +
+        '    byId("loginSub").textContent = "Ingresá el PIN del panel para administrar esta Raspberry Pi.";' +
+        '    byId("loginLbl").textContent = "PIN del panel";' +
+        '  }' +
         '  if (a && a.locked) { setAuthLocked(true); } else { setAuthLocked(false); refresh(); }' +
         '}).catch(function(){ refresh(); });' +
         'setInterval(refresh, 3000);' +
@@ -6239,7 +6610,8 @@ app.use(express.static(__dirname + '/web'));
 
 app.use(function (req, res, next) {
     var origin = req.headers.origin;
-    if (origin && !getPanelAuthConfig().enabled) {
+    var sensitivePath = (req.path.indexOf('/api/terminal') === 0 || req.path.indexOf('/api/security') === 0 || req.path.indexOf('/api/auth') === 0);
+    if (origin && !sensitivePath && !getPanelAuthConfig().enabled) {
         res.header('Access-Control-Allow-Origin', origin);
     }
     res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -6258,7 +6630,10 @@ app.get('/api/auth/check', function (req, res) {
     var authed = isRequestAuthenticated(req);
     res.json({
         pinEnabled: cfg.enabled,
+        authMode: cfg.mode,
+        osUser: cfg.osUser,
         envManaged: cfg.envManaged,
+        terminalUnlocked: isTerminalAuthenticated(req),
         locked: cfg.enabled && !authed
     });
 });
@@ -6269,25 +6644,193 @@ app.post('/api/auth/login', function (req, res) {
             return res.status(400).json({ ok: false, error: 'JSON inválido' });
         }
         loadWallConfig();
+        var cfg = getPanelAuthConfig();
         var clientKey = String((req.socket && req.socket.remoteAddress) || 'local');
         var failRec = authFailures[clientKey];
         if (failRec && failRec.until > Date.now()) {
             return res.status(429).json({ ok: false, error: 'Demasiados intentos; esperá 60 segundos.' });
         }
-        if (!getPanelAuthConfig().enabled) {
-            return res.json({ ok: true, token: issueAuthToken() });
+        if (!cfg.enabled) {
+            return res.json({ ok: true, token: issueAuthToken({ osVerified: false, pinVerified: false, user: cfg.osUser }) });
         }
-        if (!verifyPanelPin(body.pin)) {
-            var count = (failRec && failRec.resetAt > Date.now()) ? (failRec.count + 1) : 1;
-            authFailures[clientKey] = {
-                count: count,
-                resetAt: Date.now() + 60000,
-                until: (count >= 5) ? (Date.now() + 60000) : 0
-            };
-            return res.status(401).json({ ok: false, error: 'PIN incorrecto' });
+        verifyPanelCredentialAsync(body.pin, false, function (valid) {
+            if (!valid) {
+                var count = (failRec && failRec.resetAt > Date.now()) ? (failRec.count + 1) : 1;
+                authFailures[clientKey] = {
+                    count: count,
+                    resetAt: Date.now() + 60000,
+                    until: (count >= 5) ? (Date.now() + 60000) : 0
+                };
+                var errTxt = (cfg.mode === 'os')
+                    ? ('Clave incorrecta para el usuario ' + cfg.osUser)
+                    : 'PIN incorrecto';
+                return res.status(401).json({ ok: false, error: errTxt });
+            }
+            delete authFailures[clientKey];
+            var tok = issueAuthToken({
+                osVerified: (cfg.mode === 'os'),
+                pinVerified: (cfg.mode === 'pin' || cfg.mode === 'env'),
+                user: cfg.osUser
+            });
+            res.json({ ok: true, token: tok, authMode: cfg.mode, osUser: cfg.osUser });
+        });
+    });
+});
+
+app.post('/api/terminal/unlock', function (req, res) {
+    readJsonBody(req, function (err, body) {
+        if (err || !body || typeof body !== 'object') {
+            return res.status(400).json({ ok: false, error: 'JSON inválido' });
         }
-        delete authFailures[clientKey];
-        res.json({ ok: true, token: issueAuthToken() });
+        loadWallConfig();
+        var cfg = getPanelAuthConfig();
+        var clientKey = String((req.socket && req.socket.remoteAddress) || 'local');
+        var failRec = authFailures[clientKey];
+        if (failRec && failRec.until > Date.now()) {
+            return res.status(429).json({ ok: false, error: 'Demasiados intentos; esperá 60 segundos.' });
+        }
+        var cand = (body.password !== undefined) ? body.password : body.pin;
+        verifyPanelCredentialAsync(cand, true, function (valid) {
+            if (!valid) {
+                var count = (failRec && failRec.resetAt > Date.now()) ? (failRec.count + 1) : 1;
+                authFailures[clientKey] = {
+                    count: count,
+                    resetAt: Date.now() + 60000,
+                    until: (count >= 5) ? (Date.now() + 60000) : 0
+                };
+                return res.status(401).json({ ok: false, error: 'Clave incorrecta para usuario ' + cfg.osUser });
+            }
+            delete authFailures[clientKey];
+            var tok = issueAuthToken({ osVerified: true, pinVerified: true, user: cfg.osUser });
+            res.json({ ok: true, token: tok, osUser: cfg.osUser });
+        });
+    });
+});
+
+app.post('/api/terminal', requireTerminalAuth, function (req, res) {
+    readJsonBody(req, function (err, body) {
+        if (err || !body || typeof body !== 'object') {
+            return res.status(400).json({ ok: false, error: 'JSON inválido' });
+        }
+        if (typeof body.command !== 'string') {
+            return res.status(400).json({ ok: false, error: 'Comando inválido' });
+        }
+        var cmd = body.command.trim();
+        if (!cmd || cmd.length > 512) {
+            return res.status(400).json({ ok: false, error: 'El comando debe tener entre 1 y 512 caracteres.' });
+        }
+        if (/[\0\r\n]/.test(cmd)) {
+            return res.status(400).json({ ok: false, error: 'Comando multilínea o con caracteres no permitidos.' });
+        }
+
+        var sess = req.urpSession;
+        var currentCwd = (sess && sess.data && sess.data.cwd && fs.existsSync(sess.data.cwd)) ? sess.data.cwd : basePath;
+
+        var firstSeg = cmd.split(/\s+/)[0].replace(/^sudo$/i, '').trim();
+        var checkTokens = cmd.split(/\s+/);
+        var leadCmd = checkTokens[0];
+        if (leadCmd === 'sudo' && checkTokens.length > 1) {
+            for (var ti = 1; ti < checkTokens.length; ti++) {
+                if (checkTokens[ti].charAt(0) !== '-') {
+                    leadCmd = checkTokens[ti];
+                    break;
+                }
+            }
+        }
+        var baseLead = path.basename(leadCmd || firstSeg || '').toLowerCase();
+        var interactiveList = ['nano', 'vi', 'vim', 'nvim', 'emacs', 'htop', 'top', 'less', 'more', 'man', 'mc', 'raspi-config', 'urp-wall', 'ssh', 'passwd', 'alsamixer', 'tmux', 'screen', 'su', 'login'];
+        if (interactiveList.indexOf(baseLead) !== -1 && cmd.indexOf('--') === -1 && cmd.indexOf('nonint') === -1) {
+            var hint = (baseLead === 'urp-wall')
+                ? ' Usá "urp-wall --status", "urp-wall --off" o el Configurador Web.'
+                : ' Usá comandos no interactivos (ej: cat, tail, grep, pm2 status, free -m).';
+            return res.status(400).json({ ok: false, error: 'Comando interactivo ("' + baseLead + '") no compatible con consola liviana.' + hint });
+        }
+
+        var cdMatch = cmd.match(/^cd(?:\s+(.*))?$/);
+        if (cdMatch && cmd.indexOf('&&') === -1 && cmd.indexOf(';') === -1 && cmd.indexOf('|') === -1) {
+            var rawDir = String(cdMatch[1] || '').trim().replace(/^["']|["']$/g, '');
+            var targetDir = !rawDir || rawDir === '~'
+                ? (osMod.homedir ? osMod.homedir() : '/home/pi')
+                : path.resolve(currentCwd, rawDir);
+            try {
+                if (!fs.existsSync(targetDir) || !fs.statSync(targetDir).isDirectory()) {
+                    return res.json({ ok: true, code: 1, stdout: '', stderr: 'bash: cd: ' + targetDir + ': No existe el directorio', cwd: currentCwd, durationMs: 0 });
+                }
+                if (sess && sess.data) sess.data.cwd = targetDir;
+                return res.json({ ok: true, code: 0, stdout: '', stderr: '', cwd: targetDir, durationMs: 0 });
+            } catch (cdErr) {
+                return res.json({ ok: true, code: 1, stdout: '', stderr: cdErr.message, cwd: currentCwd, durationMs: 0 });
+            }
+        }
+
+        var osUser = getPanelOsUser();
+        console.log('[TERMINAL] (' + osUser + ' @ ' + currentCwd + ') $ ' + cmd);
+
+        var startedAt = Date.now();
+        var MAX_TERM_OUT = 65536;
+        var outBuf = '';
+        var errBuf = '';
+        var truncated = false;
+        var finished = false;
+
+        var child = spawn('/bin/bash', ['-c', cmd], {
+            cwd: currentCwd,
+            env: Object.assign({}, getGuiEnv(), { TERM: 'xterm', PAGER: 'cat', GIT_TERMINAL_PROMPT: '0' }),
+            stdio: ['ignore', 'pipe', 'pipe']
+        });
+
+        var killTimer = setTimeout(function () {
+            if (!finished) {
+                errBuf += '\n[Tiempo límite de 15s superado]';
+                try { child.kill('SIGTERM'); } catch (ke) {}
+                setTimeout(function () {
+                    try { child.kill('SIGKILL'); } catch (ke2) {}
+                }, 800);
+            }
+        }, 15000);
+
+        if (child.stdout) {
+            child.stdout.on('data', function (chunk) {
+                if (outBuf.length + errBuf.length >= MAX_TERM_OUT) {
+                    truncated = true;
+                    return;
+                }
+                var room = MAX_TERM_OUT - (outBuf.length + errBuf.length);
+                outBuf += String(chunk).slice(0, room);
+            });
+        }
+        if (child.stderr) {
+            child.stderr.on('data', function (chunk) {
+                if (outBuf.length + errBuf.length >= MAX_TERM_OUT) {
+                    truncated = true;
+                    return;
+                }
+                var room = MAX_TERM_OUT - (outBuf.length + errBuf.length);
+                errBuf += String(chunk).slice(0, room);
+            });
+        }
+
+        child.on('error', function (runErr) {
+            if (finished) return;
+            finished = true;
+            clearTimeout(killTimer);
+            res.status(500).json({ ok: false, error: runErr.message });
+        });
+
+        child.on('close', function (code) {
+            if (finished) return;
+            finished = true;
+            clearTimeout(killTimer);
+            res.json({
+                ok: true,
+                code: (typeof code === 'number') ? code : 0,
+                stdout: outBuf,
+                stderr: errBuf,
+                truncated: truncated,
+                cwd: currentCwd,
+                durationMs: Date.now() - startedAt
+            });
+        });
     });
 });
 
@@ -6309,24 +6852,53 @@ app.post('/api/security/pin', requirePanelAuth, function (req, res) {
         if (authCfg.envManaged) {
             return res.status(403).json({ ok: false, error: 'El PIN está fijado por variable de entorno URP_PANEL_PIN' });
         }
-        if (authCfg.enabled && !verifyPanelPin(body.currentPin)) {
-            return res.status(401).json({ ok: false, error: 'PIN actual incorrecto' });
+        var targetMode = (body.mode === 'os' || body.mode === 'pin' || body.mode === 'off')
+            ? body.mode
+            : (String(body.newPin || '').trim() ? 'pin' : 'off');
+        var clientKey = String((req.socket && req.socket.remoteAddress) || 'local');
+        var failRec = authFailures[clientKey];
+        if (failRec && failRec.until > Date.now()) {
+            return res.status(429).json({ ok: false, error: 'Demasiados intentos; esperá 60 segundos.' });
         }
-        var newPin = String(body.newPin || '').trim();
-        if (!newPin) {
-            saveWallConfigPartial({ panelPinHash: '' });
+
+        var applyChange = function () {
+            delete authFailures[clientKey];
+            if (targetMode === 'os') {
+                saveWallConfigPartial({ panelAuthMode: 'os' });
+                authSessions = {};
+                var osToken = issueAuthToken({ osVerified: true, pinVerified: true, user: authCfg.osUser });
+                console.log('[SECURITY] Panel :8090 protegido con clave del usuario Raspberry Pi (' + authCfg.osUser + ').');
+                return res.json({ ok: true, pinEnabled: true, authMode: 'os', token: osToken });
+            }
+            if (targetMode === 'off') {
+                saveWallConfigPartial({ panelAuthMode: 'off' });
+                authSessions = {};
+                console.log('[SECURITY] Monitoreo :8090 abierto en LAN/Tailscale (Consola Web mantiene bloqueo por clave Raspberry Pi).');
+                return res.json({ ok: true, pinEnabled: false, authMode: 'off' });
+            }
+            var newPin = String(body.newPin || '').trim();
+            if (newPin.length < 4 || newPin.length > 32) {
+                return res.status(400).json({ ok: false, error: 'El PIN personalizado debe tener entre 4 y 32 caracteres.' });
+            }
+            saveWallConfigPartial({ panelAuthMode: 'pin', panelPinHash: hashPinScrypt(newPin) });
             authSessions = {};
-            console.log('[SECURITY] PIN del panel :8090 desactivado.');
-            return res.json({ ok: true, pinEnabled: false });
-        }
-        if (newPin.length < 4 || newPin.length > 32) {
-            return res.status(400).json({ ok: false, error: 'El PIN debe tener entre 4 y 32 caracteres.' });
-        }
-        saveWallConfigPartial({ panelPinHash: hashPinScrypt(newPin) });
-        authSessions = {};
-        var freshToken = issueAuthToken();
-        console.log('[SECURITY] PIN del panel :8090 actualizado (scrypt).');
-        res.json({ ok: true, pinEnabled: true, token: freshToken });
+            var freshToken = issueAuthToken({ osVerified: false, pinVerified: true, user: authCfg.osUser });
+            console.log('[SECURITY] PIN personalizado del panel :8090 actualizado (scrypt).');
+            res.json({ ok: true, pinEnabled: true, authMode: 'pin', token: freshToken });
+        };
+
+        verifyPanelCredentialAsync(body.currentPin, !authCfg.enabled, function (valid) {
+            if (!valid) {
+                var count = (failRec && failRec.resetAt > Date.now()) ? (failRec.count + 1) : 1;
+                authFailures[clientKey] = {
+                    count: count,
+                    resetAt: Date.now() + 60000,
+                    until: (count >= 5) ? (Date.now() + 60000) : 0
+                };
+                return res.status(401).json({ ok: false, error: 'Clave o PIN actual incorrecto.' });
+            }
+            applyChange();
+        });
     });
 });
 
@@ -6404,7 +6976,13 @@ app.get('/api/status', requirePanelAuth, function (req, res) {
             memPercentUsed: memPercentUsed,
             throttleStatus: throttleStatus,
             screenPoweredOff: isScreenPoweredOff,
-            security: { pinEnabled: secCfg.enabled, envManaged: secCfg.envManaged },
+            security: {
+                pinEnabled: secCfg.enabled,
+                authMode: secCfg.mode,
+                osUser: secCfg.osUser,
+                envManaged: secCfg.envManaged,
+                terminalUnlocked: isTerminalAuthenticated(req)
+            },
             blockPlaying: blockPlaying,
             nowPlayingId: URPNowPlaying,
             filesPlaying: filesPlaying,
