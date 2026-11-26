@@ -5093,10 +5093,9 @@ function startOrExtendLiveSession() {
 }
 
 function formatManagerIpField() {
-    var lanIp = String(URPdata.URPIpAddress || '').trim();
     var tsIp = String(getTailscaleIp() || '').trim();
-    if (lanIp && tsIp && lanIp !== tsIp) return lanIp + ' / ' + tsIp;
-    return lanIp || tsIp || '';
+    if (tsIp) return tsIp;
+    return String(URPdata.URPIpAddress || '').trim();
 }
 
 function callWS() {
